@@ -1,0 +1,38 @@
+# Python/cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+venv/
+env/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+
+# Data and generated artifacts
+bstalignment/data/mit/*.pkl
+bstalignment/data/mit/Data/*.mat
+bstalignment/data/raw/
+bstalignment/data/processed/
+data/
+runs/
+external/
+
+# Large archives/checkpoints
+*.zip
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Logs and reports
+*.log
+wandb/
+mlruns/
