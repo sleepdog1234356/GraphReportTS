@@ -118,6 +118,7 @@ class BatteryRawGraphDataset(Dataset):
         include_hankel: bool = True,
         include_ic_dv: bool = True,
         allow_summary_fallback: bool = False,
+        cache_items: bool = True,
         seed: int = 42,
         max_cycles: Optional[int] = None,
     ):
@@ -132,6 +133,8 @@ class BatteryRawGraphDataset(Dataset):
         self.include_hankel = bool(include_hankel)
         self.include_ic_dv = bool(include_ic_dv)
         self.allow_summary_fallback = bool(allow_summary_fallback)
+        self.cache_items = bool(cache_items)
+        self._item_cache: Dict[int, Dict[str, Any]] = {}
         self.samples: List[Dict[str, Any]] = []
         self.records: List[CellRecord] = []
         self.processed_cells: List[Dict[str, Any]] = []
@@ -227,9 +230,14 @@ class BatteryRawGraphDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        if self.cache_items and idx in self._item_cache:
+            return self._item_cache[idx]
         s = self.samples[idx]
         if "processed_idx" in s:
-            return self._getitem_processed(s)
+            item = self._getitem_processed(s)
+            if self.cache_items:
+                self._item_cache[idx] = item
+            return item
         rec = self.records[int(s["record_idx"])]
         df = add_cycle_features(rec.summary)
         row_idx = int(s["row_idx"])
@@ -265,7 +273,7 @@ class BatteryRawGraphDataset(Dataset):
             f" Battery adapter: cell_id={rec.cell_id}; cycle={cycle_id}; "
             f"channels={', '.join(map_names[:10])}; target=SOH."
         )
-        return {
+        item = {
             "maps": torch.tensor(maps, dtype=torch.float32),
             "y": torch.tensor(np.concatenate([[float(df.iloc[row_idx]['SOH'])], future["SOH"].to_numpy(dtype=np.float32)]), dtype=torch.float32),
             "mask": torch.ones(horizon + 1, dtype=torch.bool),
@@ -275,6 +283,9 @@ class BatteryRawGraphDataset(Dataset):
             "cycle": cycle_id,
             "target_steps": torch.tensor(np.concatenate([[cycle_id], future["cycle"].to_numpy(dtype=np.int64)]), dtype=torch.long),
         }
+        if self.cache_items:
+            self._item_cache[idx] = item
+        return item
 
     def _getitem_processed(self, s: Dict[str, Any]) -> Dict[str, Any]:
         cell = self.processed_cells[int(s["processed_idx"])]
@@ -309,7 +320,7 @@ class BatteryRawGraphDataset(Dataset):
         )
         target_steps = np.concatenate([[cycle_id], np.asarray(cell["cycle_id"][future_slice], dtype=np.int64)])
         y = np.concatenate([[float(cell["soh"][row_idx])], np.asarray(cell["soh"][future_slice], dtype=np.float32)])
-        return {
+        item = {
             "maps": torch.tensor(maps, dtype=torch.float32),
             "y": torch.tensor(y, dtype=torch.float32),
             "mask": torch.ones(horizon + 1, dtype=torch.bool),
@@ -319,6 +330,7 @@ class BatteryRawGraphDataset(Dataset):
             "cycle": cycle_id,
             "target_steps": torch.tensor(target_steps, dtype=torch.long),
         }
+        return item
 
 
 def collate_graph_report_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:

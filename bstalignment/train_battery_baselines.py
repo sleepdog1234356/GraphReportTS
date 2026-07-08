@@ -275,6 +275,7 @@ def parse_args():
     p.add_argument("--d_model", type=int, default=128)
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--early_stop_patience", type=int, default=8)
@@ -302,9 +303,16 @@ def main():
     if len(train_ds) == 0 or len(test_ds) == 0:
         raise RuntimeError("Baseline train/test split is empty. Check data and input_len/pred_len.")
     val_eval_ds = val_ds if len(val_ds) else test_ds
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_eval_ds, batch_size=args.batch_size, shuffle=False)
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
+    loader_kwargs = {
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "pin_memory": str(args.device).startswith("cuda"),
+    }
+    if args.num_workers > 0:
+        loader_kwargs.update({"persistent_workers": True, "prefetch_factor": 2})
+    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_eval_ds, shuffle=False, **loader_kwargs)
+    test_loader = DataLoader(test_ds, shuffle=False, **loader_kwargs)
     model = build_model(args.model, args.input_len, args.pred_len, len(FEATURES), args.d_model).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     out_dir = ensure_dir(Path(args.out_dir) / args.dataset / args.model)

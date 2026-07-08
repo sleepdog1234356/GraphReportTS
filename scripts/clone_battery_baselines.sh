@@ -10,7 +10,11 @@ clone_or_update() {
   local url="$2"
   local dir="external/$name"
   if [ -d "$dir/.git" ]; then
-    git -C "$dir" fetch --all --prune || echo "warn: could not update existing $name" >&2
+    if [ "${UPDATE_BASELINES:-0}" = "1" ]; then
+      git -C "$dir" fetch --all --prune || echo "warn: could not update existing $name" >&2
+    else
+      echo "skip existing $dir"
+    fi
   else
     local ok=0
     for attempt in 1 2 3; do

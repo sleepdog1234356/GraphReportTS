@@ -38,6 +38,7 @@ def parse_args():
     p.add_argument("--out_root", type=str, default="runs/graph_report_ablation")
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--pred_len", type=int, default=20)
     p.add_argument("--input_len", type=int, default=96)
     p.add_argument("--no_hf_text", action="store_true")
@@ -69,6 +70,8 @@ def main():
             str(args.epochs),
             "--batch_size",
             str(args.batch_size),
+            "--num_workers",
+            str(args.num_workers),
             "--pred_len",
             str(args.pred_len),
             "--input_len",

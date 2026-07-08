@@ -53,6 +53,7 @@ def parse_args():
     p.add_argument("--no_domain_edges", action="store_true")
     p.add_argument("--separate_heads", action="store_true")
     p.add_argument("--allow_summary_fallback", action="store_true", help="Smoke-test only: synthesize raw curves from summary if MIT raw arrays are missing")
+    p.add_argument("--no_cache_items", action="store_true", help="Disable per-worker sample caching for raw map construction")
     p.add_argument("--max_cycles", type=int, default=None)
     p.add_argument("--epochs", type=int, default=80)
     p.add_argument("--batch_size", type=int, default=32)
@@ -81,6 +82,7 @@ def build_loaders(args) -> Tuple[DataLoader, DataLoader, DataLoader, int]:
             include_hankel=not args.no_hankel_map,
             include_ic_dv=not args.no_ic_dv,
             allow_summary_fallback=args.allow_summary_fallback,
+            cache_items=not args.no_cache_items,
             seed=args.seed,
             max_cycles=args.max_cycles,
         )
@@ -107,8 +109,16 @@ def build_loaders(args) -> Tuple[DataLoader, DataLoader, DataLoader, int]:
         test_ds = GeneralForecastGraphDataset(split="test", scaler=scaler, fit_scaler=False, **ds_kwargs)
         collate = collate_general_graph_batch
         output_dim = len(train_ds.columns)
+    loader_kwargs = {
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "collate_fn": collate,
+        "pin_memory": str(args.device).startswith("cuda"),
+    }
+    if args.num_workers > 0:
+        loader_kwargs.update({"persistent_workers": True, "prefetch_factor": 2})
     loaders = [
-        DataLoader(ds, batch_size=args.batch_size, shuffle=(name == "train"), num_workers=args.num_workers, collate_fn=collate)
+        DataLoader(ds, shuffle=(name == "train"), **loader_kwargs)
         for ds, name in [(train_ds, "train"), (val_ds, "val"), (test_ds, "test")]
     ]
     return loaders[0], loaders[1], loaders[2], output_dim
