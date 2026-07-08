@@ -4,6 +4,8 @@ import argparse
 import subprocess
 from pathlib import Path
 
+import pandas as pd
+
 
 BATTERY_ABLATIONS = {
     "full": [],
@@ -86,8 +88,6 @@ def main():
         if metrics_path.exists():
             rows.append(pd.read_json(metrics_path, typ="series").to_dict() | {"ablation": name})
     if rows:
-        import pandas as pd
-
         summary = pd.DataFrame(rows)
         summary_path = Path(args.out_root) / args.variant / args.dataset / "ablation_summary.csv"
         summary_path.parent.mkdir(parents=True, exist_ok=True)

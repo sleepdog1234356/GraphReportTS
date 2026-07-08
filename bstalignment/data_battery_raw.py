@@ -175,8 +175,18 @@ class BatteryRawGraphDataset(Dataset):
         rng = np.random.default_rng(seed)
         order = np.arange(len(files))
         rng.shuffle(order)
-        n_train = int(len(order) * 0.7)
-        n_val = int(len(order) * 0.15)
+        if len(order) >= 3:
+            n_train = max(1, int(len(order) * 0.7))
+            n_val = max(1, int(len(order) * 0.15))
+            if n_train + n_val >= len(order):
+                n_train = max(1, len(order) - 2)
+                n_val = 1
+        elif len(order) == 2:
+            n_train = 1
+            n_val = 0
+        else:
+            n_train = len(order)
+            n_val = 0
         split_ids = {
             "train": order[:n_train],
             "val": order[n_train : n_train + n_val],
