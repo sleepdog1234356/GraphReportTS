@@ -21,6 +21,10 @@ for name in CS2_35 CS2_36 CS2_37 CS2_38; do
 done
 
 cd "$ROOT/bstalignment/data/raw/battery/xjtu"
+if find . -type f -name "*.mat" | grep -q .; then
+  echo "Found local XJTU .mat files under $(pwd); skip Zenodo download."
+  exit 0
+fi
 expected_xjtu_bytes=2438769934
 actual_xjtu_bytes=0
 if [ -f Battery_Dataset.zip ]; then
