@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${1:-/root/autodl-tmp/GraphReportTS}"
+ROOT="${1:-$(pwd)}"
 cd "$ROOT"
 
 mkdir -p \

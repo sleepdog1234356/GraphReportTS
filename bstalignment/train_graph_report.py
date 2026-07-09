@@ -53,7 +53,10 @@ def parse_args():
     p.add_argument("--no_domain_edges", action="store_true")
     p.add_argument("--separate_heads", action="store_true")
     p.add_argument("--allow_summary_fallback", action="store_true", help="Smoke-test only: synthesize raw curves from summary if MIT raw arrays are missing")
-    p.add_argument("--no_cache_items", action="store_true", help="Disable per-worker sample caching for raw map construction")
+    p.add_argument("--cache_items", action="store_true", help="Enable per-worker sample caching for raw map construction. This can grow RAM quickly with many workers.")
+    p.add_argument("--no_cache_items", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--precomputed_cache_dir", type=str, default=None, help="Read deterministic battery graph samples from this cache root when available")
+    p.add_argument("--require_precomputed_cache", action="store_true", help="Fail instead of falling back to online battery graph map construction")
     p.add_argument("--max_cycles", type=int, default=None)
     p.add_argument("--epochs", type=int, default=80)
     p.add_argument("--batch_size", type=int, default=32)
@@ -63,6 +66,7 @@ def parse_args():
     p.add_argument("--w_align", type=float, default=0.01)
     p.add_argument("--early_stop_patience", type=int, default=10)
     p.add_argument("--early_stop_min_delta", type=float, default=1e-5)
+    p.add_argument("--no_resume", action="store_true", help="Disable automatic resume from last.pt/best.pt in the output directory")
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -82,7 +86,9 @@ def build_loaders(args) -> Tuple[DataLoader, DataLoader, DataLoader, int]:
             include_hankel=not args.no_hankel_map,
             include_ic_dv=not args.no_ic_dv,
             allow_summary_fallback=args.allow_summary_fallback,
-            cache_items=not args.no_cache_items,
+            cache_items=args.cache_items and not args.no_cache_items,
+            precomputed_cache_dir=args.precomputed_cache_dir,
+            require_precomputed_cache=args.require_precomputed_cache,
             seed=args.seed,
             max_cycles=args.max_cycles,
         )
@@ -116,11 +122,15 @@ def build_loaders(args) -> Tuple[DataLoader, DataLoader, DataLoader, int]:
         "pin_memory": str(args.device).startswith("cuda"),
     }
     if args.num_workers > 0:
-        loader_kwargs.update({"persistent_workers": True, "prefetch_factor": 2})
-    loaders = [
-        DataLoader(ds, shuffle=(name == "train"), **loader_kwargs)
-        for ds, name in [(train_ds, "train"), (val_ds, "val"), (test_ds, "test")]
-    ]
+        loader_kwargs.update({"prefetch_factor": 2})
+
+    def make_loader(ds, name: str) -> DataLoader:
+        kwargs = dict(loader_kwargs)
+        if args.num_workers > 0:
+            kwargs["persistent_workers"] = name == "train"
+        return DataLoader(ds, shuffle=(name == "train"), **kwargs)
+
+    loaders = [make_loader(ds, name) for ds, name in [(train_ds, "train"), (val_ds, "val"), (test_ds, "test")]]
     return loaders[0], loaders[1], loaders[2], output_dim
 
 
@@ -186,7 +196,23 @@ def main():
     save_json({"args": vars(args), "model_cfg": model_cfg.__dict__, "output_dim": output_dim}, out_dir / "run_config.json")
     best = float("inf")
     stale = 0
-    for epoch in range(1, args.epochs + 1):
+    start_epoch = 1
+    if not args.no_resume:
+        last_path = out_dir / "last.pt"
+        best_path = out_dir / "best.pt"
+        resume_path = last_path if last_path.exists() else best_path
+        if resume_path.exists():
+            ckpt = torch.load(resume_path, map_location=device)
+            model.load_state_dict(ckpt["model"])
+            if "optimizer" in ckpt:
+                opt.load_state_dict(ckpt["optimizer"])
+            val_metrics = ckpt.get("val_metrics", {})
+            best = float(ckpt.get("best", val_metrics.get("mse", best)))
+            stale = int(ckpt.get("stale", 0))
+            start_epoch = int(ckpt.get("epoch", 0)) + 1 if "epoch" in ckpt else 1
+            print(f"resumed from {resume_path} at epoch {start_epoch}; best val_mse={best:.6f}")
+
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         meters = {k: AverageMeter() for k in ["total", "reg", "align"]}
         pbar = tqdm(train_loader, desc=f"{args.variant}/{args.dataset} epoch {epoch}/{args.epochs}")
@@ -212,9 +238,22 @@ def main():
             save_json(val, out_dir / "val_metrics.json")
         else:
             stale += 1
-            if stale >= args.early_stop_patience:
-                print(f"early stopping at epoch {epoch}; best val_mse={best:.6f}")
-                break
+        torch.save(
+            {
+                "model": model.state_dict(),
+                "model_cfg": model_cfg.__dict__,
+                "args": vars(args),
+                "optimizer": opt.state_dict(),
+                "epoch": epoch,
+                "best": best,
+                "stale": stale,
+                "val_metrics": val,
+            },
+            out_dir / "last.pt",
+        )
+        if stale >= args.early_stop_patience:
+            print(f"early stopping at epoch {epoch}; best val_mse={best:.6f}")
+            break
     ckpt = torch.load(out_dir / "best.pt", map_location=device)
     model.load_state_dict(ckpt["model"])
     test = evaluate(model, test_loader, device, weights, args.loss)

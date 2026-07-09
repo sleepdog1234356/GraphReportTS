@@ -65,7 +65,7 @@ Official baseline source code is not vendored. `bstalignment.baseline_adapters` 
 - DLinear
 - Time-LLM
 
-Actual baseline training adapters should be written against those official repositories after they are cloned under `external/`.
+`bstalignment.train_battery_official_baselines` provides adapters that instantiate model definitions from those official repositories after they are cloned under `external/`.
 
 ## Local Verification
 
@@ -75,9 +75,9 @@ Completed:
 - baseline setup dry-run
 - ablation command dry-run
 
-Not completed on this PC:
+Environment-dependent:
 
-- training forward pass, because the local Python environment does not have `torch`.
+- Full training requires a Python environment with PyTorch and the relevant external baseline repositories.
 - full experiment execution, because CALCE/XJTU and general datasets are not yet downloaded.
 
 Cloud execution instructions are in `docs/cloud_training_workflow.md`.

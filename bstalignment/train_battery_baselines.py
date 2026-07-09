@@ -242,23 +242,24 @@ def run_epoch(model, loader, device, opt=None) -> Dict[str, float]:
     model.train(train)
     loss_meter = AverageMeter()
     mse_sum = mae_sum = count = 0.0
-    for batch in tqdm(loader, desc="train" if train else "eval"):
-        x = batch["x"].to(device)
-        y = batch["y"].to(device)
-        pred = model(x)
-        loss = F.smooth_l1_loss(pred, y)
-        if train:
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-        n = x.size(0)
-        loss_meter.update(float(loss.detach()), n)
-        m = metrics(pred, y)
-        elems = y.numel()
-        mse_sum += m["mse"] * elems
-        mae_sum += m["mae"] * elems
-        count += elems
+    with torch.set_grad_enabled(train):
+        for batch in tqdm(loader, desc="train" if train else "eval"):
+            x = batch["x"].to(device)
+            y = batch["y"].to(device)
+            pred = model(x)
+            loss = F.smooth_l1_loss(pred, y)
+            if train:
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+            n = x.size(0)
+            loss_meter.update(float(loss.detach()), n)
+            m = metrics(pred, y)
+            elems = y.numel()
+            mse_sum += m["mse"] * elems
+            mae_sum += m["mae"] * elems
+            count += elems
     mse = mse_sum / max(count, 1.0)
     mae = mae_sum / max(count, 1.0)
     return {"loss": loss_meter.avg, "mse": mse, "mae": mae, "rmse": mse**0.5}
@@ -280,6 +281,7 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--early_stop_patience", type=int, default=8)
     p.add_argument("--max_cycles", type=int, default=None)
+    p.add_argument("--no_resume", action="store_true", help="Disable automatic resume from last.pt/best.pt in the output directory")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
@@ -309,29 +311,68 @@ def main():
         "pin_memory": str(args.device).startswith("cuda"),
     }
     if args.num_workers > 0:
-        loader_kwargs.update({"persistent_workers": True, "prefetch_factor": 2})
-    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
-    val_loader = DataLoader(val_eval_ds, shuffle=False, **loader_kwargs)
-    test_loader = DataLoader(test_ds, shuffle=False, **loader_kwargs)
+        loader_kwargs.update({"prefetch_factor": 2})
+    train_loader = DataLoader(train_ds, shuffle=True, persistent_workers=args.num_workers > 0, **loader_kwargs)
+    val_loader = DataLoader(val_eval_ds, shuffle=False, persistent_workers=False, **loader_kwargs)
+    test_loader = DataLoader(test_ds, shuffle=False, persistent_workers=False, **loader_kwargs)
     model = build_model(args.model, args.input_len, args.pred_len, len(FEATURES), args.d_model).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     out_dir = ensure_dir(Path(args.out_dir) / args.dataset / args.model)
     save_json({"args": vars(args), "features": FEATURES, "num_train": len(train_ds), "num_val": len(val_ds), "num_test": len(test_ds)}, out_dir / "run_config.json")
     best = float("inf")
     stale = 0
-    for epoch in range(1, args.epochs + 1):
+    start_epoch = 1
+    if not args.no_resume:
+        last_path = out_dir / "last.pt"
+        best_path = out_dir / "best.pt"
+        resume_path = last_path if last_path.exists() else best_path
+        if resume_path.exists():
+            ckpt = torch.load(resume_path, map_location=device)
+            model.load_state_dict(ckpt["model"])
+            if "optimizer" in ckpt:
+                opt.load_state_dict(ckpt["optimizer"])
+            val_metrics = ckpt.get("val_metrics", {})
+            best = float(ckpt.get("best", val_metrics.get("mse", best)))
+            stale = int(ckpt.get("stale", 0))
+            start_epoch = int(ckpt.get("epoch", 0)) + 1 if "epoch" in ckpt else 1
+            print(f"resumed from {resume_path} at epoch {start_epoch}; best val_mse={best:.6f}")
+
+    for epoch in range(start_epoch, args.epochs + 1):
         train_m = run_epoch(model, train_loader, device, opt)
         val_m = run_epoch(model, val_loader, device)
         print(f"epoch={epoch} train_loss={train_m['loss']:.6f} val_mse={val_m['mse']:.6f} val_mae={val_m['mae']:.6f}")
         if val_m["mse"] < best:
             best = val_m["mse"]
             stale = 0
-            torch.save({"model": model.state_dict(), "args": vars(args), "val_metrics": val_m}, out_dir / "best.pt")
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "args": vars(args),
+                    "optimizer": opt.state_dict(),
+                    "epoch": epoch,
+                    "best": best,
+                    "stale": stale,
+                    "val_metrics": val_m,
+                },
+                out_dir / "best.pt",
+            )
             save_json(val_m, out_dir / "val_metrics.json")
         else:
             stale += 1
-            if stale >= args.early_stop_patience:
-                break
+        torch.save(
+            {
+                "model": model.state_dict(),
+                "args": vars(args),
+                "optimizer": opt.state_dict(),
+                "epoch": epoch,
+                "best": best,
+                "stale": stale,
+                "val_metrics": val_m,
+            },
+            out_dir / "last.pt",
+        )
+        if stale >= args.early_stop_patience:
+            break
     ckpt = torch.load(out_dir / "best.pt", map_location=device)
     model.load_state_dict(ckpt["model"])
     test_m = run_epoch(model, test_loader, device)

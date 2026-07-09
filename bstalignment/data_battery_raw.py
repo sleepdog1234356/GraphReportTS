@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -19,6 +21,47 @@ except ImportError:
 
 
 RAW_BATTERY_CHANNELS = ["current", "voltage", "temperature", "capacity"]
+BATTERY_GRAPH_CACHE_VERSION = 1
+
+
+def battery_graph_cache_config(
+    dataset_name: str,
+    split: str,
+    max_horizon: int,
+    resample_len: int,
+    delay_dim: int,
+    delay_lag: int,
+    include_derivatives: bool,
+    include_hankel: bool,
+    include_ic_dv: bool,
+    allow_summary_fallback: bool,
+    seed: int,
+    max_cycles: Optional[int],
+) -> Dict[str, Any]:
+    return {
+        "version": BATTERY_GRAPH_CACHE_VERSION,
+        "dataset": dataset_name.lower(),
+        "split": split,
+        "max_horizon": int(max_horizon),
+        "resample_len": int(resample_len),
+        "delay_dim": int(delay_dim),
+        "delay_lag": int(delay_lag),
+        "include_derivatives": bool(include_derivatives),
+        "include_hankel": bool(include_hankel),
+        "include_ic_dv": bool(include_ic_dv),
+        "allow_summary_fallback": bool(allow_summary_fallback),
+        "seed": int(seed),
+        "max_cycles": None if max_cycles is None else int(max_cycles),
+    }
+
+
+def battery_graph_cache_hash(config: Dict[str, Any]) -> str:
+    payload = json.dumps(config, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha1(payload).hexdigest()[:12]
+
+
+def battery_graph_cache_path(cache_root: str | Path, config: Dict[str, Any]) -> Path:
+    return Path(cache_root) / str(config["dataset"]) / str(config["split"]) / battery_graph_cache_hash(config)
 
 
 def _safe_array(obj: Any) -> np.ndarray:
@@ -118,7 +161,9 @@ class BatteryRawGraphDataset(Dataset):
         include_hankel: bool = True,
         include_ic_dv: bool = True,
         allow_summary_fallback: bool = False,
-        cache_items: bool = True,
+        cache_items: bool = False,
+        precomputed_cache_dir: Optional[str] = None,
+        require_precomputed_cache: bool = False,
         seed: int = 42,
         max_cycles: Optional[int] = None,
     ):
@@ -135,6 +180,35 @@ class BatteryRawGraphDataset(Dataset):
         self.allow_summary_fallback = bool(allow_summary_fallback)
         self.cache_items = bool(cache_items)
         self._item_cache: Dict[int, Dict[str, Any]] = {}
+        self.precomputed_cache_dir = Path(precomputed_cache_dir) if precomputed_cache_dir else None
+        self.require_precomputed_cache = bool(require_precomputed_cache)
+        self.cache_config = battery_graph_cache_config(
+            dataset_name=self.dataset_name,
+            split=self.split,
+            max_horizon=self.max_horizon,
+            resample_len=self.resample_len,
+            delay_dim=self.delay_dim,
+            delay_lag=self.delay_lag,
+            include_derivatives=self.include_derivatives,
+            include_hankel=self.include_hankel,
+            include_ic_dv=self.include_ic_dv,
+            allow_summary_fallback=self.allow_summary_fallback,
+            seed=seed,
+            max_cycles=max_cycles,
+        )
+        self._precomputed = False
+        self._cache_path: Optional[Path] = None
+        self._cache_maps = None
+        self._cache_y = None
+        self._cache_mask = None
+        self._cache_horizon = None
+        self._cache_target_steps = None
+        self._cache_meta: List[Dict[str, Any]] = []
+        if self.precomputed_cache_dir is not None and self._try_load_precomputed_cache():
+            return
+        if self.require_precomputed_cache:
+            expected = battery_graph_cache_path(self.precomputed_cache_dir or "", self.cache_config)
+            raise FileNotFoundError(f"Required battery graph cache not found or invalid: {expected}")
         self.samples: List[Dict[str, Any]] = []
         self.records: List[CellRecord] = []
         self.processed_cells: List[Dict[str, Any]] = []
@@ -142,6 +216,40 @@ class BatteryRawGraphDataset(Dataset):
             self._load_mit(seed=seed, max_cycles=max_cycles)
         else:
             self._load_processed(max_cycles=max_cycles, seed=seed)
+
+    def _try_load_precomputed_cache(self) -> bool:
+        if self.precomputed_cache_dir is None:
+            return False
+        cache_path = battery_graph_cache_path(self.precomputed_cache_dir, self.cache_config)
+        manifest_path = cache_path / "manifest.json"
+        if not manifest_path.exists():
+            return False
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if manifest.get("config") != self.cache_config:
+            return False
+        files = manifest.get("files", {})
+        required = ["maps", "y", "mask", "horizon", "target_steps", "meta"]
+        if any(not (cache_path / str(files.get(name, ""))).exists() for name in required):
+            return False
+        self._cache_path = cache_path
+        self._cache_maps = np.load(cache_path / files["maps"], mmap_mode="r")
+        self._cache_y = np.load(cache_path / files["y"], mmap_mode="r")
+        self._cache_mask = np.load(cache_path / files["mask"], mmap_mode="r")
+        self._cache_horizon = np.load(cache_path / files["horizon"], mmap_mode="r")
+        self._cache_target_steps = np.load(cache_path / files["target_steps"], mmap_mode="r")
+        with (cache_path / files["meta"]).open("r", encoding="utf-8") as f:
+            self._cache_meta = [json.loads(line) for line in f if line.strip()]
+        sample_count = int(manifest.get("sample_count", -1))
+        if sample_count < 0 or sample_count != len(self._cache_meta) or sample_count != int(self._cache_maps.shape[0]):
+            return False
+        self._precomputed = True
+        self.samples = []
+        self.records = []
+        self.processed_cells = []
+        return True
 
     def _load_mit(self, seed: int, max_cycles: Optional[int]) -> None:
         records = load_mit_battery_pkls(self.data_root / "mit")
@@ -227,9 +335,13 @@ class BatteryRawGraphDataset(Dataset):
                 )
 
     def __len__(self) -> int:
+        if self._precomputed:
+            return int(self._cache_maps.shape[0])
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
+        if self._precomputed:
+            return self._getitem_precomputed(idx)
         if self.cache_items and idx in self._item_cache:
             return self._item_cache[idx]
         s = self.samples[idx]
@@ -286,6 +398,23 @@ class BatteryRawGraphDataset(Dataset):
         if self.cache_items:
             self._item_cache[idx] = item
         return item
+
+    def _getitem_precomputed(self, idx: int) -> Dict[str, Any]:
+        if self._cache_maps is None or self._cache_y is None or self._cache_mask is None or self._cache_horizon is None or self._cache_target_steps is None:
+            raise RuntimeError("Precomputed cache arrays are not loaded")
+        horizon = int(self._cache_horizon[idx])
+        width = horizon + 1
+        meta = self._cache_meta[idx]
+        return {
+            "maps": torch.tensor(np.array(self._cache_maps[idx], copy=True), dtype=torch.float32),
+            "y": torch.tensor(np.array(self._cache_y[idx, :width], copy=True), dtype=torch.float32),
+            "mask": torch.tensor(np.array(self._cache_mask[idx, :width], copy=True), dtype=torch.bool),
+            "horizon": torch.tensor(horizon, dtype=torch.long),
+            "prompt": str(meta["prompt"]),
+            "cell_id": str(meta["cell_id"]),
+            "cycle": int(meta["cycle"]),
+            "target_steps": torch.tensor(np.array(self._cache_target_steps[idx, :width], copy=True), dtype=torch.long),
+        }
 
     def _getitem_processed(self, s: Dict[str, Any]) -> Dict[str, Any]:
         cell = self.processed_cells[int(s["processed_idx"])]

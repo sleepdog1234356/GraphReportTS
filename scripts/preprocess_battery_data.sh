@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${1:-/root/autodl-tmp/GraphReportTS}"
+ROOT="${1:-$(pwd)}"
 cd "$ROOT"
-PY="/root/miniconda3/bin/conda run --no-capture-output -n graphreport python -u"
+PY="${PY:-python -u}"
 
 calce_count="$(find bstalignment/data/processed/battery/calce -name "*.npz" 2>/dev/null | wc -l)"
 xjtu_count="$(find bstalignment/data/processed/battery/xjtu -name "*.npz" 2>/dev/null | wc -l)"

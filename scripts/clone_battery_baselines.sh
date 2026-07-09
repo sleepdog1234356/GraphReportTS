@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${1:-/root/autodl-tmp/GraphReportTS}"
+ROOT="${1:-$(pwd)}"
 cd "$ROOT"
 mkdir -p external
 
@@ -37,6 +37,7 @@ clone_or_update itransformer https://github.com/thuml/iTransformer.git
 clone_or_update timecma https://github.com/ChenxiLiu-HNU/TimeCMA.git
 clone_or_update timesnet https://github.com/thuml/Time-Series-Library.git
 clone_or_update dlinear https://github.com/cure-lab/LTSF-Linear.git
+clone_or_update time_llm https://github.com/KimMeen/Time-LLM.git
 
-PYTHON="${PYTHON:-/root/miniconda3/envs/graphreport/bin/python}"
+PYTHON="${PYTHON:-python}"
 "$PYTHON" -m bstalignment.baseline_adapters --root external

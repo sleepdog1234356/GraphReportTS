@@ -1,34 +1,35 @@
-# Editing Locally with Codex and Training on a Cloud Server
+# Local Editing and Cloud Training Workflow
 
-This guide describes the intended workflow after the project is uploaded to GitHub:
+This guide describes a reproducible workflow for editing the project locally and running heavy experiments on a cloud GPU server.
 
-1. edit and review code on the local PC with Codex;
-2. push changes to GitHub;
-3. pull the latest code on a rented cloud GPU server;
-4. run heavy GraphReportTS training on the server;
-5. copy metrics, figures, and checkpoints back as needed.
+## 1. Local Setup
 
-## 1. Local PC Setup
-
-Clone the GitHub repository on the PC:
+Clone the repository:
 
 ```bash
 git clone <YOUR_GITHUB_REPO_URL>
-cd battery_stalign_code
+cd GraphReportTS
 ```
 
-Open this folder in Codex Desktop. Continue editing code in the same project folder.
+Install dependencies:
 
-Before each cloud training run:
+```bash
+pip install -r requirements.txt
+```
+
+Install the PyTorch build that matches the target machine. For example:
+
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+```
+
+Before pushing, check that large generated files are not staged:
 
 ```bash
 git status
-git add README.md bstalignment docs .gitignore requirements.txt
-git commit -m "Update GraphReportTS experiment code"
-git push origin main
 ```
 
-Do not commit raw datasets, checkpoints, `runs/`, `external/`, or downloaded baseline repositories. They are ignored by `.gitignore`.
+Do not commit raw datasets, processed datasets, checkpoints, downloaded HuggingFace weights, external baseline repositories, or `runs/`.
 
 ## 2. Cloud Server Setup
 
@@ -36,34 +37,30 @@ On the cloud GPU server:
 
 ```bash
 git clone <YOUR_GITHUB_REPO_URL>
-cd battery_stalign_code
+cd GraphReportTS
 python -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-Install the PyTorch build that matches the server CUDA version. For example:
+Install a CUDA-compatible PyTorch build for the server GPU.
+
+If the server cannot access HuggingFace reliably, download model weights once into an ignored directory such as `hf_models/`, then pass the local path:
 
 ```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+--text_model hf_models/distilbert-base-uncased
 ```
 
-If the server cannot access HuggingFace reliably, use:
+For fully offline transformer loading:
 
 ```bash
-python -m bstalignment.train_graph_report ... --no_hf_text
+export TRANSFORMERS_OFFLINE=1
 ```
 
-or download the text model once and pass its local path:
+## 3. Data Placement
 
-```bash
---text_model /path/to/distilbert-base-uncased
-```
-
-## 3. Data Placement on the Server
-
-Place raw and processed data under the ignored data folders:
+Place battery data under:
 
 ```text
 bstalignment/data/mit
@@ -71,128 +68,61 @@ bstalignment/data/raw/battery/calce
 bstalignment/data/raw/battery/xjtu
 bstalignment/data/processed/battery/calce
 bstalignment/data/processed/battery/xjtu
-bstalignment/data/raw/general/ETTm1
-...
 ```
 
-For CALCE/XJTU, preprocess raw files into `.npz` files under:
-
-```text
-bstalignment/data/processed/battery/<dataset>/<cell_id>.npz
-```
-
-Required arrays:
-
-```text
-cycle_id [N]
-soh [N]
-current [N, L]
-voltage [N, L]
-temperature [N, L]
-capacity [N, L] optional if time/current are available
-time [N, L] optional
-```
-
-For general datasets, place CSV files such as:
-
-```text
-bstalignment/data/raw/general/ETTm1/ETTm1.csv
-```
-
-with one optional timestamp column and numeric variable columns.
-
-## 4. Training Commands
-
-Battery MIT smoke test, only if raw arrays are not available:
+The helper script can download public CALCE/XJTU data when network access is available:
 
 ```bash
-python -m bstalignment.train_graph_report \
-  --variant battery \
-  --dataset mit \
-  --pred_len 20 \
-  --allow_summary_fallback \
-  --no_hf_text
+bash scripts/download_battery_data.sh "$(pwd)"
 ```
 
-Formal battery training should use raw cycle arrays and should not use `--allow_summary_fallback`:
+Preprocess CALCE/XJTU:
 
 ```bash
-python -m bstalignment.train_graph_report \
-  --variant battery \
-  --dataset mit \
-  --pred_len 20 \
-  --batch_size 32
+bash scripts/preprocess_battery_data.sh "$(pwd)"
 ```
 
-CALCE and XJTU after preprocessing:
+## 4. Running Experiments
+
+Main GraphReportTS battery experiments:
 
 ```bash
-python -m bstalignment.train_graph_report --variant battery --dataset calce --pred_len 20
-python -m bstalignment.train_graph_report --variant battery --dataset xjtu --pred_len 20
+bash scripts/run_battery_main_full_hf.sh "$(pwd)"
 ```
 
-General TimeCMA-aligned experiments:
+Official baselines:
 
 ```bash
-python -m bstalignment.train_graph_report \
-  --variant general \
-  --dataset ETTm1 \
-  --input_len 96 \
-  --pred_len 96 \
-  --batch_size 32
+bash scripts/run_battery_official_baselines.sh "$(pwd)"
 ```
 
 Ablations:
 
 ```bash
-python -m bstalignment.run_ablation_suite \
-  --variant battery \
-  --dataset mit \
-  --pred_len 20
+bash scripts/run_battery_ablations_full_hf.sh "$(pwd)"
 ```
 
-## 5. Running Long Jobs
-
-Use `tmux` so jobs continue after the SSH session disconnects:
+You can override runtime settings through environment variables:
 
 ```bash
-tmux new -s graphreport
-python -m bstalignment.train_graph_report --variant battery --dataset mit --pred_len 20
+PY="python -u" \
+OUT_ROOT=runs/full_hf \
+TEXT_MODEL=hf_models/distilbert-base-uncased \
+EPOCHS=80 \
+BATCH_SIZE=128 \
+NUM_WORKERS=8 \
+bash scripts/run_battery_main_full_hf.sh "$(pwd)"
 ```
 
-Detach:
+## 5. Results
 
-```text
-Ctrl-b d
-```
+Experiment outputs are written under `runs/`, including:
 
-Resume:
+- `test_metrics.json`
+- `val_metrics.json`
+- `ablation_summary.csv`
+- prediction CSV files
+- paper-style figures
+- checkpoints and logs
 
-```bash
-tmux attach -t graphreport
-```
-
-## 6. Pulling New Local Changes on the Server
-
-After editing with Codex and pushing:
-
-```bash
-git pull origin main
-```
-
-If dependencies changed:
-
-```bash
-pip install -r requirements.txt
-```
-
-## 7. Copying Results Back
-
-From the local PC:
-
-```bash
-scp -r user@server:/path/to/battery_stalign_code/runs ./runs_from_server
-```
-
-Only commit selected small result tables or paper-ready figures if needed. Keep checkpoints and full run folders out of GitHub.
-
+These files are ignored by Git. Copy selected metrics or figures into a separate report only when they are ready to publish.

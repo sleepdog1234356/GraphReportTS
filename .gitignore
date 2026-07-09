@@ -24,6 +24,7 @@ bstalignment/data/processed/
 data/
 runs/
 external/
+hf_models/
 
 # Large archives/checkpoints
 *.zip
@@ -31,8 +32,19 @@ external/
 *.pth
 *.ckpt
 *.onnx
+*.bin
+*.safetensors
+*.h5
+*.npz
+*.mat
 
 # Logs and reports
 *.log
 wandb/
 mlruns/
+
+# Local agent/Codex handoff files
+.agents/
+docs/graphreportts_remote_training_handoff.md
+docs/superpowers/
+scripts/run_all*_nohup.sh

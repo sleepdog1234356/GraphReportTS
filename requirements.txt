@@ -10,6 +10,8 @@ PyYAML>=6.0
 torch>=2.0
 transformers>=4.38
 accelerate>=0.28
+einops>=0.7
+reformer-pytorch>=1.4
 
 # Optional, for reading .mat if you rebuild PKL from MATLAB files
 scipy>=1.10

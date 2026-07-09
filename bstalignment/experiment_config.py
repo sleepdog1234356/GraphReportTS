@@ -6,23 +6,6 @@ from typing import Any, Dict, List, Optional
 
 
 @dataclass
-class APIConfig:
-    """Central place for optional external LLM/API usage.
-
-    The default pipeline uses a frozen local HuggingFace text encoder or the
-    lightweight hash encoder. If a later experiment calls an external LLM to
-    generate reports, keep provider/model/key/env settings here rather than
-    scattering them through the codebase.
-    """
-
-    use_external_llm: bool = False
-    provider: str = "openai"
-    model: str = "gpt-4.1-mini"
-    api_key_env: str = "OPENAI_API_KEY"
-    timeout_s: int = 60
-
-
-@dataclass
 class DataConfig:
     dataset_group: str = "battery"  # battery or general
     dataset_name: str = "mit"
@@ -88,8 +71,8 @@ class BaselineConfig:
     """Reference baseline source locations and expected local placement.
 
     External baselines are intentionally not vendored in this repository. Put
-    cloned source trees under `external/` and write small adapters against their
-    official training entry points.
+    cloned source trees under `external/`; the official baseline trainer imports
+    model definitions from those source trees.
     """
 
     root: str = "external"
@@ -111,7 +94,6 @@ class ExperimentConfig:
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
-    api: APIConfig = field(default_factory=APIConfig)
     baselines: BaselineConfig = field(default_factory=BaselineConfig)
 
     def to_dict(self) -> Dict[str, Any]:

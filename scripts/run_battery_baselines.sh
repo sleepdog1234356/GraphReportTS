@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${1:-/root/autodl-tmp/GraphReportTS}"
+ROOT="${1:-$(pwd)}"
 EPOCHS="${BASELINE_EPOCHS:-50}"
 BATCH_SIZE="${BASELINE_BATCH_SIZE:-64}"
 NUM_WORKERS="${BASELINE_NUM_WORKERS:-4}"
@@ -12,7 +12,7 @@ mkdir -p runs/logs
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
-PY="/root/miniconda3/bin/conda run --no-capture-output -n graphreport python -u"
+PY="${PY:-python -u}"
 
 for dataset in mit calce xjtu; do
   for model in patchtst itransformer timecma timesnet dlinear; do

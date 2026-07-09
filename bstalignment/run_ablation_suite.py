@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import subprocess
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -41,8 +42,12 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--pred_len", type=int, default=20)
     p.add_argument("--input_len", type=int, default=96)
+    p.add_argument("--text_model", type=str, default="distilbert-base-uncased")
     p.add_argument("--no_hf_text", action="store_true")
     p.add_argument("--allow_summary_fallback", action="store_true")
+    p.add_argument("--precomputed_cache_dir", type=str, default=None)
+    p.add_argument("--require_precomputed_cache", action="store_true")
+    p.add_argument("--force_precompute_cache", action="store_true")
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--dry_run", action="store_true")
     return p.parse_args()
@@ -54,8 +59,45 @@ def main():
     rows = []
     for name, flags in suite.items():
         out_dir = Path(args.out_root) / args.variant / args.dataset / name
+        metrics_path = out_dir / args.variant / args.dataset / "test_metrics.json"
+        if metrics_path.exists():
+            print(f"skip completed ablation {args.dataset} {name}")
+            rows.append(pd.read_json(metrics_path, typ="series").to_dict() | {"ablation": name})
+            continue
+        if args.variant == "battery" and args.precomputed_cache_dir:
+            precompute_cmd = [
+                sys.executable,
+                "-m",
+                "bstalignment.precompute_battery_graph_cache",
+                "--dataset",
+                args.dataset,
+                "--data_root",
+                args.data_root,
+                "--cache_dir",
+                args.precomputed_cache_dir,
+                "--pred_len",
+                str(args.pred_len),
+                "--batch_size",
+                str(args.batch_size),
+                "--num_workers",
+                str(args.num_workers),
+                "--splits",
+                "train",
+                "val",
+                "test",
+            ]
+            if args.allow_summary_fallback:
+                precompute_cmd.append("--allow_summary_fallback")
+            for flag in flags:
+                if flag in {"--no_ic_dv", "--no_hankel_map", "--no_derivative_map"}:
+                    precompute_cmd.append(flag)
+            if args.force_precompute_cache:
+                precompute_cmd.append("--force")
+            print(" ".join(precompute_cmd))
+            if not args.dry_run:
+                subprocess.run(precompute_cmd, check=True)
         cmd = [
-            "python",
+            sys.executable,
             "-m",
             "bstalignment.train_graph_report",
             "--variant",
@@ -78,16 +120,21 @@ def main():
             str(args.input_len),
             "--device",
             args.device,
+            "--text_model",
+            args.text_model,
         ]
         if args.no_hf_text:
             cmd.append("--no_hf_text")
         if args.allow_summary_fallback:
             cmd.append("--allow_summary_fallback")
+        if args.precomputed_cache_dir:
+            cmd.extend(["--precomputed_cache_dir", args.precomputed_cache_dir])
+        if args.require_precomputed_cache:
+            cmd.append("--require_precomputed_cache")
         cmd.extend(flags)
         print(" ".join(cmd))
         if not args.dry_run:
             subprocess.run(cmd, check=True)
-        metrics_path = out_dir / args.variant / args.dataset / "test_metrics.json"
         if metrics_path.exists():
             rows.append(pd.read_json(metrics_path, typ="series").to_dict() | {"ablation": name})
     if rows:

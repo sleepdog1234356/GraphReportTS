@@ -2,23 +2,26 @@
 set -euo pipefail
 
 ROOT="${1:-$(pwd)}"
+OUT_ROOT="${OUT_ROOT:-runs/full_hf}"
 EPOCHS="${EPOCHS:-80}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
 PRED_LEN="${PRED_LEN:-20}"
-NUM_WORKERS="${NUM_WORKERS:-2}"
+NUM_WORKERS="${NUM_WORKERS:-8}"
 USE_GRAPH_CACHE="${USE_BATTERY_GRAPH_CACHE:-1}"
-GRAPH_CACHE_DIR="${BATTERY_GRAPH_CACHE_DIR:-runs/cache/battery_graph}"
+GRAPH_CACHE_DIR="${BATTERY_GRAPH_CACHE_DIR:-${OUT_ROOT}/cache/battery_graph}"
+TEXT_MODEL="${TEXT_MODEL:-distilbert-base-uncased}"
 cd "$ROOT"
-mkdir -p runs/logs
+mkdir -p "$OUT_ROOT/logs"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
+export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 PY="${PY:-python -u}"
 
 for dataset in mit calce xjtu; do
-  out="runs/graph_report_ts/battery/${dataset}"
+  out="${OUT_ROOT}/graph_report_ts/battery/${dataset}"
   if [ -f "$out/test_metrics.json" ]; then
-    echo "skip completed GraphReportTS $dataset"
+    echo "skip completed full-HF GraphReportTS $dataset"
     continue
   fi
   CACHE_ARGS=()
@@ -37,12 +40,12 @@ for dataset in mit calce xjtu; do
     --variant battery \
     --dataset "$dataset" \
     --data_root bstalignment/data \
-    --out_dir runs/graph_report_ts \
+    --out_dir "${OUT_ROOT}/graph_report_ts" \
     --pred_len "$PRED_LEN" \
     --epochs "$EPOCHS" \
     --batch_size "$BATCH_SIZE" \
     --num_workers "$NUM_WORKERS" \
     --device cuda \
-    "${CACHE_ARGS[@]}" \
-    --no_hf_text 2>&1 | tee "runs/logs/main_${dataset}.log"
+    --text_model "$TEXT_MODEL" \
+    "${CACHE_ARGS[@]}" 2>&1 | tee "${OUT_ROOT}/logs/main_${dataset}.log"
 done
