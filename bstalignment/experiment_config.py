@@ -17,6 +17,7 @@ class DataConfig:
     input_len: int = 96
     label_len: int = 0
     pred_len: int = 20
+    history_len: int = 32
     resample_len: int = 128
     early_history_ratio: float = 0.5
     target_col: str = "SOH"
@@ -48,6 +49,13 @@ class ModelConfig:
     use_domain_edges: bool = True
     use_cross_modal_fusion: bool = True
     unified_decoder: bool = True
+    use_multi_cycle_raw: bool = True
+    use_numeric_history: bool = True
+    use_text_gate: bool = True
+    use_semantic_alignment: bool = True
+    use_relative_steps: bool = True
+    temporal_layers: int = 1
+    temporal_heads: int = 4
 
 
 @dataclass
@@ -62,7 +70,7 @@ class TrainConfig:
     early_stop_patience: int = 10
     early_stop_min_delta: float = 1e-5
     loss: str = "smooth_l1"  # smooth_l1, mse, mae
-    w_align: float = 0.01
+    w_align: float = 0.001
     grad_clip: float = 1.0
 
 

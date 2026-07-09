@@ -10,6 +10,13 @@ import pandas as pd
 
 BATTERY_ABLATIONS = {
     "full": [],
+    "no_numeric_history": ["--no_numeric_history"],
+    "no_multi_cycle_raw": ["--no_multi_cycle_raw"],
+    "single_cycle_raw": ["--single_cycle_raw"],
+    "no_text_gate": ["--no_text_gate"],
+    "no_semantic_alignment": ["--no_semantic_alignment"],
+    "no_align_loss": ["--no_align_loss"],
+    "absolute_step_decoder": ["--absolute_step_decoder"],
     "no_ic_dv": ["--no_ic_dv"],
     "no_hankel_map": ["--no_hankel_map"],
     "no_derivative_map": ["--no_derivative_map"],
@@ -41,7 +48,12 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--pred_len", type=int, default=20)
+    p.add_argument("--history_len", type=int, default=32)
     p.add_argument("--input_len", type=int, default=96)
+    p.add_argument("--w_align", type=float, default=0.001)
+    p.add_argument("--align_warmup_epochs", type=int, default=0)
+    p.add_argument("--temporal_layers", type=int, default=1)
+    p.add_argument("--temporal_heads", type=int, default=4)
     p.add_argument("--text_model", type=str, default="distilbert-base-uncased")
     p.add_argument("--no_hf_text", action="store_true")
     p.add_argument("--allow_summary_fallback", action="store_true")
@@ -77,6 +89,8 @@ def main():
                 args.precomputed_cache_dir,
                 "--pred_len",
                 str(args.pred_len),
+                "--history_len",
+                str(args.history_len),
                 "--batch_size",
                 str(args.batch_size),
                 "--num_workers",
@@ -116,8 +130,18 @@ def main():
             str(args.num_workers),
             "--pred_len",
             str(args.pred_len),
+            "--history_len",
+            str(args.history_len),
             "--input_len",
             str(args.input_len),
+            "--w_align",
+            str(args.w_align),
+            "--align_warmup_epochs",
+            str(args.align_warmup_epochs),
+            "--temporal_layers",
+            str(args.temporal_layers),
+            "--temporal_heads",
+            str(args.temporal_heads),
             "--device",
             args.device,
             "--text_model",

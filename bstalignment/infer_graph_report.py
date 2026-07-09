@@ -50,6 +50,7 @@ def build_loader(args, ckpt):
             data_root=data_root,
             split=args.split,
             max_horizon=train_args["pred_len"],
+            history_len=train_args.get("history_len", 32),
             resample_len=train_args["resample_len"],
             delay_dim=train_args["delay_dim"],
             delay_lag=train_args["delay_lag"],
@@ -99,7 +100,14 @@ def collect_predictions(model, loader, device, variant: str) -> tuple[pd.DataFra
     mse_sum = mae_sum = count = 0.0
     for batch in loader:
         batch = to_device(batch, device)
-        out = model(batch["maps"], batch["prompt"], batch["horizon"])
+        steps = batch["target_steps"] if variant == "battery" and not model.cfg.use_relative_steps else None
+        out = model(
+            batch["maps"],
+            batch["prompt"],
+            batch["horizon"],
+            steps=steps,
+            history_features=batch.get("history_features"),
+        )
         metrics = regression_metrics(out["pred"], batch["y"], batch["mask"])
         elems = float(batch["mask"].sum().detach().cpu())
         mse_sum += metrics["mse"] * elems
@@ -118,7 +126,7 @@ def collect_predictions(model, loader, device, variant: str) -> tuple[pd.DataFra
                         {
                             "series_id": batch["cell_id"][i],
                             "input_index": int(batch["cycle"][i].detach().cpu()),
-                            "forecast_step": step,
+                            "forecast_step": step + 1,
                             "target_index": int(batch["target_steps"][i, step].detach().cpu()),
                             "target_dim": "SOH",
                             "y_true": true_val,
@@ -200,7 +208,14 @@ def main():
         loader, variant, dataset = build_loader(args, ckpt)
         init_batch = next(iter(loader))
         init_batch = to_device(init_batch, device)
-        _ = model(init_batch["maps"], init_batch["prompt"], init_batch["horizon"])
+        init_steps = init_batch["target_steps"] if variant == "battery" and not model.cfg.use_relative_steps else None
+        _ = model(
+            init_batch["maps"],
+            init_batch["prompt"],
+            init_batch["horizon"],
+            steps=init_steps,
+            history_features=init_batch.get("history_features"),
+        )
     model.load_state_dict(ckpt["model"])
     model.eval()
     out_dir = ensure_dir(args.out_dir or Path(args.checkpoint).with_suffix("").parent / "figures")

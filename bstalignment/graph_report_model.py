@@ -167,6 +167,138 @@ class CrossModalFusion(nn.Module):
         return {"tokens": fused_tokens, "context": context, "cross_attn": attn}
 
 
+def _valid_n_heads(d_model: int, requested: int) -> int:
+    heads = max(1, min(int(requested), int(d_model)))
+    while heads > 1 and d_model % heads != 0:
+        heads -= 1
+    return heads
+
+
+class InterCycleTemporalEncoder(nn.Module):
+    """First-pass temporal encoder over per-cycle graph embeddings."""
+
+    def __init__(
+        self,
+        d_model: int,
+        max_history_len: int = 64,
+        layers: int = 1,
+        n_heads: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.pos_embed = nn.Embedding(max_history_len, d_model)
+        heads = _valid_n_heads(d_model, n_heads)
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=heads,
+            dim_feedforward=d_model * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=max(int(layers), 1))
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, cycle_repr: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # cycle_repr: [B,T,D]
+        b, t, _ = cycle_repr.shape
+        pos = torch.arange(t, device=cycle_repr.device).clamp(max=self.pos_embed.num_embeddings - 1)
+        x = cycle_repr + self.pos_embed(pos).unsqueeze(0)
+        tokens = self.norm(self.encoder(x))
+        return tokens[:, -1], tokens
+
+
+class NumericHistoryEncoder(nn.Module):
+    """Encode direct cycle-level numeric history used by sequence baselines."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        d_model: int,
+        max_history_len: int = 64,
+        layers: int = 1,
+        n_heads: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.input_proj = nn.Linear(self.input_dim, d_model)
+        self.pos_embed = nn.Embedding(max_history_len, d_model)
+        heads = _valid_n_heads(d_model, n_heads)
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=heads,
+            dim_feedforward=d_model * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=max(int(layers), 1))
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, history_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if history_features.size(-1) < self.input_dim:
+            pad = self.input_dim - history_features.size(-1)
+            history_features = F.pad(history_features, (0, pad))
+        elif history_features.size(-1) > self.input_dim:
+            history_features = history_features[..., : self.input_dim]
+        b, t, _ = history_features.shape
+        pos = torch.arange(t, device=history_features.device).clamp(max=self.pos_embed.num_embeddings - 1)
+        x = self.input_proj(history_features.float()) + self.pos_embed(pos).unsqueeze(0)
+        tokens = self.norm(self.encoder(x))
+        return tokens[:, -1], tokens
+
+
+class GatedSemanticFusion(nn.Module):
+    """Token-aware text retrieval followed by learnable prompt gating."""
+
+    def __init__(self, d_model: int, dropout: float = 0.1, use_gate: bool = True):
+        super().__init__()
+        self.use_gate = bool(use_gate)
+        self.q = nn.Linear(d_model, d_model)
+        self.k = nn.Linear(d_model, d_model)
+        self.v = nn.Linear(d_model, d_model)
+        self.text_out = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, d_model), nn.Dropout(dropout))
+        self.gate = nn.Sequential(
+            nn.LayerNorm(d_model * 3),
+            nn.Linear(d_model * 3, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 1),
+        )
+
+    def forward(
+        self,
+        base_context: torch.Tensor,
+        query_tokens: torch.Tensor,
+        text_tokens: torch.Tensor,
+        text_mask: Optional[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        q = self.q(query_tokens)
+        k = self.k(text_tokens)
+        v = self.v(text_tokens)
+        scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(q.size(-1))
+        if text_mask is not None:
+            scores = scores.masked_fill(~text_mask.unsqueeze(1), -1e4)
+        attn = torch.softmax(scores, dim=-1)
+        retrieved = torch.matmul(attn, v)
+        text_context = self.text_out(retrieved.mean(dim=1))
+        if self.use_gate:
+            gate = torch.sigmoid(self.gate(torch.cat([base_context, text_context, base_context * text_context], dim=-1)))
+        else:
+            gate = torch.ones(base_context.size(0), 1, dtype=base_context.dtype, device=base_context.device)
+        context = base_context + gate * text_context
+        return {
+            "context": context,
+            "gate": gate,
+            "cross_attn": attn,
+            "align_graph": query_tokens.mean(dim=1),
+            "align_text": retrieved.mean(dim=1),
+            "text_context": text_context,
+        }
+
+
 class UnifiedQueryDecoder(nn.Module):
     """Shared decoder for current estimation and arbitrary future horizon."""
 
@@ -245,6 +377,16 @@ class GraphReportTSConfig:
     use_cross_modal_fusion: bool = True
     use_dynamic_graph: bool = True
     unified_decoder: bool = True
+    battery_history_len: int = 32
+    history_feature_dim: int = 8
+    use_multi_cycle_raw: bool = True
+    single_cycle_raw: bool = False
+    use_numeric_history: bool = True
+    use_text_gate: bool = True
+    use_semantic_alignment: bool = True
+    use_relative_steps: bool = True
+    temporal_layers: int = 1
+    temporal_heads: int = 4
 
 
 class GraphReportTS(nn.Module):
@@ -270,9 +412,54 @@ class GraphReportTS(nn.Module):
         else:
             self.text_encoder = None
         self.fusion = CrossModalFusion(cfg.d_model, cfg.dropout)
+        self.semantic_fusion = GatedSemanticFusion(cfg.d_model, cfg.dropout, use_gate=cfg.use_text_gate)
+        self.temporal_encoder = InterCycleTemporalEncoder(
+            cfg.d_model,
+            max_history_len=cfg.battery_history_len,
+            layers=cfg.temporal_layers,
+            n_heads=cfg.temporal_heads,
+            dropout=cfg.dropout,
+        )
+        self.numeric_history_encoder = NumericHistoryEncoder(
+            cfg.history_feature_dim,
+            cfg.d_model,
+            max_history_len=cfg.battery_history_len,
+            layers=cfg.temporal_layers,
+            n_heads=cfg.temporal_heads,
+            dropout=cfg.dropout,
+        )
+        self.context_fuser = nn.Sequential(
+            nn.LayerNorm(cfg.d_model * 2),
+            nn.Linear(cfg.d_model * 2, cfg.d_model),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(cfg.d_model, cfg.d_model),
+        )
         self.context_norm = nn.LayerNorm(cfg.d_model)
         decoder_cls = UnifiedQueryDecoder if cfg.unified_decoder else SeparateNowFutureDecoder
         self.decoder = decoder_cls(cfg.d_model, cfg.output_dim, cfg.max_steps, cfg.dropout)
+
+    def _encode_graph_history(self, maps: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        if maps.ndim == 5:
+            b, t, c, h, w = maps.shape
+            if not self.cfg.use_multi_cycle_raw:
+                zeros = torch.zeros(b, t, self.cfg.d_model, dtype=maps.dtype, device=maps.device)
+                return zeros[:, -1], zeros, {"tokens": zeros, "graph_attn": None}
+            if self.cfg.single_cycle_raw:
+                graph = self.graph_encoder(maps[:, -1])
+                tokens = graph["repr"].unsqueeze(1)
+                return graph["repr"], tokens, graph
+            if t > 1 and self.cfg.use_multi_cycle_raw:
+                flat_maps = maps.reshape(b * t, c, h, w)
+                graph = self.graph_encoder(flat_maps)
+                cycle_repr = graph["repr"].reshape(b, t, -1)
+                if t == 1:
+                    return cycle_repr[:, -1], cycle_repr, graph
+                context, tokens = self.temporal_encoder(cycle_repr)
+                return context, tokens, graph
+        graph = self.graph_encoder(maps if maps.ndim == 4 else maps[:, -1])
+        tokens = graph["repr"].unsqueeze(1)
+        return graph["repr"], tokens, graph
 
     def forward(
         self,
@@ -280,32 +467,55 @@ class GraphReportTS(nn.Module):
         prompts: List[str],
         horizon: torch.Tensor | int,
         steps: Optional[torch.Tensor] = None,
+        history_features: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        graph = self.graph_encoder(maps)
-        context = graph["repr"]
+        graph_context, graph_cycle_tokens, graph = self._encode_graph_history(maps)
+        if history_features is not None and self.cfg.use_numeric_history:
+            numeric_context, numeric_tokens = self.numeric_history_encoder(history_features)
+        else:
+            b = maps.size(0)
+            numeric_context = torch.zeros(b, self.cfg.d_model, dtype=graph_context.dtype, device=graph_context.device)
+            numeric_tokens = torch.zeros(b, 1, self.cfg.d_model, dtype=graph_context.dtype, device=graph_context.device)
+        context = self.context_fuser(torch.cat([graph_context, numeric_context], dim=-1))
+        query_tokens = torch.cat([graph_cycle_tokens, numeric_tokens], dim=1)
         text_repr = None
         cross_attn = None
+        gate = torch.zeros(context.size(0), 1, dtype=context.dtype, device=context.device)
+        align_graph = context
+        align_text = context.detach()
         if self.text_encoder is not None and self.cfg.use_report_prompt and self.cfg.use_cross_modal_fusion:
             text_tokens, text_repr, text_mask = self.text_encoder(prompts)
-            fused = self.fusion(graph["tokens"], graph["repr"], text_tokens, text_mask)
+            if maps.ndim == 5 or self.cfg.variant == "battery":
+                fused = self.semantic_fusion(context, query_tokens, text_tokens, text_mask)
+            else:
+                fused = self.fusion(graph["tokens"], graph["repr"], text_tokens, text_mask)
+                fused["gate"] = torch.ones(context.size(0), 1, dtype=context.dtype, device=context.device)
+                fused["align_graph"] = fused["context"]
+                fused["align_text"] = text_repr
             context = fused["context"]
             cross_attn = fused["cross_attn"]
+            gate = fused["gate"]
+            align_graph = fused["align_graph"]
+            align_text = fused["align_text"] if self.cfg.use_semantic_alignment else text_repr
         context = self.context_norm(context)
         if steps is None:
             if not torch.is_tensor(horizon):
                 max_h = int(horizon)
             else:
                 max_h = int(horizon.max().item())
-            start = 0 if self.cfg.variant == "battery" else 1
-            steps = torch.arange(start, max_h + 1, device=maps.device)
+            start = 1 if (self.cfg.variant == "battery" and self.cfg.use_relative_steps) else 1
+            steps = torch.arange(start, max_h + start, device=maps.device)
         pred = self.decoder(context, steps)
         return {
             "pred": pred,
             "context": context,
-            "graph_tokens": graph["tokens"],
+            "graph_tokens": graph_cycle_tokens,
             "graph_attn": graph["graph_attn"],
             "text_repr": text_repr if text_repr is not None else context.detach() * 0,
             "cross_attn": cross_attn,
+            "gate": gate,
+            "align_graph": align_graph,
+            "align_text": align_text,
         }
 
 

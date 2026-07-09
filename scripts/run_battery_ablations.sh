@@ -5,7 +5,10 @@ ROOT="${1:-$(pwd)}"
 EPOCHS="${ABLATION_EPOCHS:-30}"
 BATCH_SIZE="${ABLATION_BATCH_SIZE:-128}"
 PRED_LEN="${PRED_LEN:-20}"
+HISTORY_LEN="${HISTORY_LEN:-32}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
+W_ALIGN="${W_ALIGN:-0.001}"
+ALIGN_WARMUP_EPOCHS="${ALIGN_WARMUP_EPOCHS:-0}"
 USE_GRAPH_CACHE="${USE_BATTERY_GRAPH_CACHE:-1}"
 GRAPH_CACHE_DIR="${BATTERY_GRAPH_CACHE_DIR:-runs/cache/battery_graph}"
 cd "$ROOT"
@@ -31,10 +34,13 @@ for dataset in mit calce xjtu; do
     --data_root bstalignment/data \
     --out_root runs/graph_report_ablation \
     --pred_len "$PRED_LEN" \
+    --history_len "$HISTORY_LEN" \
     --epochs "$EPOCHS" \
     --batch_size "$BATCH_SIZE" \
     --num_workers "$NUM_WORKERS" \
     --device cuda \
+    --w_align "$W_ALIGN" \
+    --align_warmup_epochs "$ALIGN_WARMUP_EPOCHS" \
     "${CACHE_ARGS[@]}" \
     --no_hf_text 2>&1 | tee "runs/logs/ablation_${dataset}.log"
 done

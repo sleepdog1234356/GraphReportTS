@@ -44,8 +44,12 @@ def graph_report_loss(
 ) -> Dict[str, torch.Tensor]:
     pred = out["pred"]
     reg = masked_regression_loss(pred, y, mask, loss_type=loss_type)
-    align = nt_xent_loss(out["context"], out["text_repr"], temperature=weights.get("temperature", 0.2))
-    total = reg + weights.get("align", 0.01) * align
+    align_weight = float(weights.get("align", 0.0))
+    if align_weight > 0.0 and "align_graph" in out and "align_text" in out:
+        align = nt_xent_loss(out["align_graph"], out["align_text"], temperature=weights.get("temperature", 0.2))
+    else:
+        align = torch.tensor(0.0, dtype=reg.dtype, device=reg.device)
+    total = reg + align_weight * align
     return {"total": total, "reg": reg.detach(), "align": align.detach()}
 
 

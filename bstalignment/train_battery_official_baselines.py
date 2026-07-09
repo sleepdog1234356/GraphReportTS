@@ -101,8 +101,8 @@ def base_forecast_config(args, num_features: int) -> SimpleNamespace:
         llm_layers=args.llm_layers,
         prompt_domain=1,
         content=(
-            "Battery state-of-health forecasting from historical SOH and capacity-summary "
-            "cycle sequences."
+            "Battery state-of-health forecasting from observable capacity, resistance, "
+            "charge-time, and cycle-position sequences without historical SOH inputs."
         ),
     )
 
@@ -138,7 +138,7 @@ class TimeCMAPromptEmbeddings(nn.Module):
 
     def _prompts(self, x: torch.Tensor) -> List[str]:
         prompts: List[str] = []
-        names = ["SOH", "capacity summary"]
+        names = [name.replace("_", " ") for name in FEATURES]
         x_cpu = x.detach().float().cpu()
         for b in range(x_cpu.size(0)):
             for j in range(x_cpu.size(2)):

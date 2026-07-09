@@ -93,7 +93,7 @@ def preprocess_calce_cell(cell_dir: Path, out_path: Path, resample_len: int = 12
         if df.empty or "Cycle_Index" not in df:
             continue
         df = df.copy()
-        df["Cycle_Index"] = pd.to_numeric(df["Cycle_Index"], errors="coerce").ffill().bfill()
+        df["Cycle_Index"] = pd.to_numeric(df["Cycle_Index"], errors="coerce").ffill()
         df = df.dropna(subset=["Cycle_Index"])
         if df.empty:
             continue

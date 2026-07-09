@@ -48,6 +48,11 @@ CYCLE_FEATURES = [
 ]
 
 
+def _past_only_fill(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill missing cycle-level values without using later cycles."""
+    return df.replace([np.inf, -np.inf], np.nan).ffill().fillna(0.0)
+
+
 @dataclass
 class CellRecord:
     cell_id: str
@@ -130,10 +135,7 @@ def _summary_to_frame(summary: Dict[str, Any]) -> pd.DataFrame:
     if df["cycle"].isna().all():
         df["cycle"] = np.arange(1, len(df) + 1)
     df = df.sort_values("cycle").reset_index(drop=True)
-    # Fill sparse missing values without leaking future too aggressively.
-    df = df.replace([np.inf, -np.inf], np.nan).interpolate(limit_direction="both")
-    df = df.ffill().bfill()
-    return df
+    return _past_only_fill(df)
 
 
 def load_mit_battery_pkls(data_dir: str | Path, filenames: Optional[List[str]] = None) -> List[CellRecord]:
@@ -188,7 +190,7 @@ def load_mit_battery_pkls(data_dir: str | Path, filenames: Optional[List[str]] =
 
 
 def add_cycle_features(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
+    out = _past_only_fill(df.copy())
     # MIT cells are A123 LFP/graphite nominally around 1.1Ah; for SOH, initial observed capacity is safer.
     qd = out["QD"].astype(float).to_numpy()
     valid = qd[np.isfinite(qd)]
@@ -207,7 +209,7 @@ def add_cycle_features(df: pd.DataFrame) -> pd.DataFrame:
     out["QD_slope5"] = _rolling_slope(out["QD"], window=5)
     out["IR_slope5"] = _rolling_slope(out["IR"], window=5)
     out["aging_stage"] = out["SOH"].map(aging_stage_from_soh).astype(int)
-    return out.replace([np.inf, -np.inf], np.nan).interpolate(limit_direction="both").ffill().bfill()
+    return _past_only_fill(out)
 
 
 def _rolling_slope(series: pd.Series, window: int = 5) -> pd.Series:

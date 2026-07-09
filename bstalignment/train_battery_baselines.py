@@ -19,7 +19,27 @@ except ImportError:
     from utils import AverageMeter, ensure_dir, save_json, seed_everything
 
 
-FEATURES = ["soh", "capacity_summary"]
+FEATURES = ["capacity_summary", "capacity_delta", "internal_resistance", "charge_time", "cycle_ratio"]
+
+
+def _as_float_series(values: np.ndarray | None, n: int, fill: float = 0.0) -> np.ndarray:
+    if values is None:
+        return np.full(n, float(fill), dtype=np.float32)
+    arr = np.asarray(values, dtype=np.float32).reshape(-1)
+    if len(arr) < n:
+        out = np.full(n, float(fill), dtype=np.float32)
+        out[: len(arr)] = arr
+        return out
+    return arr[:n].astype(np.float32)
+
+
+def _cycle_ratio(cycle_ids: np.ndarray | None, n: int) -> np.ndarray:
+    if cycle_ids is None:
+        arr = np.arange(1, n + 1, dtype=np.float32)
+    else:
+        arr = _as_float_series(cycle_ids, n, fill=0.0)
+    denom = max(float(np.nanmax(arr)) if len(arr) else 1.0, 1.0)
+    return (arr / denom).astype(np.float32)
 
 
 class BatterySequenceDataset(Dataset):
@@ -39,22 +59,43 @@ class BatterySequenceDataset(Dataset):
         self.input_len = int(input_len)
         self.pred_len = int(pred_len)
         self.series: Dict[str, np.ndarray] = {}
+        self.targets: Dict[str, np.ndarray] = {}
         self.samples: List[Tuple[str, int]] = []
         if self.dataset_name == "mit":
             self._load_mit(seed, max_cycles)
         else:
             self._load_processed(seed, max_cycles)
 
-    def _add_series(self, cell_id: str, soh: np.ndarray, capacity: np.ndarray | None) -> None:
+    def _add_series(
+        self,
+        cell_id: str,
+        soh: np.ndarray,
+        capacity: np.ndarray | None,
+        internal_resistance: np.ndarray | None = None,
+        charge_time: np.ndarray | None = None,
+        cycle_ids: np.ndarray | None = None,
+    ) -> None:
         soh = np.asarray(soh, dtype=np.float32).reshape(-1)
-        if capacity is None or len(capacity) != len(soh):
-            capacity = soh.copy()
-        capacity = np.asarray(capacity, dtype=np.float32).reshape(-1)
-        values = np.stack([soh, capacity], axis=-1)
+        n = len(soh)
+        capacity = _as_float_series(capacity, n)
+        internal_resistance = _as_float_series(internal_resistance, n)
+        charge_time = _as_float_series(charge_time, n)
+        values = np.stack(
+            [
+                capacity,
+                np.diff(capacity, prepend=capacity[0]).astype(np.float32) if n else capacity,
+                internal_resistance,
+                charge_time,
+                _cycle_ratio(cycle_ids, n),
+            ],
+            axis=-1,
+        )
         values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+        target = np.nan_to_num(soh, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
         if len(values) < self.input_len + self.pred_len:
             return
         self.series[cell_id] = values
+        self.targets[cell_id] = target
         for start in range(0, len(values) - self.input_len - self.pred_len + 1):
             self.samples.append((cell_id, start))
 
@@ -66,7 +107,14 @@ class BatterySequenceDataset(Dataset):
             df = add_cycle_features(rec.summary)
             if max_cycles is not None:
                 df = df.iloc[: int(max_cycles)].copy()
-            self._add_series(rec.cell_id, df["SOH"].to_numpy(np.float32), df["QD"].to_numpy(np.float32))
+            self._add_series(
+                rec.cell_id,
+                df["SOH"].to_numpy(np.float32),
+                df["QD"].to_numpy(np.float32),
+                df["IR"].to_numpy(np.float32),
+                df["chargetime"].to_numpy(np.float32),
+                df["cycle"].to_numpy(np.float32),
+            )
 
     def _load_processed(self, seed: int, max_cycles: int | None) -> None:
         root = self.data_root / "processed" / "battery" / self.dataset_name
@@ -96,10 +144,19 @@ class BatterySequenceDataset(Dataset):
             data = np.load(files[int(idx)], allow_pickle=True)
             soh = np.asarray(data["soh"], dtype=np.float32)
             capacity = np.asarray(data["capacity_summary"], dtype=np.float32) if "capacity_summary" in data else None
+            if capacity is None and "capacity" in data:
+                capacity_arr = np.asarray(data["capacity"], dtype=np.float32)
+                capacity = capacity_arr[:, -1] if capacity_arr.ndim == 2 else capacity_arr.reshape(len(soh), -1)[:, -1]
+            internal_resistance = np.asarray(data["internal_resistance"], dtype=np.float32) if "internal_resistance" in data else None
+            charge_time = np.asarray(data["charge_time"], dtype=np.float32) if "charge_time" in data else None
+            cycle_ids = np.asarray(data["cycle_id"], dtype=np.float32) if "cycle_id" in data else None
             if max_cycles is not None:
                 soh = soh[: int(max_cycles)]
                 capacity = capacity[: int(max_cycles)] if capacity is not None else None
-            self._add_series(files[int(idx)].stem, soh, capacity)
+                internal_resistance = internal_resistance[: int(max_cycles)] if internal_resistance is not None else None
+                charge_time = charge_time[: int(max_cycles)] if charge_time is not None else None
+                cycle_ids = cycle_ids[: int(max_cycles)] if cycle_ids is not None else None
+            self._add_series(files[int(idx)].stem, soh, capacity, internal_resistance, charge_time, cycle_ids)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -107,8 +164,9 @@ class BatterySequenceDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor | str]:
         cell_id, start = self.samples[idx]
         values = self.series[cell_id]
+        target = self.targets[cell_id]
         x = values[start : start + self.input_len]
-        y = values[start + self.input_len : start + self.input_len + self.pred_len, 0]
+        y = target[start + self.input_len : start + self.input_len + self.pred_len]
         return {
             "x": torch.tensor(x, dtype=torch.float32),
             "y": torch.tensor(y, dtype=torch.float32),

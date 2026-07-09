@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -21,7 +22,18 @@ except ImportError:
 
 
 RAW_BATTERY_CHANNELS = ["current", "voltage", "temperature", "capacity"]
-BATTERY_GRAPH_CACHE_VERSION = 1
+BATTERY_GRAPH_CACHE_VERSION = 4
+BATTERY_HISTORY_FEATURE_SCHEMA = [
+    "capacity_value",
+    "capacity_zscore",
+    "internal_resistance_zscore",
+    "charge_time_zscore",
+    "cycle_ratio",
+    "capacity_delta",
+    "internal_resistance_delta",
+    "charge_time_delta",
+]
+BATTERY_HISTORY_FEATURE_DIM = len(BATTERY_HISTORY_FEATURE_SCHEMA)
 
 
 def battery_graph_cache_config(
@@ -37,6 +49,7 @@ def battery_graph_cache_config(
     allow_summary_fallback: bool,
     seed: int,
     max_cycles: Optional[int],
+    history_len: int = 32,
 ) -> Dict[str, Any]:
     return {
         "version": BATTERY_GRAPH_CACHE_VERSION,
@@ -52,6 +65,8 @@ def battery_graph_cache_config(
         "allow_summary_fallback": bool(allow_summary_fallback),
         "seed": int(seed),
         "max_cycles": None if max_cycles is None else int(max_cycles),
+        "history_len": int(history_len),
+        "history_feature_schema": list(BATTERY_HISTORY_FEATURE_SCHEMA),
     }
 
 
@@ -135,6 +150,63 @@ def _summary_pseudo_channels(rec: CellRecord, cycle_id: int) -> Dict[str, np.nda
     }
 
 
+def _safe_col(df: pd.DataFrame, name: str, fallback: float = 0.0) -> np.ndarray:
+    if name in df:
+        return df[name].to_numpy(dtype=np.float32)
+    return np.full(len(df), float(fallback), dtype=np.float32)
+
+
+def _safe_zscore(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    arr = np.nan_to_num(np.asarray(x, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    std = float(np.nanstd(arr))
+    if std < eps:
+        return np.zeros_like(arr, dtype=np.float32)
+    return ((arr - float(np.nanmean(arr))) / std).astype(np.float32)
+
+
+def _relative_to_first(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    arr = np.nan_to_num(np.asarray(x, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    base = float(arr[0]) if len(arr) else 1.0
+    if abs(base) < eps:
+        return arr.astype(np.float32)
+    return (arr / base).astype(np.float32)
+
+
+def _diff_prepend_zero(x: np.ndarray) -> np.ndarray:
+    arr = np.nan_to_num(np.asarray(x, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    if len(arr) == 0:
+        return arr
+    return np.diff(arr, prepend=arr[0]).astype(np.float32)
+
+
+def _history_feature_matrix(
+    capacity: np.ndarray,
+    internal_resistance: np.ndarray,
+    charge_time: np.ndarray,
+    cycle_ids: np.ndarray,
+    max_cycle_id: int,
+) -> np.ndarray:
+    capacity = np.nan_to_num(np.asarray(capacity, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    internal_resistance = np.nan_to_num(np.asarray(internal_resistance, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    charge_time = np.nan_to_num(np.asarray(charge_time, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    cycle_ids = np.asarray(cycle_ids, dtype=np.float32)
+    denom = max(float(max_cycle_id), 1.0)
+    feats = np.stack(
+        [
+            capacity.astype(np.float32),
+            _safe_zscore(capacity),
+            _safe_zscore(internal_resistance),
+            _safe_zscore(charge_time),
+            (cycle_ids / denom).astype(np.float32),
+            _diff_prepend_zero(capacity),
+            _diff_prepend_zero(internal_resistance),
+            _diff_prepend_zero(charge_time),
+        ],
+        axis=-1,
+    )
+    return np.nan_to_num(feats.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+
+
 class BatteryRawGraphDataset(Dataset):
     """Battery SOH dataset for GraphReportTS.
 
@@ -162,10 +234,12 @@ class BatteryRawGraphDataset(Dataset):
         include_ic_dv: bool = True,
         allow_summary_fallback: bool = False,
         cache_items: bool = False,
+        cycle_cache_size: int = 4096,
         precomputed_cache_dir: Optional[str] = None,
         require_precomputed_cache: bool = False,
         seed: int = 42,
         max_cycles: Optional[int] = None,
+        history_len: int = 32,
     ):
         self.dataset_name = dataset_name.lower()
         self.data_root = Path(data_root)
@@ -178,8 +252,11 @@ class BatteryRawGraphDataset(Dataset):
         self.include_hankel = bool(include_hankel)
         self.include_ic_dv = bool(include_ic_dv)
         self.allow_summary_fallback = bool(allow_summary_fallback)
+        self.history_len = max(int(history_len), 1)
         self.cache_items = bool(cache_items)
         self._item_cache: Dict[int, Dict[str, Any]] = {}
+        self.cycle_cache_size = max(int(cycle_cache_size), 0)
+        self._cycle_map_cache: OrderedDict[Tuple[str, str, int], Tuple[np.ndarray, List[str]]] = OrderedDict()
         self.precomputed_cache_dir = Path(precomputed_cache_dir) if precomputed_cache_dir else None
         self.require_precomputed_cache = bool(require_precomputed_cache)
         self.cache_config = battery_graph_cache_config(
@@ -195,14 +272,20 @@ class BatteryRawGraphDataset(Dataset):
             allow_summary_fallback=self.allow_summary_fallback,
             seed=seed,
             max_cycles=max_cycles,
+            history_len=self.history_len,
         )
         self._precomputed = False
         self._cache_path: Optional[Path] = None
         self._cache_maps = None
+        self._cache_cycle_maps = None
+        self._cache_history_indices = None
         self._cache_y = None
         self._cache_mask = None
         self._cache_horizon = None
         self._cache_target_steps = None
+        self._cache_history_features = None
+        self._cache_history_cycles = None
+        self._cache_layout = "sample_history"
         self._cache_meta: List[Dict[str, Any]] = []
         if self.precomputed_cache_dir is not None and self._try_load_precomputed_cache():
             return
@@ -231,19 +314,29 @@ class BatteryRawGraphDataset(Dataset):
         if manifest.get("config") != self.cache_config:
             return False
         files = manifest.get("files", {})
-        required = ["maps", "y", "mask", "horizon", "target_steps", "meta"]
+        self._cache_layout = str(manifest.get("layout", "sample_history"))
+        if self._cache_layout == "cycle_history":
+            required = ["cycle_maps", "history_indices", "y", "mask", "horizon", "target_steps", "history_features", "history_cycles", "meta"]
+        else:
+            required = ["maps", "y", "mask", "horizon", "target_steps", "history_features", "history_cycles", "meta"]
         if any(not (cache_path / str(files.get(name, ""))).exists() for name in required):
             return False
         self._cache_path = cache_path
-        self._cache_maps = np.load(cache_path / files["maps"], mmap_mode="r")
+        if self._cache_layout == "cycle_history":
+            self._cache_cycle_maps = np.load(cache_path / files["cycle_maps"], mmap_mode="r")
+            self._cache_history_indices = np.load(cache_path / files["history_indices"], mmap_mode="r")
+        else:
+            self._cache_maps = np.load(cache_path / files["maps"], mmap_mode="r")
         self._cache_y = np.load(cache_path / files["y"], mmap_mode="r")
         self._cache_mask = np.load(cache_path / files["mask"], mmap_mode="r")
         self._cache_horizon = np.load(cache_path / files["horizon"], mmap_mode="r")
         self._cache_target_steps = np.load(cache_path / files["target_steps"], mmap_mode="r")
+        self._cache_history_features = np.load(cache_path / files["history_features"], mmap_mode="r")
+        self._cache_history_cycles = np.load(cache_path / files["history_cycles"], mmap_mode="r")
         with (cache_path / files["meta"]).open("r", encoding="utf-8") as f:
             self._cache_meta = [json.loads(line) for line in f if line.strip()]
         sample_count = int(manifest.get("sample_count", -1))
-        if sample_count < 0 or sample_count != len(self._cache_meta) or sample_count != int(self._cache_maps.shape[0]):
+        if sample_count < 0 or sample_count != len(self._cache_meta) or sample_count != int(self._cache_y.shape[0]):
             return False
         self._precomputed = True
         self.samples = []
@@ -260,7 +353,7 @@ class BatteryRawGraphDataset(Dataset):
             df = add_cycle_features(rec.summary)
             if max_cycles is not None:
                 df = df.iloc[:max_cycles].copy()
-            for row_idx in range(0, len(df) - 1):
+            for row_idx in range(self.history_len - 1, len(df) - 1):
                 available = min(self.max_horizon, len(df) - row_idx - 1)
                 if available <= 0:
                     continue
@@ -275,7 +368,9 @@ class BatteryRawGraphDataset(Dataset):
 
     def _load_processed(self, max_cycles: Optional[int], seed: int) -> None:
         note = BATTERY_DATASET_NOTES.get(self.dataset_name, {})
-        processed_dir = Path(note.get("processed_dir", self.data_root / "processed" / "battery" / self.dataset_name))
+        processed_dir = self.data_root / "processed" / "battery" / self.dataset_name
+        if not processed_dir.exists() and note.get("processed_dir"):
+            processed_dir = Path(note["processed_dir"])
         files = sorted(processed_dir.glob("*.npz"))
         if not files:
             required = "\n  - ".join(note.get("required", []))
@@ -321,7 +416,7 @@ class BatteryRawGraphDataset(Dataset):
             n = len(cell["cycle_id"])
             if max_cycles is not None:
                 n = min(n, int(max_cycles))
-            for row_idx in range(0, n - 1):
+            for row_idx in range(self.history_len - 1, n - 1):
                 available = min(self.max_horizon, n - row_idx - 1)
                 if available <= 0:
                     continue
@@ -336,8 +431,113 @@ class BatteryRawGraphDataset(Dataset):
 
     def __len__(self) -> int:
         if self._precomputed:
-            return int(self._cache_maps.shape[0])
+            if self._cache_y is None:
+                return 0
+            return int(self._cache_y.shape[0])
         return len(self.samples)
+
+    def _cached_cycle_maps(self, key: Tuple[str, str, int], builder: Callable[[], Tuple[np.ndarray, List[str]]]) -> Tuple[np.ndarray, List[str]]:
+        if self.cycle_cache_size <= 0:
+            return builder()
+        if key in self._cycle_map_cache:
+            maps, names = self._cycle_map_cache.pop(key)
+            self._cycle_map_cache[key] = (maps, names)
+            return maps, names
+        maps, names = builder()
+        self._cycle_map_cache[key] = (maps, names)
+        while len(self._cycle_map_cache) > self.cycle_cache_size:
+            self._cycle_map_cache.popitem(last=False)
+        return maps, names
+
+    def _build_maps_from_channels(self, channels: Dict[str, np.ndarray]) -> Tuple[np.ndarray, List[str]]:
+        return build_multiview_maps(
+            channels,
+            resample_len=self.resample_len,
+            delay_dim=self.delay_dim,
+            delay_lag=self.delay_lag,
+            include_derivatives=self.include_derivatives,
+            include_hankel=self.include_hankel,
+            include_ic_dv=self.include_ic_dv,
+        )
+
+    def _mit_cycle_maps(self, rec: CellRecord, cycle_id: int) -> Tuple[np.ndarray, List[str]]:
+        def build() -> Tuple[np.ndarray, List[str]]:
+            channels = _extract_mit_cycle_channels(rec, cycle_id)
+            if not any(len(v) for v in channels.values()):
+                if not self.allow_summary_fallback:
+                    raise RuntimeError(
+                        f"Raw MIT cycle arrays not found for {rec.cell_id} cycle {cycle_id}. "
+                        "For formal GraphReportTS experiments, rebuild MIT pkl with raw cycles. "
+                        "Use allow_summary_fallback only for smoke tests."
+                    )
+                channels = _summary_pseudo_channels(rec, cycle_id)
+            return self._build_maps_from_channels(channels)
+
+        return self._cached_cycle_maps(("mit", rec.cell_id, int(cycle_id)), build)
+
+    def _processed_cycle_maps(self, cell: Dict[str, Any], row_idx: int) -> Tuple[np.ndarray, List[str]]:
+        cycle_id = int(cell["cycle_id"][row_idx])
+
+        def build() -> Tuple[np.ndarray, List[str]]:
+            channels = {
+                "current": np.asarray(cell["current"][row_idx], dtype=np.float32),
+                "voltage": np.asarray(cell["voltage"][row_idx], dtype=np.float32),
+                "temperature": np.asarray(cell["temperature"][row_idx], dtype=np.float32),
+                "capacity": np.asarray(cell["capacity"][row_idx], dtype=np.float32),
+            }
+            return self._build_maps_from_channels(channels)
+
+        return self._cached_cycle_maps((str(self.dataset_name), str(cell["cell_id"]), cycle_id), build)
+
+    def _mit_history_features(self, df: pd.DataFrame, start: int, stop: int) -> np.ndarray:
+        hist = df.iloc[start:stop]
+        max_cycle = int(df["cycle"].iloc[-1]) if len(df) else 1
+        return _history_feature_matrix(
+            capacity=_safe_col(hist, "QD"),
+            internal_resistance=_safe_col(hist, "IR"),
+            charge_time=_safe_col(hist, "chargetime"),
+            cycle_ids=_safe_col(hist, "cycle"),
+            max_cycle_id=max_cycle,
+        )
+
+    def _processed_history_features(self, cell: Dict[str, Any], start: int, stop: int, n: int) -> np.ndarray:
+        if "capacity_summary" in cell:
+            capacity = np.asarray(cell["capacity_summary"][start:stop], dtype=np.float32)
+        else:
+            capacity_arr = np.asarray(cell["capacity"][start:stop], dtype=np.float32)
+            capacity = capacity_arr[:, -1] if capacity_arr.ndim == 2 else capacity_arr.reshape(len(capacity_arr), -1)[:, -1]
+        zeros = np.zeros_like(capacity, dtype=np.float32)
+        return _history_feature_matrix(
+            capacity=capacity,
+            internal_resistance=np.asarray(cell.get("internal_resistance", zeros)[start:stop], dtype=np.float32)
+            if "internal_resistance" in cell
+            else zeros,
+            charge_time=np.asarray(cell.get("charge_time", zeros)[start:stop], dtype=np.float32) if "charge_time" in cell else zeros,
+            cycle_ids=np.asarray(cell["cycle_id"][start:stop], dtype=np.float32),
+            max_cycle_id=int(cell["cycle_id"][n - 1]) if n > 0 else 1,
+        )
+
+    def _prompt_from_history(
+        self,
+        summary_array: np.ndarray,
+        variables: List[str],
+        horizon: int,
+        cell_id: str,
+        cycle_id: int,
+        map_names: List[str],
+    ) -> str:
+        prompt = build_report_from_array(
+            summary_array,
+            domain=f"battery-{self.dataset_name}",
+            horizon=horizon,
+            variables=variables,
+        )
+        prompt += (
+            f" Recent {self.history_len} cycles are provided as direct numeric and raw-map input; "
+            f"older history is summarized in this prompt. Battery adapter: cell_id={cell_id}; "
+            f"cycle={cycle_id}; channels={', '.join(map_names[:10])}; target=future SOH."
+        )
+        return prompt
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         if self._precomputed:
@@ -350,63 +550,35 @@ class BatteryRawGraphDataset(Dataset):
             if self.cache_items:
                 self._item_cache[idx] = item
             return item
-        rec = self.records[int(s["record_idx"])]
-        df = add_cycle_features(rec.summary)
-        row_idx = int(s["row_idx"])
-        horizon = int(s["horizon"])
-        cycle_id = int(df.iloc[row_idx]["cycle"])
-        future = df.iloc[row_idx + 1 : row_idx + 1 + horizon]
-        channels = _extract_mit_cycle_channels(rec, cycle_id)
-        if not any(len(v) for v in channels.values()):
-            if not self.allow_summary_fallback:
-                raise RuntimeError(
-                    f"Raw MIT cycle arrays not found for {rec.cell_id} cycle {cycle_id}. "
-                    "For formal GraphReportTS experiments, rebuild MIT pkl with raw cycles. "
-                    "Use allow_summary_fallback only for smoke tests."
-                )
-            channels = _summary_pseudo_channels(rec, cycle_id)
-        maps, map_names = build_multiview_maps(
-            channels,
-            resample_len=self.resample_len,
-            delay_dim=self.delay_dim,
-            delay_lag=self.delay_lag,
-            include_derivatives=self.include_derivatives,
-            include_hankel=self.include_hankel,
-            include_ic_dv=self.include_ic_dv,
-        )
-        hist = df.iloc[: row_idx + 1][["QD", "IR", "chargetime"]].to_numpy(dtype=np.float32)
-        prompt = build_report_from_array(
-            hist,
-            domain=f"battery-{self.dataset_name}",
-            horizon=horizon,
-            variables=["QD", "IR", "chargetime"],
-        )
-        prompt += (
-            f" Battery adapter: cell_id={rec.cell_id}; cycle={cycle_id}; "
-            f"channels={', '.join(map_names[:10])}; target=SOH."
-        )
-        item = {
-            "maps": torch.tensor(maps, dtype=torch.float32),
-            "y": torch.tensor(np.concatenate([[float(df.iloc[row_idx]['SOH'])], future["SOH"].to_numpy(dtype=np.float32)]), dtype=torch.float32),
-            "mask": torch.ones(horizon + 1, dtype=torch.bool),
-            "horizon": torch.tensor(horizon, dtype=torch.long),
-            "prompt": prompt,
-            "cell_id": rec.cell_id,
-            "cycle": cycle_id,
-            "target_steps": torch.tensor(np.concatenate([[cycle_id], future["cycle"].to_numpy(dtype=np.int64)]), dtype=torch.long),
-        }
+        item = self._getitem_mit(s)
         if self.cache_items:
             self._item_cache[idx] = item
         return item
 
     def _getitem_precomputed(self, idx: int) -> Dict[str, Any]:
-        if self._cache_maps is None or self._cache_y is None or self._cache_mask is None or self._cache_horizon is None or self._cache_target_steps is None:
+        if (
+            self._cache_y is None
+            or self._cache_mask is None
+            or self._cache_horizon is None
+            or self._cache_target_steps is None
+            or self._cache_history_features is None
+            or self._cache_history_cycles is None
+        ):
             raise RuntimeError("Precomputed cache arrays are not loaded")
         horizon = int(self._cache_horizon[idx])
-        width = horizon + 1
+        width = horizon
         meta = self._cache_meta[idx]
+        if self._cache_layout == "cycle_history":
+            if self._cache_cycle_maps is None or self._cache_history_indices is None:
+                raise RuntimeError("Precomputed cycle-history cache arrays are not loaded")
+            hist_idx = np.asarray(self._cache_history_indices[idx], dtype=np.int64)
+            maps_arr = np.array(self._cache_cycle_maps[hist_idx], copy=True)
+        else:
+            if self._cache_maps is None:
+                raise RuntimeError("Precomputed sample-history map cache is not loaded")
+            maps_arr = np.array(self._cache_maps[idx], copy=True)
         return {
-            "maps": torch.tensor(np.array(self._cache_maps[idx], copy=True), dtype=torch.float32),
+            "maps": torch.tensor(maps_arr, dtype=torch.float32),
             "y": torch.tensor(np.array(self._cache_y[idx, :width], copy=True), dtype=torch.float32),
             "mask": torch.tensor(np.array(self._cache_mask[idx, :width], copy=True), dtype=torch.bool),
             "horizon": torch.tensor(horizon, dtype=torch.long),
@@ -414,7 +586,46 @@ class BatteryRawGraphDataset(Dataset):
             "cell_id": str(meta["cell_id"]),
             "cycle": int(meta["cycle"]),
             "target_steps": torch.tensor(np.array(self._cache_target_steps[idx, :width], copy=True), dtype=torch.long),
+            "history_features": torch.tensor(np.array(self._cache_history_features[idx], copy=True), dtype=torch.float32),
+            "history_cycles": torch.tensor(np.array(self._cache_history_cycles[idx], copy=True), dtype=torch.long),
         }
+
+    def _getitem_mit(self, s: Dict[str, Any]) -> Dict[str, Any]:
+        rec = self.records[int(s["record_idx"])]
+        df = add_cycle_features(rec.summary)
+        row_idx = int(s["row_idx"])
+        horizon = int(s["horizon"])
+        cycle_id = int(df.iloc[row_idx]["cycle"])
+        start = row_idx - self.history_len + 1
+        hist_df = df.iloc[start : row_idx + 1]
+        future = df.iloc[row_idx + 1 : row_idx + 1 + horizon]
+        map_rows: List[np.ndarray] = []
+        map_names: List[str] = []
+        for hist_cycle in hist_df["cycle"].to_numpy(dtype=np.int64):
+            maps_i, names_i = self._mit_cycle_maps(rec, int(hist_cycle))
+            map_rows.append(maps_i)
+            if not map_names:
+                map_names = names_i
+        older = df.iloc[:start]
+        if len(older):
+            summary = older[["QD", "IR", "chargetime"]].to_numpy(dtype=np.float32)
+        else:
+            summary = hist_df[["QD", "IR", "chargetime"]].to_numpy(dtype=np.float32)
+        prompt = self._prompt_from_history(summary, ["QD", "IR", "chargetime"], horizon, rec.cell_id, cycle_id, map_names)
+        y = future["SOH"].to_numpy(dtype=np.float32)
+        item = {
+            "maps": torch.tensor(np.stack(map_rows, axis=0), dtype=torch.float32),
+            "history_features": torch.tensor(self._mit_history_features(df, start, row_idx + 1), dtype=torch.float32),
+            "history_cycles": torch.tensor(hist_df["cycle"].to_numpy(dtype=np.int64), dtype=torch.long),
+            "y": torch.tensor(y, dtype=torch.float32),
+            "mask": torch.ones(horizon, dtype=torch.bool),
+            "horizon": torch.tensor(horizon, dtype=torch.long),
+            "prompt": prompt,
+            "cell_id": rec.cell_id,
+            "cycle": cycle_id,
+            "target_steps": torch.tensor(future["cycle"].to_numpy(dtype=np.int64), dtype=torch.long),
+        }
+        return item
 
     def _getitem_processed(self, s: Dict[str, Any]) -> Dict[str, Any]:
         cell = self.processed_cells[int(s["processed_idx"])]
@@ -422,37 +633,44 @@ class BatteryRawGraphDataset(Dataset):
         horizon = int(s["horizon"])
         cycle_id = int(cell["cycle_id"][row_idx])
         future_slice = slice(row_idx + 1, row_idx + 1 + horizon)
-        channels = {
-            "current": np.asarray(cell["current"][row_idx], dtype=np.float32),
-            "voltage": np.asarray(cell["voltage"][row_idx], dtype=np.float32),
-            "temperature": np.asarray(cell["temperature"][row_idx], dtype=np.float32),
-            "capacity": np.asarray(cell["capacity"][row_idx], dtype=np.float32),
-        }
-        maps, map_names = build_multiview_maps(
-            channels,
-            resample_len=self.resample_len,
-            delay_dim=self.delay_dim,
-            delay_lag=self.delay_lag,
-            include_derivatives=self.include_derivatives,
-            include_hankel=self.include_hankel,
-            include_ic_dv=self.include_ic_dv,
-        )
-        hist_cols = [np.asarray(cell["soh"][: row_idx + 1], dtype=np.float32)]
+        start = row_idx - self.history_len + 1
+        map_rows: List[np.ndarray] = []
+        map_names: List[str] = []
+        for hist_row in range(start, row_idx + 1):
+            maps_i, names_i = self._processed_cycle_maps(cell, hist_row)
+            map_rows.append(maps_i)
+            if not map_names:
+                map_names = names_i
+        older_stop = max(start, 1)
+        hist_cols: List[np.ndarray] = []
+        variables: List[str] = []
         if "capacity_summary" in cell:
-            hist_cols.append(np.asarray(cell["capacity_summary"][: row_idx + 1], dtype=np.float32))
+            hist_cols.append(np.asarray(cell["capacity_summary"][:older_stop], dtype=np.float32))
+            variables.append("capacity")
+        elif "capacity" in cell:
+            cap = np.asarray(cell["capacity"][:older_stop], dtype=np.float32)
+            hist_cols.append(cap[:, -1] if cap.ndim == 2 else cap.reshape(older_stop, -1)[:, -1])
+            variables.append("capacity")
+        if "internal_resistance" in cell:
+            hist_cols.append(np.asarray(cell["internal_resistance"][:older_stop], dtype=np.float32))
+            variables.append("internal_resistance")
+        if "charge_time" in cell:
+            hist_cols.append(np.asarray(cell["charge_time"][:older_stop], dtype=np.float32))
+            variables.append("charge_time")
+        if not hist_cols:
+            hist_cols.append(np.asarray(cell["cycle_id"][:older_stop], dtype=np.float32))
+            variables.append("cycle_id")
         hist = np.stack(hist_cols, axis=-1)
-        variables = ["SOH"] + (["capacity"] if len(hist_cols) > 1 else [])
-        prompt = build_report_from_array(hist, domain=f"battery-{self.dataset_name}", horizon=horizon, variables=variables)
-        prompt += (
-            f" Battery adapter: cell_id={cell['cell_id']}; cycle={cycle_id}; "
-            f"channels={', '.join(map_names[:10])}; target=SOH."
-        )
-        target_steps = np.concatenate([[cycle_id], np.asarray(cell["cycle_id"][future_slice], dtype=np.int64)])
-        y = np.concatenate([[float(cell["soh"][row_idx])], np.asarray(cell["soh"][future_slice], dtype=np.float32)])
+        prompt = self._prompt_from_history(hist, variables, horizon, str(cell["cell_id"]), cycle_id, map_names)
+        n = len(cell["cycle_id"])
+        target_steps = np.asarray(cell["cycle_id"][future_slice], dtype=np.int64)
+        y = np.asarray(cell["soh"][future_slice], dtype=np.float32)
         item = {
-            "maps": torch.tensor(maps, dtype=torch.float32),
+            "maps": torch.tensor(np.stack(map_rows, axis=0), dtype=torch.float32),
+            "history_features": torch.tensor(self._processed_history_features(cell, start, row_idx + 1, n), dtype=torch.float32),
+            "history_cycles": torch.tensor(np.asarray(cell["cycle_id"][start : row_idx + 1], dtype=np.int64), dtype=torch.long),
             "y": torch.tensor(y, dtype=torch.float32),
-            "mask": torch.ones(horizon + 1, dtype=torch.bool),
+            "mask": torch.ones(horizon, dtype=torch.bool),
             "horizon": torch.tensor(horizon, dtype=torch.long),
             "prompt": prompt,
             "cell_id": str(cell["cell_id"]),
@@ -463,18 +681,24 @@ class BatteryRawGraphDataset(Dataset):
 
 
 def collate_graph_report_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    max_h = max(int(b["horizon"]) for b in batch) + 1
-    max_c = max(b["maps"].shape[0] for b in batch)
-    max_hmap = max(b["maps"].shape[1] for b in batch)
-    max_wmap = max(b["maps"].shape[2] for b in batch)
-    maps = torch.zeros(len(batch), max_c, max_hmap, max_wmap, dtype=torch.float32)
+    max_h = max(int(b["horizon"]) for b in batch)
+    max_t = max(b["maps"].shape[0] for b in batch)
+    max_c = max(b["maps"].shape[1] for b in batch)
+    max_hmap = max(b["maps"].shape[2] for b in batch)
+    max_wmap = max(b["maps"].shape[3] for b in batch)
+    feat_dim = max(b["history_features"].shape[-1] for b in batch)
+    maps = torch.zeros(len(batch), max_t, max_c, max_hmap, max_wmap, dtype=torch.float32)
+    history_features = torch.zeros(len(batch), max_t, feat_dim, dtype=torch.float32)
+    history_cycles = torch.zeros(len(batch), max_t, dtype=torch.long)
     y = torch.zeros(len(batch), max_h, dtype=torch.float32)
     mask = torch.zeros(len(batch), max_h, dtype=torch.bool)
     target_steps = torch.zeros(len(batch), max_h, dtype=torch.long)
     for i, b in enumerate(batch):
-        c, hm, wm = b["maps"].shape
+        t, c, hm, wm = b["maps"].shape
         steps = len(b["y"])
-        maps[i, :c, :hm, :wm] = b["maps"]
+        maps[i, :t, :c, :hm, :wm] = b["maps"]
+        history_features[i, : b["history_features"].shape[0], : b["history_features"].shape[1]] = b["history_features"]
+        history_cycles[i, : len(b["history_cycles"])] = b["history_cycles"]
         y[i, :steps] = b["y"]
         mask[i, :steps] = True
         target_steps[i, :steps] = b["target_steps"]
@@ -487,4 +711,6 @@ def collate_graph_report_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "cell_id": [b["cell_id"] for b in batch],
         "cycle": torch.tensor([b["cycle"] for b in batch], dtype=torch.long),
         "target_steps": target_steps,
+        "history_features": history_features,
+        "history_cycles": history_cycles,
     }

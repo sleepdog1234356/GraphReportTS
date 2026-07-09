@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader
@@ -32,6 +34,7 @@ def parse_args():
     p.add_argument("--out_dir", type=str, default="runs/graph_report_ts")
     p.add_argument("--input_len", type=int, default=96)
     p.add_argument("--pred_len", type=int, default=20)
+    p.add_argument("--history_len", type=int, default=32)
     p.add_argument("--resample_len", type=int, default=128)
     p.add_argument("--delay_dim", type=int, default=8)
     p.add_argument("--delay_lag", type=int, default=1)
@@ -52,6 +55,15 @@ def parse_args():
     p.add_argument("--no_dynamic_graph", action="store_true")
     p.add_argument("--no_domain_edges", action="store_true")
     p.add_argument("--separate_heads", action="store_true")
+    p.add_argument("--no_numeric_history", action="store_true")
+    p.add_argument("--no_multi_cycle_raw", action="store_true")
+    p.add_argument("--single_cycle_raw", action="store_true")
+    p.add_argument("--no_text_gate", action="store_true")
+    p.add_argument("--no_semantic_alignment", action="store_true")
+    p.add_argument("--no_align_loss", action="store_true")
+    p.add_argument("--absolute_step_decoder", action="store_true")
+    p.add_argument("--temporal_layers", type=int, default=1)
+    p.add_argument("--temporal_heads", type=int, default=4)
     p.add_argument("--allow_summary_fallback", action="store_true", help="Smoke-test only: synthesize raw curves from summary if MIT raw arrays are missing")
     p.add_argument("--cache_items", action="store_true", help="Enable per-worker sample caching for raw map construction. This can grow RAM quickly with many workers.")
     p.add_argument("--no_cache_items", action="store_true", help=argparse.SUPPRESS)
@@ -63,7 +75,8 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--loss", choices=["smooth_l1", "mse", "mae"], default="smooth_l1")
-    p.add_argument("--w_align", type=float, default=0.01)
+    p.add_argument("--w_align", type=float, default=0.001)
+    p.add_argument("--align_warmup_epochs", type=int, default=0)
     p.add_argument("--early_stop_patience", type=int, default=10)
     p.add_argument("--early_stop_min_delta", type=float, default=1e-5)
     p.add_argument("--no_resume", action="store_true", help="Disable automatic resume from last.pt/best.pt in the output directory")
@@ -79,6 +92,7 @@ def build_loaders(args) -> Tuple[DataLoader, DataLoader, DataLoader, int]:
             dataset_name=args.dataset,
             data_root=args.data_root,
             max_horizon=args.pred_len,
+            history_len=args.history_len,
             resample_len=args.resample_len,
             delay_dim=args.delay_dim,
             delay_lag=args.delay_lag,
@@ -134,18 +148,92 @@ def build_loaders(args) -> Tuple[DataLoader, DataLoader, DataLoader, int]:
     return loaders[0], loaders[1], loaders[2], output_dim
 
 
+def _empty_gate_stats() -> Dict[str, float]:
+    return {"sum": 0.0, "sum_sq": 0.0, "count": 0.0, "min": float("inf"), "max": float("-inf")}
+
+
+def _update_gate_stats(stats: Dict[str, float], gate: Optional[torch.Tensor]) -> None:
+    if gate is None:
+        return
+    vals = gate.detach().float().reshape(-1).cpu()
+    if vals.numel() == 0:
+        return
+    stats["sum"] += float(vals.sum())
+    stats["sum_sq"] += float((vals * vals).sum())
+    stats["count"] += float(vals.numel())
+    stats["min"] = min(stats["min"], float(vals.min()))
+    stats["max"] = max(stats["max"], float(vals.max()))
+
+
+def _finalize_gate_stats(stats: Dict[str, float]) -> Dict[str, float]:
+    count = max(stats["count"], 1.0)
+    mean = stats["sum"] / count
+    var = max(stats["sum_sq"] / count - mean * mean, 0.0)
+    if stats["count"] <= 0:
+        return {"gate_mean": 0.0, "gate_std": 0.0, "gate_min": 0.0, "gate_max": 0.0}
+    return {"gate_mean": mean, "gate_std": var**0.5, "gate_min": stats["min"], "gate_max": stats["max"]}
+
+
+def _model_forward(model: GraphReportTS, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+    steps = None
+    if model.cfg.variant == "battery" and not model.cfg.use_relative_steps:
+        steps = batch.get("target_steps")
+    return model(
+        batch["maps"],
+        batch["prompt"],
+        batch["horizon"],
+        steps=steps,
+        history_features=batch.get("history_features"),
+    )
+
+
+def _loss_weights(args, epoch: Optional[int] = None) -> Dict[str, float]:
+    if args.no_report_prompt or args.no_cross_modal or args.no_align_loss or args.no_semantic_alignment:
+        align = 0.0
+    else:
+        align = float(args.w_align)
+    if epoch is not None and int(args.align_warmup_epochs) > 0:
+        align *= min(float(epoch) / float(args.align_warmup_epochs), 1.0)
+    return {"align": align}
+
+
+def _write_gate_rows(path: Path, rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["cell_id", "cycle", "gate"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 @torch.no_grad()
-def evaluate(model, loader, device, weights: Dict[str, float], loss_type: str) -> Dict[str, float]:
+def evaluate(
+    model,
+    loader,
+    device,
+    weights: Dict[str, float],
+    loss_type: str,
+    gate_path: Optional[Path] = None,
+) -> Dict[str, float]:
     model.eval()
     meters = {k: AverageMeter() for k in ["total", "reg", "align"]}
+    gate_stats = _empty_gate_stats()
+    gate_rows: List[Dict[str, Any]] = []
     mse_sum = mae_sum = count = 0.0
     for batch in loader:
         batch = to_device(batch, device)
-        out = model(batch["maps"], batch["prompt"], batch["horizon"])
+        out = _model_forward(model, batch)
         loss = graph_report_loss(out, batch["y"], batch["mask"], weights, loss_type=loss_type)
         n = batch["maps"].size(0)
         for k, v in loss.items():
             meters[k].update(float(v.detach()), n)
+        _update_gate_stats(gate_stats, out.get("gate"))
+        if gate_path is not None and "gate" in out:
+            gate_vals = out["gate"].detach().reshape(n, -1).mean(dim=1).cpu().tolist()
+            cycles = batch["cycle"].detach().cpu().tolist() if torch.is_tensor(batch.get("cycle")) else [0] * n
+            for i, gate in enumerate(gate_vals):
+                gate_rows.append({"cell_id": batch["cell_id"][i], "cycle": int(cycles[i]), "gate": float(gate)})
         metrics = regression_metrics(out["pred"], batch["y"], batch["mask"])
         elems = float(batch["mask"].sum().detach().cpu())
         mse_sum += metrics["mse"] * elems
@@ -155,6 +243,9 @@ def evaluate(model, loader, device, weights: Dict[str, float], loss_type: str) -
     mae = mae_sum / max(count, 1.0)
     out = {k: m.avg for k, m in meters.items()}
     out.update({"mse": mse, "mae": mae, "rmse": mse**0.5})
+    out.update(_finalize_gate_stats(gate_stats))
+    if gate_path is not None:
+        _write_gate_rows(gate_path, gate_rows)
     return out
 
 
@@ -184,14 +275,24 @@ def main():
         use_domain_edges=not args.no_domain_edges,
         use_dynamic_graph=not args.no_dynamic_graph,
         unified_decoder=not args.separate_heads,
+        battery_history_len=args.history_len,
+        history_feature_dim=8,
+        use_multi_cycle_raw=not args.no_multi_cycle_raw,
+        single_cycle_raw=args.single_cycle_raw,
+        use_numeric_history=not args.no_numeric_history,
+        use_text_gate=not args.no_text_gate,
+        use_semantic_alignment=not args.no_semantic_alignment,
+        use_relative_steps=not args.absolute_step_decoder,
+        temporal_layers=args.temporal_layers,
+        temporal_heads=args.temporal_heads,
     )
     model = GraphReportTS(model_cfg).to(device)
     with torch.no_grad():
         init_batch = next(iter(train_loader))
         init_batch = to_device(init_batch, device)
-        _ = model(init_batch["maps"], init_batch["prompt"], init_batch["horizon"])
+        _ = _model_forward(model, init_batch)
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr, weight_decay=args.weight_decay)
-    weights = {"align": 0.0 if (args.no_report_prompt or args.no_cross_modal) else args.w_align}
+    eval_weights = _loss_weights(args)
 
     save_json({"args": vars(args), "model_cfg": model_cfg.__dict__, "output_dim": output_dim}, out_dir / "run_config.json")
     best = float("inf")
@@ -215,10 +316,12 @@ def main():
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         meters = {k: AverageMeter() for k in ["total", "reg", "align"]}
+        gate_stats = _empty_gate_stats()
+        weights = _loss_weights(args, epoch)
         pbar = tqdm(train_loader, desc=f"{args.variant}/{args.dataset} epoch {epoch}/{args.epochs}")
         for batch in pbar:
             batch = to_device(batch, device)
-            out = model(batch["maps"], batch["prompt"], batch["horizon"])
+            out = _model_forward(model, batch)
             loss = graph_report_loss(out, batch["y"], batch["mask"], weights, loss_type=args.loss)
             opt.zero_grad(set_to_none=True)
             loss["total"].backward()
@@ -227,9 +330,25 @@ def main():
             n = batch["maps"].size(0)
             for k, v in loss.items():
                 meters[k].update(float(v.detach()), n)
+            _update_gate_stats(gate_stats, out.get("gate"))
             pbar.set_postfix({"loss": meters["total"].avg})
-        val = evaluate(model, val_loader, device, weights, args.loss)
-        print(f"epoch={epoch} val_mse={val['mse']:.6f} val_mae={val['mae']:.6f} val_loss={val['total']:.6f}")
+        train_gate = _finalize_gate_stats(gate_stats)
+        val = evaluate(model, val_loader, device, weights, args.loss, gate_path=out_dir / f"val_gates_epoch_{epoch}.csv")
+        epoch_row = {
+            "epoch": epoch,
+            "align_weight": weights["align"],
+            "train_loss": meters["total"].avg,
+            "train_reg": meters["reg"].avg,
+            "train_align": meters["align"].avg,
+            **{f"train_{k}": v for k, v in train_gate.items()},
+            **{f"val_{k}": v for k, v in val.items()},
+        }
+        with (out_dir / "epoch_history.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(epoch_row, ensure_ascii=False, sort_keys=True) + "\n")
+        print(
+            f"epoch={epoch} val_mse={val['mse']:.6f} val_mae={val['mae']:.6f} "
+            f"val_loss={val['total']:.6f} gate_mean={val['gate_mean']:.4f} align_w={weights['align']:.5f}"
+        )
         score = val["mse"]
         if score < best - args.early_stop_min_delta:
             best = score
@@ -256,7 +375,7 @@ def main():
             break
     ckpt = torch.load(out_dir / "best.pt", map_location=device)
     model.load_state_dict(ckpt["model"])
-    test = evaluate(model, test_loader, device, weights, args.loss)
+    test = evaluate(model, test_loader, device, eval_weights, args.loss, gate_path=out_dir / "test_gates.csv")
     save_json(test, out_dir / "test_metrics.json")
     print("test metrics:", test)
 

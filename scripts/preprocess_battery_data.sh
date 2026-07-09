@@ -20,7 +20,7 @@ $PY - <<'PY'
 from bstalignment.data_battery_raw import BatteryRawGraphDataset
 for dataset in ["mit", "calce", "xjtu"]:
     for split in ["train", "val", "test"]:
-        ds = BatteryRawGraphDataset(dataset_name=dataset, data_root="bstalignment/data", split=split, max_horizon=2, max_cycles=5)
+        ds = BatteryRawGraphDataset(dataset_name=dataset, data_root="bstalignment/data", split=split, max_horizon=2, history_len=2, max_cycles=5)
         print(dataset, split, len(ds))
         if len(ds):
             item = ds[0]

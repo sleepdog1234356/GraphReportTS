@@ -1,6 +1,6 @@
 # GraphReportTS
 
-GraphReportTS is a research codebase for battery state-of-health (SOH) forecasting and general time-series forecasting. The main model combines raw-signal 2D graph representations, statistical report prompts, cross-modal fusion, and a unified query decoder.
+GraphReportTS is a research codebase for battery state-of-health (SOH) forecasting and general time-series forecasting. The current implementation combines raw-signal 2D graph representations, statistical report prompts, cross-modal fusion, and a unified query decoder. The battery v2 path adds baseline-aligned multi-cycle history modeling and gated semantic fusion, described below.
 
 This repository contains source code, experiment scripts, and documentation only. Raw datasets, model checkpoints, downloaded HuggingFace weights, external baseline repositories, logs, and generated training artifacts are intentionally excluded.
 
@@ -27,6 +27,96 @@ flowchart TD
     K --> M
     M --> N["Forecast"]
 ```
+
+## Battery-GraphReportTS V2 Design Target
+
+The next battery model revision is designed to fix the gap observed on MIT and XJTU against strong sequence baselines. This section preserves the intended architecture and the implemented v2 path.
+
+Implementation status: the v2 path has been added to the training code. It uses future-only battery targets, direct 32-cycle raw-map and numeric-history inputs, a first-version cycle-level `InterCycleTemporalEncoder`, relative future-step decoding, gated semantic fusion, weak optional alignment, and v2-specific ablations. The formal no-historical-SOH rerun should use `runs/full_hf_v2_nosoh` and retrain official baselines because their input feature contract changed.
+
+### Baseline-Aligned Input
+
+Battery samples should use the same historical window as the baselines:
+
+```text
+recent history: 32 cycles
+prediction horizon: future 20 cycles
+metric target: future-only MSE / MAE / RMSE
+```
+
+The latest 32 cycles are fed directly into the model. Older history is not used as a raw tensor; it is summarized into degradation statistics and written into the report prompt.
+
+### Multi-Cycle Raw Map Path
+
+The first implementation should encode each recent cycle with the existing `GraphMapEncoder`, then model cycle-to-cycle aging dynamics:
+
+```text
+multi_cycle_maps [B, 32, C_map, H, W]
+  -> shared GraphMapEncoder over [B*32, C_map, H, W]
+  -> cycle_graph_repr [B, 32, D]
+  -> InterCycleTemporalEncoder
+  -> temporal_graph_context [B, D]
+```
+
+`InterCycleTemporalEncoder` is intentionally a first-pass cycle-level temporal encoder, not a full patch-level spatio-temporal attention model. The recommended first version is a small Transformer encoder over `[B, 32, D]` cycle embeddings. If training resources allow, a later version can keep all patch tokens and perform cross-cycle attention over `[B, 32, N_patch, D]`.
+
+The graph cache for v2 is cycle-level rather than sample-level: each `(cell_id, cycle)` raw map is stored once, and each sample stores 32 integer indices into that map table. Do not change this back to sample-level `[sample, 32, C_map, H, W]` caching, because that multiplies cache size by the history length.
+
+### Numeric History Path
+
+To match the information available to PatchTST/iTransformer/TimesNet-style baselines, the model should also include a direct numeric history encoder:
+
+```text
+history_features [B, 32, F]
+  -> NumericHistoryEncoder
+  -> cycle_history_repr [B, 32, D]
+```
+
+This path must not include historical SOH or SOH deltas. The current 8-dimensional schema is:
+
+```text
+capacity_value
+capacity_zscore
+internal_resistance_zscore
+charge_time_zscore
+cycle_ratio
+capacity_delta
+internal_resistance_delta
+charge_time_delta
+```
+
+Capacity/QD is kept because it is a directly observable physical signal in the battery test data, but it should be treated as a strong SOH proxy when interpreting results.
+
+### Relative-Step Decoder
+
+The decoder should predict only future steps `1..20` and should use relative step embeddings. Absolute cycle ids must not be used directly as decoder step ids, because long-lived cells can exceed fixed embedding limits. Absolute aging information can enter as continuous covariates such as normalized cycle ratio or recent capacity slope, but not as historical SOH.
+
+### Gated Semantic Fusion
+
+Text prompt information should pass through a learnable gate:
+
+```text
+context = temporal_numeric_graph_context + gate * semantic_text_context
+```
+
+The gate is a required module, not an optional simplification. Training and evaluation should log `gate_mean`, `gate_std`, `gate_min`, and `gate_max`, and should save sample-level gate values so the actual contribution of the prompt can be inspected.
+
+### Weak Semantic Alignment
+
+Semantic alignment should be weak and controllable. The default alignment weight should be much smaller than the earlier `0.01`, with support for `w_align=0`, weak values such as `0.001`, and optional warmup. Alignment should be token-aware and closer to TimeCMA-style cross-modality alignment than a single global context/text contrastive loss.
+
+### V2 Ablations
+
+The ablation suite should be adjusted for the new model:
+
+- `no_numeric_history`
+- `no_multi_cycle_raw`
+- `single_cycle_raw`
+- `no_text_gate`
+- `no_semantic_alignment`
+- `no_align_loss`
+- `absolute_step_decoder`
+- existing map/graph ablations: `no_ic_dv`, `no_hankel_map`, `no_derivative_map`, `static_graph`, `no_domain_edges`
 
 ## Repository Layout
 
@@ -93,12 +183,26 @@ Processed CALCE/XJTU files are `.npz` files with:
 
 ```text
 cycle_id [N]
-soh [N]
+soh [N]                         # target label only, not a historical input feature
 current [N, L]
 voltage [N, L]
 temperature [N, L]
 capacity [N, L] or enough time/current data to integrate capacity
+capacity_summary [N]             # optional observable capacity/QD summary
+internal_resistance [N]          # optional observable cycle feature
+charge_time [N]                  # optional observable cycle feature
 ```
+
+## Battery Input Feature Contract
+
+Formal battery runs use a no-historical-SOH contract:
+
+- **Raw-map input:** the recent `history_len` cycles, default 32, are encoded from current, voltage, temperature, capacity, optional IC/DV maps, Hankel maps, and derivative maps. These maps stop at the latest observed cycle.
+- **Numeric-history input:** `history_features [B, 32, 8]` contains raw capacity/QD value, capacity/QD z-score, IR z-score, charge-time z-score, normalized cycle ratio, capacity/QD delta, IR delta, and charge-time delta.
+- **Prompt input:** older history is summarized from observable capacity/QD, IR, and charge-time statistics. The prompt may state that the task is future SOH forecasting, but it must not include historical SOH statistics.
+- **Target:** `y [B, pred_len]` is future SOH only. Historical SOH, SOH deltas, and SOH-derived aging-stage labels are excluded from model and baseline inputs.
+
+Official baselines use the same no-SOH sequence contract. Their input features are `capacity_summary`, `capacity_delta`, `internal_resistance`, `charge_time`, and `cycle_ratio`; their target remains future SOH.
 
 General datasets follow the TimeCMA-style CSV layout:
 
@@ -165,6 +269,8 @@ python -m bstalignment.train_battery_official_baselines \
 ```
 
 Time-LLM and TimeCMA can use local HuggingFace models through `--hf_gpt2_model` and `--hf_bert_model`. Downloaded model weights should stay outside Git, for example under ignored `hf_models/`.
+
+For the v2 no-historical-SOH comparison, retrain these baselines under the same input contract as the main model. Older baseline results that used historical SOH as an input are not directly comparable to the no-SOH main-model run.
 
 ## Ablations
 
