@@ -6,7 +6,7 @@ Updated: 2026-07-10
 
 This project builds GraphReportTS for battery SOH forecasting and general time-series forecasting. The battery setting is the current focus: train the main model on MIT, CALCE, and XJTU; compare against strong time-series baselines; and run ablations that measure the contribution of each model component.
 
-As of 2026-07-10, the full-HF baseline comparison had completed on the remote server under the earlier input contract. That contract included historical SOH in the baseline sequence inputs and in the first v2 numeric-history branch, so the first `runs/full_hf_v2` attempt was stopped. The formal rerun now uses the no-historical-SOH contract under `runs/full_hf_v2_nosoh`, and official baselines must be retrained because their input features changed.
+As of 2026-07-10, the full-HF baseline comparison had completed on the remote server under the earlier input contract. That contract included historical SOH in the baseline sequence inputs and in the first v2 numeric-history branch, so the first `runs/full_hf_v2` attempt was stopped. The formal rerun now uses the no-historical-SOH contract under `runs/full_hf_v2_nosoh`, and official baselines must be retrained because their input features changed. The corrected formal pipeline is full retraining: official baselines, main models, and ablations all rerun from scratch, without smoke subsets, short ablation epochs, skipped completed runs, or lightweight no-HF paths.
 
 ## 2. Current Main Model
 
@@ -150,6 +150,8 @@ Next v2 no-historical-SOH workflow:
 4. Train the new main model on MIT, CALCE, and XJTU.
 5. Run v2-specific ablations on the new main model.
 6. Compare future-only metrics across the no-SOH baselines, main model, and ablations.
+
+The formal script is `scripts/run_battery_v2_full_hf_pipeline.sh`. It should run with `FORCE_RETRAIN=1` and with baseline/ablation epoch budgets matched to the main model unless there is an explicit resource-failure record explaining a later hardware-only adjustment.
 
 Remote status at the moment this report was updated:
 

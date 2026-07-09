@@ -52,6 +52,8 @@ def parse_args():
     p.add_argument("--input_len", type=int, default=96)
     p.add_argument("--w_align", type=float, default=0.001)
     p.add_argument("--align_warmup_epochs", type=int, default=0)
+    p.add_argument("--early_stop_patience", type=int, default=None)
+    p.add_argument("--early_stop_min_delta", type=float, default=0.0)
     p.add_argument("--temporal_layers", type=int, default=1)
     p.add_argument("--temporal_heads", type=int, default=4)
     p.add_argument("--text_model", type=str, default="distilbert-base-uncased")
@@ -138,6 +140,8 @@ def main():
             str(args.w_align),
             "--align_warmup_epochs",
             str(args.align_warmup_epochs),
+            "--early_stop_min_delta",
+            str(args.early_stop_min_delta),
             "--temporal_layers",
             str(args.temporal_layers),
             "--temporal_heads",
@@ -147,6 +151,8 @@ def main():
             "--text_model",
             args.text_model,
         ]
+        if args.early_stop_patience is not None:
+            cmd.extend(["--early_stop_patience", str(args.early_stop_patience)])
         if args.no_hf_text:
             cmd.append("--no_hf_text")
         if args.allow_summary_fallback:

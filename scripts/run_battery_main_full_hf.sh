@@ -10,6 +10,8 @@ HISTORY_LEN="${HISTORY_LEN:-32}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 W_ALIGN="${W_ALIGN:-0.001}"
 ALIGN_WARMUP_EPOCHS="${ALIGN_WARMUP_EPOCHS:-0}"
+FORCE_RETRAIN="${FORCE_RETRAIN:-0}"
+EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-$EPOCHS}"
 USE_GRAPH_CACHE="${USE_BATTERY_GRAPH_CACHE:-1}"
 GRAPH_CACHE_DIR="${BATTERY_GRAPH_CACHE_DIR:-${OUT_ROOT}/cache/battery_graph}"
 TEXT_MODEL="${TEXT_MODEL:-hf_models/distilbert-base-uncased}"
@@ -23,7 +25,9 @@ PY="${PY:-python -u}"
 
 for dataset in mit calce xjtu; do
   out="${OUT_ROOT}/graph_report_ts/battery/${dataset}"
-  if [ -f "$out/test_metrics.json" ]; then
+  if [ "$FORCE_RETRAIN" = "1" ]; then
+    rm -rf "$out"
+  elif [ -f "$out/test_metrics.json" ]; then
     echo "skip completed full-HF GraphReportTS $dataset"
     continue
   fi
@@ -53,6 +57,9 @@ for dataset in mit calce xjtu; do
     --device cuda \
     --w_align "$W_ALIGN" \
     --align_warmup_epochs "$ALIGN_WARMUP_EPOCHS" \
+    --early_stop_patience "$EARLY_STOP_PATIENCE" \
+    --early_stop_min_delta 0 \
     --text_model "$TEXT_MODEL" \
-    "${CACHE_ARGS[@]}" 2>&1 | tee "${OUT_ROOT}/logs/main_${dataset}.log"
+    "${CACHE_ARGS[@]}" \
+    --no_resume 2>&1 | tee "${OUT_ROOT}/logs/main_${dataset}.log"
 done

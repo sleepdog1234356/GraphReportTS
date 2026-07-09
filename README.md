@@ -32,7 +32,7 @@ flowchart TD
 
 The next battery model revision is designed to fix the gap observed on MIT and XJTU against strong sequence baselines. This section preserves the intended architecture and the implemented v2 path.
 
-Implementation status: the v2 path has been added to the training code. It uses future-only battery targets, direct 32-cycle raw-map and numeric-history inputs, a first-version cycle-level `InterCycleTemporalEncoder`, relative future-step decoding, gated semantic fusion, weak optional alignment, and v2-specific ablations. The formal no-historical-SOH rerun should use `runs/full_hf_v2_nosoh` and retrain official baselines because their input feature contract changed.
+Implementation status: the v2 path has been added to the training code. It uses future-only battery targets, direct 32-cycle raw-map and numeric-history inputs, a first-version cycle-level `InterCycleTemporalEncoder`, relative future-step decoding, gated semantic fusion, weak optional alignment, and v2-specific ablations. The formal no-historical-SOH rerun should use `runs/full_hf_v2_nosoh` and retrain official baselines because their input feature contract changed. The v2 full-HF pipeline defaults to full retraining: official baselines, main models, and ablations all rerun instead of reusing partial outputs.
 
 ### Baseline-Aligned Input
 
@@ -271,6 +271,14 @@ python -m bstalignment.train_battery_official_baselines \
 Time-LLM and TimeCMA can use local HuggingFace models through `--hf_gpt2_model` and `--hf_bert_model`. Downloaded model weights should stay outside Git, for example under ignored `hf_models/`.
 
 For the v2 no-historical-SOH comparison, retrain these baselines under the same input contract as the main model. Older baseline results that used historical SOH as an input are not directly comparable to the no-SOH main-model run.
+
+The formal v2 pipeline is:
+
+```bash
+bash scripts/run_battery_v2_full_hf_pipeline.sh "$(pwd)"
+```
+
+By default this runs full retraining with `FORCE_RETRAIN=1`: all official baselines, all main-model datasets, and all ablations are regenerated. Baseline and ablation epoch budgets inherit the main `EPOCHS` value unless explicitly overridden. This script should not be used for smoke tests.
 
 ## Ablations
 
