@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import json
+import multiprocessing
+import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Sequence, Tuple
 
 import numpy as np
 
@@ -50,7 +54,7 @@ def parse_args():
     p.add_argument("--allow_summary_fallback", action="store_true")
     p.add_argument("--max_cycles", type=int, default=None)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--batch_size", type=int, default=128)
+    p.add_argument("--batch_size", type=int, default=128, help="Maximum number of cycle maps scheduled in flight")
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--force", action="store_true")
     return p.parse_args()
@@ -119,6 +123,88 @@ def _entry_maps(ds: BatteryRawGraphDataset, entry: Tuple[str, int, int]) -> Tupl
     if kind == "processed":
         return ds._processed_cycle_maps(ds.processed_cells[owner_idx], row_or_cycle)
     return ds._mit_cycle_maps(ds.records[owner_idx], row_or_cycle)
+
+
+_WORKER_DATASET: BatteryRawGraphDataset | None = None
+CycleItem = Tuple[int, Tuple[str, int], Tuple[str, int, int]]
+CycleResult = Tuple[int, Tuple[str, int], np.ndarray, List[str]]
+
+
+def _cycle_item_batches(items: Sequence[CycleItem], batch_size: int) -> Iterator[List[CycleItem]]:
+    for start in range(0, len(items), batch_size):
+        yield list(items[start : start + batch_size])
+
+
+def _compute_cycle_map_batch(batch: Sequence[CycleItem]) -> List[CycleResult]:
+    if _WORKER_DATASET is None:
+        raise RuntimeError("Cycle-map worker dataset was not initialized")
+    results = []
+    for cycle_idx, key, entry in batch:
+        maps, names = _entry_maps(_WORKER_DATASET, entry)
+        results.append((cycle_idx, key, maps, names))
+    return results
+
+
+def _parallel_cycle_map_results(
+    ds: BatteryRawGraphDataset,
+    cycle_items: Sequence[CycleItem],
+    *,
+    num_workers: int,
+    batch_size: int,
+) -> Iterator[CycleResult]:
+    if not cycle_items:
+        return
+    worker_count = min(int(num_workers), int(batch_size), len(cycle_items))
+    chunk_size = max(1, int(batch_size) // worker_count)
+    batches = iter(_cycle_item_batches(cycle_items, chunk_size))
+    use_fork = os.name != "nt" and "fork" in multiprocessing.get_all_start_methods()
+
+    global _WORKER_DATASET
+    _WORKER_DATASET = ds
+    try:
+        if use_fork:
+            executor = ProcessPoolExecutor(
+                max_workers=worker_count,
+                mp_context=multiprocessing.get_context("fork"),
+            )
+        else:
+            executor = ThreadPoolExecutor(max_workers=worker_count)
+        with executor:
+            pending = deque()
+            for _ in range(worker_count):
+                try:
+                    pending.append(executor.submit(_compute_cycle_map_batch, next(batches)))
+                except StopIteration:
+                    break
+            while pending:
+                future = pending.popleft()
+                yield from future.result()
+                try:
+                    pending.append(executor.submit(_compute_cycle_map_batch, next(batches)))
+                except StopIteration:
+                    pass
+    finally:
+        _WORKER_DATASET = None
+
+
+def _cycle_map_results(
+    ds: BatteryRawGraphDataset,
+    cycle_items: Sequence[CycleItem],
+    *,
+    num_workers: int,
+    batch_size: int,
+) -> Iterator[CycleResult]:
+    if num_workers > 0:
+        yield from _parallel_cycle_map_results(
+            ds,
+            cycle_items,
+            num_workers=num_workers,
+            batch_size=batch_size,
+        )
+        return
+    for cycle_idx, key, entry in cycle_items:
+        maps, names = _entry_maps(ds, entry)
+        yield cycle_idx, key, maps, names
 
 
 def _sample_payload(
@@ -193,6 +279,10 @@ def _sample_payload(
 
 
 def precompute_split(args, split: str) -> Path:
+    if args.num_workers < 0:
+        raise ValueError("num_workers must be non-negative")
+    if args.batch_size <= 0:
+        raise ValueError("batch_size must be positive")
     config = battery_graph_cache_config(
         dataset_name=args.dataset,
         split=split,
@@ -226,6 +316,7 @@ def precompute_split(args, split: str) -> Path:
         include_ic_dv=not args.no_ic_dv,
         allow_summary_fallback=args.allow_summary_fallback,
         cache_items=False,
+        cycle_cache_size=0,
         seed=args.seed,
         max_cycles=args.max_cycles,
         history_len=args.history_len,
@@ -271,8 +362,24 @@ def precompute_split(args, split: str) -> Path:
     meta_rows = []
 
     key_to_cycle_idx: Dict[Tuple[str, int], int] = {}
-    for cycle_idx, (key, entry) in enumerate(tqdm(cycle_items, desc=f"cycle maps {args.dataset}/{split}")):
-        maps_i, _ = _entry_maps(ds, entry)
+    cycle_maps[0] = first_maps
+    key_to_cycle_idx[cycle_items[0][0]] = 0
+    pending_cycle_items = [
+        (cycle_idx, key, entry)
+        for cycle_idx, (key, entry) in enumerate(cycle_items[1:], start=1)
+    ]
+    cycle_results = _cycle_map_results(
+        ds,
+        pending_cycle_items,
+        num_workers=int(args.num_workers),
+        batch_size=int(args.batch_size),
+    )
+    for cycle_idx, key, maps_i, _ in tqdm(
+        cycle_results,
+        total=len(cycle_items),
+        initial=1,
+        desc=f"cycle maps {args.dataset}/{split}",
+    ):
         if tuple(maps_i.shape) != cycle_map_shape:
             raise ValueError(f"Cycle map shape changed for {key}: expected {cycle_map_shape}, got {tuple(maps_i.shape)}")
         cycle_maps[cycle_idx] = maps_i

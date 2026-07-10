@@ -13,6 +13,11 @@ BASELINE_MODELS="${BASELINE_MODELS:-patchtst itransformer timecma timesnet dline
 FORCE_RETRAIN="${FORCE_RETRAIN:-0}"
 TRAINING_STRATEGY_VERSION="v3-source-profiles-main-adaptive-fixed-horizon-train-scale"
 cd "$ROOT"
+CONTROL_PY="${CONTROL_PY:-python}"
+$CONTROL_PY -m bstalignment.battery_protocol validate-formal-protocol \
+  --observed-cycles "$INPUT_LEN" \
+  --prediction-cycles "$PRED_LEN" \
+  --context "Formal official baseline runner"
 mkdir -p "$OUT_ROOT/logs"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
@@ -22,15 +27,17 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 PY="${PY:-python -u}"
 
-has_current_strategy_version() {
+has_matching_run_metadata() {
   local out="$1"
-  [ -f "$out/run_config.json" ] && \
-    grep -Eq "\"training_strategy_version\"[[:space:]]*:[[:space:]]*\"${TRAINING_STRATEGY_VERSION}\"" "$out/run_config.json"
+  $CONTROL_PY -m bstalignment.battery_protocol run-config-matches \
+    --config "$out/run_config.json" \
+    --training-strategy-version "$TRAINING_STRATEGY_VERSION" \
+    --stage baseline
 }
 
 is_completed_current_strategy() {
   local out="$1"
-  [ -f "$out/test_metrics.json" ] && has_current_strategy_version "$out"
+  [ -f "$out/test_metrics.json" ] && has_matching_run_metadata "$out"
 }
 
 for dataset in mit calce xjtu; do
@@ -46,7 +53,7 @@ for dataset in mit calce xjtu; do
       FRESH_RUN=1
     elif [ ! -e "$out" ]; then
       FRESH_RUN=1
-    elif ! has_current_strategy_version "$out"; then
+    elif ! has_matching_run_metadata "$out"; then
       rm -rf -- "$out"
       FRESH_RUN=1
     fi

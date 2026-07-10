@@ -89,11 +89,12 @@ The formal v3 entrypoint runs `main -> baselines -> ablations` and writes to `ru
 The formal battery input protocol is exactly 32 observed cycles and 20 future-only labels, with historical SOH excluded from inputs. `cycle_ratio` uses train-only dataset-global cycle scaling from the selected training cells, is shared unchanged by all splits and models, and uses no clipping above 1.0.
 
 ```bash
+mkdir -p runs/full_hf_v3_training_strategy_nosoh/logs
 FORCE_RETRAIN=1 bash scripts/run_battery_v3_training_strategy_pipeline.sh "$(pwd)" \
   2>&1 | tee runs/full_hf_v3_training_strategy_nosoh/logs/v3_start.log
 ```
 
-Run it on the approved server configuration: RTX4090 48GiB, 208 CPU threads, batch size 128, 16 workers for main/cache/ablations, and 8 workers for baselines. Main, cache, and ablation stages share `runs/cache/battery_graph`; all stages share the v3 output root. This protocol adds no AMP.
+Run it on the approved server configuration: RTX4090 48GiB, 208 CPU threads, batch size 128, 16 workers for main/cache/ablations, and 8 workers for baselines. Cache workers construct unique cycle maps in bounded parallel batches while the parent process owns deterministic memmap writes and publication. Main, cache, and ablation stages share `runs/cache/battery_graph`; all stages share the v3 output root. This protocol adds no AMP.
 
 Check the pipeline and stage logs:
 

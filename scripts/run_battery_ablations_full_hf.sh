@@ -13,6 +13,11 @@ GRAPH_CACHE_DIR="${BATTERY_GRAPH_CACHE_DIR:-runs/cache/battery_graph}"
 TEXT_MODEL="${TEXT_MODEL:-hf_models/distilbert-base-uncased}"
 TRAINING_STRATEGY_VERSION="v3-source-profiles-main-adaptive-fixed-horizon-train-scale"
 cd "$ROOT"
+CONTROL_PY="${CONTROL_PY:-python}"
+$CONTROL_PY -m bstalignment.battery_protocol validate-formal-protocol \
+  --observed-cycles "$HISTORY_LEN" \
+  --prediction-cycles "$PRED_LEN" \
+  --context "Formal GraphReportTS ablation runner"
 mkdir -p "$OUT_ROOT/logs"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"

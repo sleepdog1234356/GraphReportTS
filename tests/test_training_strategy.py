@@ -3,20 +3,25 @@ import gc
 import json
 from pathlib import Path
 import pickle
+import shlex
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 import warnings
 
 import numpy as np
 import torch
 
+import bstalignment.battery_protocol as battery_protocol
 from bstalignment.data_battery_raw import (
     BATTERY_GRAPH_CACHE_VERSION,
     BatteryRawGraphDataset,
     battery_graph_cache_config,
 )
 from bstalignment.graph_report_model import GraphReportTS, GraphReportTSConfig
+import bstalignment.precompute_battery_graph_cache as cache_precompute
 from bstalignment.precompute_battery_graph_cache import precompute_split
 import bstalignment.training_strategy as training_strategy
 from bstalignment.run_ablation_suite import (
@@ -301,6 +306,189 @@ class BatteryWindowProtocolTests(BatteryDataFixtureMixin, unittest.TestCase):
             del cached
             gc.collect()
 
+    def test_parallel_precompute_uses_parallel_path_and_matches_serial_cache(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_mit_data(root, [1, 1, 1, 1])
+
+            def args(cache_dir, num_workers):
+                return Namespace(
+                    dataset="mit",
+                    data_root=str(root),
+                    cache_dir=str(cache_dir),
+                    pred_len=20,
+                    history_len=32,
+                    resample_len=16,
+                    delay_dim=2,
+                    delay_lag=1,
+                    no_derivative_map=True,
+                    no_hankel_map=True,
+                    no_ic_dv=True,
+                    allow_summary_fallback=True,
+                    max_cycles=None,
+                    seed=42,
+                    batch_size=4,
+                    num_workers=num_workers,
+                    force=True,
+                )
+
+            serial_path = precompute_split(args(root / "serial_cache", 0), "train")
+            with patch.object(
+                cache_precompute,
+                "_parallel_cycle_map_results",
+                wraps=cache_precompute._parallel_cycle_map_results,
+            ) as parallel_path_spy, patch.object(
+                cache_precompute,
+                "BatteryRawGraphDataset",
+                wraps=BatteryRawGraphDataset,
+            ) as dataset_spy:
+                parallel_path = precompute_split(args(root / "parallel_cache", 2), "train")
+
+            parallel_path_spy.assert_called_once()
+            self.assertEqual(dataset_spy.call_args.kwargs["cycle_cache_size"], 0)
+            for filename in (
+                "cycle_maps.npy",
+                "history_indices.npy",
+                "y.npy",
+                "mask.npy",
+                "horizon.npy",
+                "target_steps.npy",
+                "history_features.npy",
+                "history_cycles.npy",
+            ):
+                np.testing.assert_array_equal(np.load(serial_path / filename), np.load(parallel_path / filename))
+            self.assertEqual(
+                (serial_path / "meta.jsonl").read_text(encoding="utf-8"),
+                (parallel_path / "meta.jsonl").read_text(encoding="utf-8"),
+            )
+
+
+class FormalBatteryProtocolTests(unittest.TestCase):
+    def test_exact_formal_protocol_is_accepted_and_nonconforming_lengths_are_rejected(self):
+        battery_protocol.require_formal_battery_protocol(
+            observed_cycles=battery_protocol.BATTERY_INPUT_CYCLES,
+            prediction_cycles=battery_protocol.BATTERY_PREDICTION_CYCLES,
+            context="test",
+        )
+        for observed_cycles, prediction_cycles in ((31, 20), (32, 19), (33, 20), (32, 21)):
+            with self.subTest(observed_cycles=observed_cycles, prediction_cycles=prediction_cycles):
+                with self.assertRaisesRegex(ValueError, "exactly 32 observed cycles and 20 future-only targets"):
+                    battery_protocol.require_formal_battery_protocol(
+                        observed_cycles=observed_cycles,
+                        prediction_cycles=prediction_cycles,
+                        context="test",
+                    )
+
+    def test_direct_battery_entrypoints_reject_nonconforming_formal_v3_lengths(self):
+        commands = (
+            [
+                sys.executable,
+                "-B",
+                "-m",
+                "bstalignment.train_graph_report",
+                "--variant",
+                "battery",
+                "--history_len",
+                "31",
+                "--pred_len",
+                "20",
+                "--device",
+                "cpu",
+            ],
+            [
+                sys.executable,
+                "-B",
+                "-m",
+                "bstalignment.train_battery_official_baselines",
+                "--model",
+                "patchtst",
+                "--dataset",
+                "mit",
+                "--input_len",
+                "32",
+                "--pred_len",
+                "19",
+                "--device",
+                "cpu",
+            ],
+            [
+                sys.executable,
+                "-B",
+                "-m",
+                "bstalignment.run_ablation_suite",
+                "--variant",
+                "battery",
+                "--history_len",
+                "31",
+                "--pred_len",
+                "20",
+                "--dry_run",
+            ],
+        )
+        for command in commands:
+            with self.subTest(module=command[3]):
+                result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("exactly 32 observed cycles and 20 future-only targets", result.stdout + result.stderr)
+
+
+class RunMetadataTests(unittest.TestCase):
+    strategy_version = TRAINING_STRATEGY_VERSION
+
+    @staticmethod
+    def valid_config(stage):
+        args = {"pred_len": 20}
+        args["input_len" if stage == "baseline" else "history_len"] = 32
+        return {"training_strategy_version": TRAINING_STRATEGY_VERSION, "args": args}
+
+    def test_valid_typed_root_metadata_matches_every_formal_stage(self):
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "run_config.json"
+            for stage in ("main", "baseline", "ablation"):
+                with self.subTest(stage=stage):
+                    config_path.write_text(json.dumps(self.valid_config(stage)), encoding="utf-8")
+                    self.assertTrue(
+                        battery_protocol.run_config_matches(
+                            config_path,
+                            training_strategy_version=self.strategy_version,
+                            stage=stage,
+                        )
+                    )
+
+    def test_malformed_truncated_nested_decoy_and_wrong_protocol_metadata_do_not_match(self):
+        valid = self.valid_config("main")
+        cases = {
+            "malformed": "{not-json",
+            "truncated": '{"training_strategy_version": "' + self.strategy_version + '",',
+            "root_array": json.dumps([valid]),
+            "nested_decoy": json.dumps(
+                {
+                    "training_strategy_version": "v2-stale",
+                    "args": valid["args"],
+                    "decoy": {"training_strategy_version": self.strategy_version},
+                }
+            ),
+            "missing_args": json.dumps({"training_strategy_version": self.strategy_version}),
+            "wrong_value": json.dumps(
+                {"training_strategy_version": self.strategy_version, "args": {"history_len": 31, "pred_len": 20}}
+            ),
+            "wrong_type": json.dumps(
+                {"training_strategy_version": self.strategy_version, "args": {"history_len": "32", "pred_len": True}}
+            ),
+        }
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "run_config.json"
+            for name, contents in cases.items():
+                with self.subTest(case=name):
+                    config_path.write_text(contents, encoding="utf-8")
+                    self.assertFalse(
+                        battery_protocol.run_config_matches(
+                            config_path,
+                            training_strategy_version=self.strategy_version,
+                            stage="main",
+                        )
+                    )
+
 
 class BaselineTrainerIntegrationTests(unittest.TestCase):
     def test_profile_is_not_overridden_when_cli_values_are_absent(self):
@@ -318,6 +506,35 @@ class BaselineTrainerIntegrationTests(unittest.TestCase):
 
 
 class PipelineScriptTests(unittest.TestCase):
+    @staticmethod
+    def formal_config(stage, version=TRAINING_STRATEGY_VERSION):
+        args = {"pred_len": 20}
+        args["input_len" if stage == "baseline" else "history_len"] = 32
+        return {"training_strategy_version": version, "args": args}
+
+    @staticmethod
+    def run_formal_script(script, out_root, **overrides):
+        executable = Path(sys.executable).as_posix()
+        control_python = f"/mnt/{executable[0].lower()}/{executable[3:]}"
+        settings = {
+            "OUT_ROOT": out_root.as_posix(),
+            "FORCE_RETRAIN": "0",
+            "USE_BATTERY_GRAPH_CACHE": "0",
+            "BASELINE_MODELS": "patchtst",
+            "PY": "true",
+            "CONTROL_PY": control_python,
+        }
+        settings.update(overrides)
+        assignments = " ".join(f"{key}={shlex.quote(str(value))}" for key, value in settings.items())
+        return subprocess.run(
+            ["bash", "-c", f"{assignments} bash {shlex.quote(script)} ."],
+            cwd=Path.cwd(),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
     def test_formal_pipeline_is_main_first_and_uses_v3_root(self):
         text = Path("scripts/run_battery_v3_training_strategy_pipeline.sh").read_text(encoding="utf-8")
         self.assertIn("runs/full_hf_v3_training_strategy_nosoh", text)
@@ -351,6 +568,8 @@ class PipelineScriptTests(unittest.TestCase):
             self.assertIn("run_config.json", text, path)
             self.assertIn("test_metrics.json", text, path)
             self.assertIn("v3-source-profiles-main-adaptive", text, path)
+            self.assertIn("run-config-matches", text, path)
+            self.assertNotIn("grep", text, path)
             self.assertNotIn("${OUT_ROOT}/cache/battery_graph", text, path)
         self.assertIn("runs/cache/battery_graph", Path("scripts/run_battery_main_full_hf.sh").read_text(encoding="utf-8"))
         self.assertIn("runs/cache/battery_graph", Path("scripts/run_battery_ablations_full_hf.sh").read_text(encoding="utf-8"))
@@ -395,26 +614,109 @@ class PipelineScriptTests(unittest.TestCase):
                     variant_dir = Path(relative_root) / variant_suffix
                     variant_dir.mkdir(parents=True, exist_ok=True)
                     (variant_dir / "stale.pt").write_text("stale", encoding="utf-8")
+                    stage = "baseline" if "official_baselines" in script else "main"
                     (variant_dir / "run_config.json").write_text(
-                        json.dumps({"training_strategy_version": config_version}),
+                        json.dumps(self.formal_config(stage, config_version)),
                         encoding="utf-8",
                     )
-                    subprocess.run(
-                        [
-                            "bash",
-                            "-c",
-                            f"OUT_ROOT={relative_root.as_posix()} FORCE_RETRAIN={force_retrain} "
-                            f"USE_BATTERY_GRAPH_CACHE=0 BASELINE_MODELS=patchtst PY=true bash {script} .",
-                        ],
-                        cwd=Path.cwd(),
-                        check=True,
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
+                    result = self.run_formal_script(
+                        script,
+                        relative_root,
+                        FORCE_RETRAIN=force_retrain,
                     )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
                     self.assertFalse(variant_dir.exists(), (script, force_retrain, config_version))
+
+    def test_invalid_metadata_removes_main_and_baseline_outputs_before_fresh_runs(self):
+        scripts_and_outputs = (
+            ("scripts/run_battery_main_full_hf.sh", Path("graph_report_ts/battery/mit"), "main"),
+            ("scripts/run_battery_official_baselines.sh", Path("baselines/mit/patchtst"), "baseline"),
+        )
+        invalid_configs = {
+            "malformed": "{not-json",
+            "truncated": '{"training_strategy_version": "' + TRAINING_STRATEGY_VERSION + '",',
+            "nested_decoy": json.dumps(
+                {
+                    "training_strategy_version": "v2-stale",
+                    "args": {"history_len": 32, "input_len": 32, "pred_len": 20},
+                    "decoy": {"training_strategy_version": TRAINING_STRATEGY_VERSION},
+                }
+            ),
+            "wrong_protocol": json.dumps(
+                {
+                    "training_strategy_version": TRAINING_STRATEGY_VERSION,
+                    "args": {"history_len": 31, "input_len": 31, "pred_len": 20},
+                }
+            ),
+            "wrong_type": json.dumps(
+                {
+                    "training_strategy_version": TRAINING_STRATEGY_VERSION,
+                    "args": {"history_len": "32", "input_len": "32", "pred_len": True},
+                }
+            ),
+        }
+        with TemporaryDirectory(dir=Path.cwd()) as tmp:
+            relative_root = Path(tmp).relative_to(Path.cwd()) / "runs"
+            for script, variant_suffix, _stage in scripts_and_outputs:
+                for case, contents in invalid_configs.items():
+                    with self.subTest(script=script, case=case):
+                        variant_dir = relative_root / variant_suffix
+                        variant_dir.mkdir(parents=True, exist_ok=True)
+                        (variant_dir / "stale.pt").write_text("stale", encoding="utf-8")
+                        (variant_dir / "test_metrics.json").write_text("{}", encoding="utf-8")
+                        (variant_dir / "run_config.json").write_text(contents, encoding="utf-8")
+
+                        result = self.run_formal_script(script, relative_root)
+
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertFalse(variant_dir.exists())
+
+    def test_matching_complete_outputs_skip_and_matching_incomplete_outputs_resume(self):
+        scripts_and_outputs = (
+            ("scripts/run_battery_main_full_hf.sh", Path("graph_report_ts/battery/mit"), "main"),
+            ("scripts/run_battery_official_baselines.sh", Path("baselines/mit/patchtst"), "baseline"),
+        )
+        with TemporaryDirectory(dir=Path.cwd()) as tmp:
+            relative_root = Path(tmp).relative_to(Path.cwd()) / "runs"
+            for script, variant_suffix, stage in scripts_and_outputs:
+                variant_dir = relative_root / variant_suffix
+                variant_dir.mkdir(parents=True, exist_ok=True)
+                marker = variant_dir / "marker.txt"
+                marker.write_text("keep", encoding="utf-8")
+                (variant_dir / "test_metrics.json").write_text("{}", encoding="utf-8")
+                (variant_dir / "run_config.json").write_text(
+                    json.dumps(self.formal_config(stage)),
+                    encoding="utf-8",
+                )
+
+                result = self.run_formal_script(script, relative_root)
+
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue(marker.exists())
+                self.assertIn("skip completed", result.stdout)
+
+                (variant_dir / "test_metrics.json").unlink()
+                resume_checkpoint = variant_dir / "last.pt"
+                resume_checkpoint.write_text("resume", encoding="utf-8")
+                result = self.run_formal_script(script, relative_root)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue(resume_checkpoint.exists())
+
+    def test_formal_shell_entrypoints_reject_environment_length_overrides(self):
+        cases = (
+            ("scripts/run_battery_main_full_hf.sh", {"HISTORY_LEN": "31"}),
+            ("scripts/run_battery_official_baselines.sh", {"INPUT_LEN": "31"}),
+            ("scripts/run_battery_ablations_full_hf.sh", {"PRED_LEN": "19"}),
+            ("scripts/run_battery_v3_training_strategy_pipeline.sh", {"HISTORY_LEN": "31"}),
+        )
+        with TemporaryDirectory(dir=Path.cwd()) as tmp:
+            relative_root = Path(tmp).relative_to(Path.cwd()) / "runs"
+            for script, overrides in cases:
+                with self.subTest(script=script):
+                    result = self.run_formal_script(script, relative_root, **overrides)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("exactly 32 observed cycles and 20 future-only targets", result.stdout + result.stderr)
 
     def test_matching_incomplete_outputs_are_preserved_for_resume(self):
         scripts_and_outputs = (
@@ -429,24 +731,13 @@ class PipelineScriptTests(unittest.TestCase):
                 variant_dir.mkdir(parents=True, exist_ok=True)
                 stale_checkpoint = variant_dir / "last.pt"
                 stale_checkpoint.write_text("resume", encoding="utf-8")
+                stage = "baseline" if "official_baselines" in script else "main"
                 (variant_dir / "run_config.json").write_text(
-                    json.dumps({"training_strategy_version": TRAINING_STRATEGY_VERSION}),
+                    json.dumps(self.formal_config(stage)),
                     encoding="utf-8",
                 )
-                subprocess.run(
-                    [
-                        "bash",
-                        "-c",
-                        f"OUT_ROOT={relative_root.as_posix()} FORCE_RETRAIN=0 "
-                        f"USE_BATTERY_GRAPH_CACHE=0 BASELINE_MODELS=patchtst PY=true bash {script} .",
-                    ],
-                    cwd=Path.cwd(),
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                )
+                result = self.run_formal_script(script, relative_root)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
                 self.assertTrue(stale_checkpoint.exists(), script)
                 text = Path(script).read_text(encoding="utf-8")
@@ -479,6 +770,10 @@ class PipelineScriptTests(unittest.TestCase):
         self.assertIn("208 CPU threads", workflow)
         self.assertIn("FORCE_RETRAIN=0", workflow)
         self.assertIn("no AMP", workflow)
+        mkdir_command = "mkdir -p runs/full_hf_v3_training_strategy_nosoh/logs"
+        tee_command = "tee runs/full_hf_v3_training_strategy_nosoh/logs/v3_start.log"
+        self.assertIn(mkdir_command, workflow)
+        self.assertLess(workflow.index(mkdir_command), workflow.index(tee_command))
 
 
 class AblationCompletionPolicyTests(unittest.TestCase):
@@ -488,13 +783,18 @@ class AblationCompletionPolicyTests(unittest.TestCase):
     def write_json(path, value):
         path.write_text(json.dumps(value), encoding="utf-8")
 
+    def formal_config(self, **args):
+        protocol_args = {"history_len": 32, "pred_len": 20}
+        protocol_args.update(args)
+        return {"training_strategy_version": self.strategy_version, "args": protocol_args}
+
     def test_matching_version_with_both_result_files_skips(self):
         with TemporaryDirectory() as tmp:
             result_dir = Path(tmp)
             self.write_json(result_dir / "test_metrics.json", {"mse": 0.1})
             self.write_json(
                 result_dir / "run_config.json",
-                {"training_strategy_version": self.strategy_version},
+                self.formal_config(),
             )
 
             self.assertTrue(should_skip_ablation(result_dir, self.strategy_version, force_retrain=False))
@@ -506,7 +806,7 @@ class AblationCompletionPolicyTests(unittest.TestCase):
             metrics_missing.mkdir()
             self.write_json(
                 metrics_missing / "run_config.json",
-                {"training_strategy_version": self.strategy_version},
+                self.formal_config(),
             )
             config_missing = root / "config_missing"
             config_missing.mkdir()
@@ -514,6 +814,27 @@ class AblationCompletionPolicyTests(unittest.TestCase):
 
             self.assertFalse(should_skip_ablation(metrics_missing, self.strategy_version, force_retrain=False))
             self.assertFalse(should_skip_ablation(config_missing, self.strategy_version, force_retrain=False))
+
+    def test_general_ablation_matching_does_not_require_battery_protocol_fields(self):
+        with TemporaryDirectory() as tmp:
+            result_dir = Path(tmp)
+            self.write_json(result_dir / "test_metrics.json", {"mse": 0.1})
+            self.write_json(
+                result_dir / "run_config.json",
+                {
+                    "training_strategy_version": self.strategy_version,
+                    "args": {"input_len": 96, "pred_len": 96},
+                },
+            )
+
+            self.assertTrue(
+                should_skip_ablation(
+                    result_dir,
+                    self.strategy_version,
+                    force_retrain=False,
+                    protocol_stage=None,
+                )
+            )
 
     def test_malformed_or_mismatched_config_retrains(self):
         with TemporaryDirectory() as tmp:
@@ -531,12 +852,31 @@ class AblationCompletionPolicyTests(unittest.TestCase):
             self.write_json(mismatched / "test_metrics.json", {"mse": 0.1})
             self.write_json(
                 mismatched / "run_config.json",
-                {"training_strategy_version": "v2-legacy"},
+                self.formal_config() | {"training_strategy_version": "v2-legacy"},
+            )
+
+            wrong_protocol = root / "wrong_protocol"
+            wrong_protocol.mkdir()
+            self.write_json(wrong_protocol / "test_metrics.json", {"mse": 0.1})
+            self.write_json(wrong_protocol / "run_config.json", self.formal_config(history_len=31))
+
+            nested_decoy = root / "nested_decoy"
+            nested_decoy.mkdir()
+            self.write_json(nested_decoy / "test_metrics.json", {"mse": 0.1})
+            self.write_json(
+                nested_decoy / "run_config.json",
+                {
+                    "training_strategy_version": "v2-legacy",
+                    "args": {"history_len": 32, "pred_len": 20},
+                    "decoy": {"training_strategy_version": self.strategy_version},
+                },
             )
 
             self.assertFalse(should_skip_ablation(malformed, self.strategy_version, force_retrain=False))
             self.assertFalse(should_skip_ablation(invalid_encoding, self.strategy_version, force_retrain=False))
             self.assertFalse(should_skip_ablation(mismatched, self.strategy_version, force_retrain=False))
+            self.assertFalse(should_skip_ablation(wrong_protocol, self.strategy_version, force_retrain=False))
+            self.assertFalse(should_skip_ablation(nested_decoy, self.strategy_version, force_retrain=False))
 
     def test_force_retrain_never_skips_and_removes_variant_output(self):
         with TemporaryDirectory() as tmp:
@@ -546,7 +886,7 @@ class AblationCompletionPolicyTests(unittest.TestCase):
             self.write_json(result_dir / "test_metrics.json", {"mse": 0.1})
             self.write_json(
                 result_dir / "run_config.json",
-                {"training_strategy_version": self.strategy_version},
+                self.formal_config(),
             )
 
             self.assertFalse(should_skip_ablation(result_dir, self.strategy_version, force_retrain=True))

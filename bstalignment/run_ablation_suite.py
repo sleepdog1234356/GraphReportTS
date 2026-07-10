@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import shutil
 import subprocess
 import sys
@@ -9,6 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from .battery_protocol import require_formal_battery_protocol, run_config_matches
 from .training_strategy import TRAINING_STRATEGY_VERSION
 
 
@@ -42,22 +42,28 @@ GENERAL_ABLATIONS = {
 }
 
 
-def has_matching_strategy_version(result_dir: Path, training_strategy_version: str) -> bool:
-    config_path = result_dir / "run_config.json"
-    if not config_path.is_file():
-        return False
-    try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return False
-    return isinstance(config, dict) and config.get("training_strategy_version") == training_strategy_version
+def has_matching_strategy_version(
+    result_dir: Path,
+    training_strategy_version: str,
+    protocol_stage: str | None = "ablation",
+) -> bool:
+    return run_config_matches(
+        result_dir / "run_config.json",
+        training_strategy_version=training_strategy_version,
+        stage=protocol_stage,
+    )
 
 
-def should_skip_ablation(result_dir: Path, training_strategy_version: str, force_retrain: bool) -> bool:
+def should_skip_ablation(
+    result_dir: Path,
+    training_strategy_version: str,
+    force_retrain: bool,
+    protocol_stage: str | None = "ablation",
+) -> bool:
     return (
         not force_retrain
         and (result_dir / "test_metrics.json").is_file()
-        and has_matching_strategy_version(result_dir, training_strategy_version)
+        and has_matching_strategy_version(result_dir, training_strategy_version, protocol_stage)
     )
 
 
@@ -98,19 +104,32 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.variant == "battery":
+        require_formal_battery_protocol(
+            observed_cycles=args.history_len,
+            prediction_cycles=args.pred_len,
+            context="GraphReportTS battery ablation suite",
+        )
     suite = BATTERY_ABLATIONS if args.variant == "battery" else GENERAL_ABLATIONS
+    protocol_stage = "ablation" if args.variant == "battery" else None
     rows = []
     for name, flags in suite.items():
         out_dir = Path(args.out_root) / args.variant / args.dataset / name
         result_dir = out_dir / args.variant / args.dataset
         metrics_path = result_dir / "test_metrics.json"
-        if should_skip_ablation(result_dir, args.training_strategy_version, args.force_retrain):
+        if should_skip_ablation(
+            result_dir,
+            args.training_strategy_version,
+            args.force_retrain,
+            protocol_stage,
+        ):
             print(f"skip completed ablation {args.dataset} {name}")
             rows.append(pd.read_json(metrics_path, typ="series").to_dict() | {"ablation": name})
             continue
         start_fresh = args.force_retrain or not has_matching_strategy_version(
             result_dir,
             args.training_strategy_version,
+            protocol_stage,
         )
         if not args.dry_run:
             remove_ablation_output_if_fresh(out_dir, start_fresh)

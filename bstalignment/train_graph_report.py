@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 try:
+    from .battery_protocol import require_formal_battery_protocol
     from .data_battery_raw import BatteryRawGraphDataset, collate_graph_report_batch
     from .data_general import GeneralForecastGraphDataset, StandardScalerNP, collate_general_graph_batch
     from .experiment_config import ExperimentConfig, ensure_research_dirs
@@ -31,6 +32,7 @@ try:
     )
     from .utils import AverageMeter, ensure_dir, save_json, seed_everything, to_device
 except ImportError:
+    from battery_protocol import require_formal_battery_protocol
     from data_battery_raw import BatteryRawGraphDataset, collate_graph_report_batch
     from data_general import GeneralForecastGraphDataset, StandardScalerNP, collate_general_graph_batch
     from experiment_config import ExperimentConfig, ensure_research_dirs
@@ -276,6 +278,12 @@ def evaluate(
 
 def main():
     args = parse_args()
+    if args.variant == "battery":
+        require_formal_battery_protocol(
+            observed_cycles=args.history_len,
+            prediction_cycles=args.pred_len,
+            context="GraphReportTS battery trainer",
+        )
     seed_everything(args.seed)
     cfg = ExperimentConfig()
     ensure_research_dirs(cfg)

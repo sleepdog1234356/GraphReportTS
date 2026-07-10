@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 try:
+    from .battery_protocol import require_formal_battery_protocol
     from .train_battery_baselines import BatterySequenceDataset, FEATURES
     from .training_strategy import (
         TRAINING_STRATEGY_VERSION,
@@ -32,6 +33,7 @@ try:
     )
     from .utils import AverageMeter, ensure_dir, save_json, seed_everything
 except ImportError:
+    from battery_protocol import require_formal_battery_protocol
     from train_battery_baselines import BatterySequenceDataset, FEATURES
     from training_strategy import (
         TRAINING_STRATEGY_VERSION,
@@ -386,6 +388,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+    require_formal_battery_protocol(
+        observed_cycles=args.input_len,
+        prediction_cycles=args.pred_len,
+        context="Official battery baseline trainer",
+    )
     profile = resolve_baseline_profile(args)
     seed_everything(args.seed)
     device = torch.device(args.device)
