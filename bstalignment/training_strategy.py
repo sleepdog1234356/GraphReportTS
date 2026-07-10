@@ -176,6 +176,35 @@ def main_training_profile_matches(value: Any) -> bool:
     return observed_profile == MAIN_TRAINING_PROFILE
 
 
+def require_graph_report_checkpoint_identity(
+    checkpoint: Any,
+    *,
+    training_strategy_version: str,
+    ablation_suite_version: str | None,
+    context: str,
+) -> None:
+    if not isinstance(checkpoint, Mapping):
+        raise RuntimeError(f"{context} must contain a checkpoint mapping")
+    observed_strategy = checkpoint.get("training_strategy_version")
+    if type(observed_strategy) is not str or observed_strategy != training_strategy_version:
+        raise RuntimeError(
+            f"{context} training strategy version mismatch: "
+            f"expected={training_strategy_version!r} observed={observed_strategy!r}"
+        )
+    observed_suite = checkpoint.get("ablation_suite_version", "<missing>")
+    if type(observed_suite) is not type(ablation_suite_version) or observed_suite != ablation_suite_version:
+        raise RuntimeError(
+            f"{context} ablation suite version mismatch: "
+            f"expected={ablation_suite_version!r} observed={observed_suite!r}"
+        )
+    observed_profile = checkpoint.get("training_profile")
+    if not main_training_profile_matches(observed_profile):
+        raise RuntimeError(
+            f"{context} training profile mismatch: "
+            f"expected={MAIN_TRAINING_PROFILE.__dict__!r} observed={observed_profile!r}"
+        )
+
+
 def _freeze_text_backbone(model) -> None:
     text_encoder = getattr(model, "text_encoder", None)
     backbone = getattr(text_encoder, "backbone", None)

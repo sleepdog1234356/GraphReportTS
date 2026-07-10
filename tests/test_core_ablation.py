@@ -99,6 +99,25 @@ class CoreAblationRunnerTests(unittest.TestCase):
         (result / "run_config.json").write_text(json.dumps(config), encoding="utf-8")
 
     @staticmethod
+    def _write_core_checkpoint(
+        path: Path,
+        *,
+        strategy: str = TRAINING_STRATEGY_VERSION,
+        suite: str = "core-v1",
+        profile: dict | None = None,
+    ) -> None:
+        torch.save(
+            {
+                "training_strategy_version": strategy,
+                "ablation_suite_version": suite,
+                "training_profile": (
+                    dict(MAIN_TRAINING_PROFILE.__dict__) if profile is None else profile
+                ),
+            },
+            path,
+        )
+
+    @staticmethod
     def _core_config(dataset: str, ablation: str) -> dict:
         args = dict(CoreAblationRunnerTests.FULL_ARGUMENTS)
         args.update({
@@ -339,7 +358,7 @@ class CoreAblationRunnerTests(unittest.TestCase):
                     (run_dir / "run_config.json").write_text(
                         json.dumps(self._core_config("mit", ablation)), encoding="utf-8"
                     )
-                    (run_dir / "best.pt").write_bytes(b"best")
+                    self._write_core_checkpoint(run_dir / "best.pt")
                     (run_dir / "test_metrics.json").write_text(
                         '{"mse": 0.2, "mae": 0.3, "rmse": 0.447}', encoding="utf-8"
                     )
@@ -383,13 +402,14 @@ class CoreAblationRunnerTests(unittest.TestCase):
             (result / "run_config.json").write_text(
                 json.dumps(self._core_config("mit", "no_text_gate")), encoding="utf-8"
             )
-            (result / "last.pt").write_bytes(b"resume-me")
+            self._write_core_checkpoint(result / "last.pt")
+            original_last = (result / "last.pt").read_bytes()
 
             def fake_run(command, **kwargs):
                 if command[:3] == ["git", "rev-parse", "HEAD"]:
                     return Namespace(stdout="source-commit\n", returncode=0)
                 if "bstalignment.train_graph_report" in command:
-                    (result / "best.pt").write_bytes(b"best")
+                    self._write_core_checkpoint(result / "best.pt")
                     (result / "test_metrics.json").write_text(
                         '{"mse": 0.2, "mae": 0.3, "rmse": 0.447}', encoding="utf-8"
                     )
@@ -416,7 +436,7 @@ class CoreAblationRunnerTests(unittest.TestCase):
             ]
             self.assertEqual(len(train_commands), 1)
             self.assertNotIn("--no_resume", train_commands[0])
-            self.assertEqual((result / "last.pt").read_bytes(), b"resume-me")
+            self.assertEqual((result / "last.pt").read_bytes(), original_last)
             precompute_commands = [
                 call.args[0] for call in run.call_args_list
                 if any("precompute_battery" in str(token) for token in call.args[0])
@@ -470,9 +490,9 @@ class CoreAblationRunnerTests(unittest.TestCase):
                     json.dumps(self._core_config("mit", "no_text_gate")), encoding="utf-8"
                 )
                 if "best.pt" in artifacts:
-                    (result / "best.pt").write_bytes(b"best")
+                    self._write_core_checkpoint(result / "best.pt")
                 if "last.pt" in artifacts:
-                    (result / "last.pt").write_bytes(b"last")
+                    self._write_core_checkpoint(result / "last.pt")
                 if "test_metrics.json" in artifacts:
                     (result / "test_metrics.json").write_text(
                         '{"mse": 0.2, "mae": 0.3, "rmse": 0.447}', encoding="utf-8"
@@ -484,7 +504,7 @@ class CoreAblationRunnerTests(unittest.TestCase):
                     if command[:3] == ["git", "rev-parse", "HEAD"]:
                         return Namespace(stdout="source-commit\n", returncode=0)
                     if "bstalignment.train_graph_report" in command:
-                        (result / "best.pt").write_bytes(b"best")
+                        self._write_core_checkpoint(result / "best.pt")
                         (result / "test_metrics.json").write_text(
                             '{"mse": 0.2, "mae": 0.3, "rmse": 0.447}', encoding="utf-8"
                         )
@@ -517,6 +537,65 @@ class CoreAblationRunnerTests(unittest.TestCase):
                 else:
                     self.assertEqual(len(train_commands), 1)
                     self.assertNotIn("--no_resume", train_commands[0])
+
+    def test_bad_core_checkpoint_identity_is_invalid_before_skip_or_resume(self):
+        cases = {
+            "complete wrong strategy": ("complete", {"strategy": "legacy"}),
+            "complete wrong suite": ("complete", {"suite": "legacy-suite"}),
+            "resumable wrong profile": (
+                "resumable",
+                {"profile": dict(MAIN_TRAINING_PROFILE.__dict__, max_epochs=79)},
+            ),
+            "complete corrupt payload": ("complete", None),
+        }
+        summary = {
+            "best_epoch": 8,
+            "stopped_epoch": 30,
+            "mean_epoch_seconds": 2.0,
+            "total_train_seconds": 60.0,
+            "trainable_parameter_count": 90,
+        }
+        for name, (state, checkpoint_updates) in cases.items():
+            with self.subTest(name=name), TemporaryDirectory() as tmp, patch(
+                "bstalignment.run_core_ablation_suite.verify_prompt_cache_identity"
+            ), patch("bstalignment.run_core_ablation_suite.subprocess.run") as run:
+                root = Path(tmp)
+                self._write_full_result(root / "full" / "mit")
+                result = root / "out" / "battery" / "mit" / "no_text_gate"
+                result.mkdir(parents=True)
+                (result / "run_config.json").write_text(
+                    json.dumps(self._core_config("mit", "no_text_gate")), encoding="utf-8"
+                )
+                if checkpoint_updates is None:
+                    (result / "best.pt").write_bytes(b"not a torch checkpoint")
+                else:
+                    self._write_core_checkpoint(result / "best.pt", **checkpoint_updates)
+                if state == "complete":
+                    (result / "test_metrics.json").write_text(
+                        '{"mse": 0.2, "mae": 0.3, "rmse": 0.447}', encoding="utf-8"
+                    )
+                    (result / "run_summary.json").write_text(json.dumps(summary), encoding="utf-8")
+                run.side_effect = lambda command, **kwargs: Namespace(
+                    stdout="source-commit\n" if command[:3] == ["git", "rev-parse", "HEAD"] else "",
+                    returncode=0,
+                )
+                argv = [
+                    "--datasets", "mit", "--ablations", "no_text_gate",
+                    "--full_result_root", str(root / "full"),
+                    "--graph_cache_dir", str(root / "graph"),
+                    "--sequence_cache_dir", str(root / "sequence"),
+                    "--out_root", str(root / "out"),
+                    "--text_model", str(root / "text-model"),
+                    "--full_reference_commit", "full-commit",
+                ]
+                before = {path.name: path.read_bytes() for path in result.iterdir()}
+                with self.assertRaisesRegex(RuntimeError, r"dataset=mit.*best.pt"):
+                    run_core_ablation_main(argv)
+                self.assertEqual(before, {path.name: path.read_bytes() for path in result.iterdir()})
+                self.assertFalse(any(
+                    "bstalignment.train_graph_report" in call.args[0]
+                    for call in run.call_args_list
+                ))
 
 
 class CoreAblationModelTests(unittest.TestCase):
@@ -708,28 +787,47 @@ class TrainerIntegrationTests(unittest.TestCase):
             last_path.write_bytes(b"last")
             self.assertEqual(graph_report_trainer._resume_checkpoint_path(out_dir), last_path)
 
-    def test_formal_resume_checkpoint_requires_the_exact_main_training_profile(self):
-        validator = getattr(graph_report_trainer, "_require_formal_resume_training_profile", None)
+    def test_formal_resume_checkpoint_requires_shared_strategy_suite_and_profile_identity(self):
+        validator = getattr(graph_report_trainer, "require_graph_report_checkpoint_identity", None)
         self.assertIsNotNone(
             validator,
-            "formal trainer must validate checkpoint training_profile before resuming",
+            "formal trainer must use the shared checkpoint identity validator",
         )
         if validator is None:
             return
-        validator({"training_profile": dict(MAIN_TRAINING_PROFILE.__dict__)})
+        valid = {
+            "training_strategy_version": TRAINING_STRATEGY_VERSION,
+            "ablation_suite_version": "core-v1",
+            "training_profile": dict(MAIN_TRAINING_PROFILE.__dict__),
+        }
+        validator(
+            valid,
+            training_strategy_version=TRAINING_STRATEGY_VERSION,
+            ablation_suite_version="core-v1",
+            context="test checkpoint",
+        )
         cases = {
-            "missing profile": {},
+            "missing strategy": dict(valid, training_strategy_version=None),
+            "wrong suite": dict(valid, ablation_suite_version="legacy-suite"),
+            "missing profile": {**valid, "training_profile": None},
             "wrong max epochs": {
+                **valid,
                 "training_profile": dict(MAIN_TRAINING_PROFILE.__dict__, max_epochs=79)
             },
-            "incomplete profile": {"training_profile": {"max_epochs": 80}},
+            "incomplete profile": {**valid, "training_profile": {"max_epochs": 80}},
             "boolean numeric field": {
+                **valid,
                 "training_profile": dict(MAIN_TRAINING_PROFILE.__dict__, gradient_clip=True)
             },
         }
         for name, checkpoint in cases.items():
-            with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, "training profile"):
-                validator(checkpoint)
+            with self.subTest(name=name), self.assertRaises(RuntimeError):
+                validator(
+                    checkpoint,
+                    training_strategy_version=TRAINING_STRATEGY_VERSION,
+                    ablation_suite_version="core-v1",
+                    context="test checkpoint",
+                )
 
     def test_raw_sequence_parser_flags_keep_formal_batch_default(self):
         with patch.object(

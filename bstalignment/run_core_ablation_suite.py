@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+import torch
+
 from .battery_protocol import (
     FORMAL_CACHE_TASK_BATCH_SIZE,
     require_formal_battery_protocol,
@@ -24,6 +26,7 @@ from .data_battery_raw import (
 from .training_strategy import (
     TRAINING_STRATEGY_VERSION,
     main_training_profile_matches,
+    require_graph_report_checkpoint_identity,
 )
 
 
@@ -589,6 +592,40 @@ def _is_nonempty_file(path: Path) -> bool:
         return False
 
 
+def _require_core_checkpoint_identity(path: Path, dataset: str) -> None:
+    try:
+        checkpoint = torch.load(
+            path,
+            map_location="cpu",
+            weights_only=True,
+        )
+    except Exception as exc:
+        raise _mismatch(
+            dataset,
+            "safely loadable core-v1 checkpoint",
+            f"{type(exc).__name__}: {exc}",
+            path,
+        ) from exc
+    try:
+        require_graph_report_checkpoint_identity(
+            checkpoint,
+            training_strategy_version=TRAINING_STRATEGY_VERSION,
+            ablation_suite_version=CORE_ABLATION_SUITE_VERSION,
+            context=f"core ablation checkpoint {path}",
+        )
+    except RuntimeError as exc:
+        raise _mismatch(
+            dataset,
+            {
+                "training_strategy_version": TRAINING_STRATEGY_VERSION,
+                "ablation_suite_version": CORE_ABLATION_SUITE_VERSION,
+                "training_profile": "MAIN_TRAINING_PROFILE",
+            },
+            str(exc),
+            path,
+        ) from exc
+
+
 def _core_output_state(
     result_dir: Path,
     dataset: str,
@@ -611,8 +648,14 @@ def _core_output_state(
             "missing, malformed, or mismatched metadata",
             result_dir / "run_config.json",
         )
-    has_best = _is_nonempty_file(result_dir / "best.pt")
-    has_last = _is_nonempty_file(result_dir / "last.pt")
+    best_path = result_dir / "best.pt"
+    last_path = result_dir / "last.pt"
+    best_exists = best_path.exists()
+    if best_exists:
+        if not _is_nonempty_file(best_path):
+            raise _mismatch(dataset, "non-empty best.pt checkpoint", "empty or invalid file", best_path)
+        _require_core_checkpoint_identity(best_path, dataset)
+    has_best = best_exists
     complete = (
         has_best
         and (result_dir / "test_metrics.json").is_file()
@@ -620,6 +663,12 @@ def _core_output_state(
     )
     if complete:
         return "complete"
+    last_exists = last_path.exists()
+    if last_exists:
+        if not _is_nonempty_file(last_path):
+            raise _mismatch(dataset, "non-empty last.pt checkpoint", "empty or invalid file", last_path)
+        _require_core_checkpoint_identity(last_path, dataset)
+    has_last = last_exists
     if has_last or has_best:
         return "resumable"
     raise _mismatch(
