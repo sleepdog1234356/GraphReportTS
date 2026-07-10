@@ -24,6 +24,7 @@ from bstalignment.data_battery_raw import (
 from bstalignment.graph_report_model import GraphReportTS, GraphReportTSConfig
 import bstalignment.precompute_battery_graph_cache as cache_precompute
 from bstalignment.precompute_battery_graph_cache import precompute_split
+import bstalignment.train_graph_report as graph_report_trainer
 import bstalignment.training_strategy as training_strategy
 from bstalignment.run_ablation_suite import (
     has_matching_strategy_version,
@@ -448,6 +449,47 @@ class FormalBatteryProtocolTests(unittest.TestCase):
                 result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("requires", result.stdout + result.stderr)
+
+
+class VariantBatchDefaultTests(unittest.TestCase):
+    def test_graph_report_parser_resolves_batch_default_by_variant(self):
+        cases = (
+            (["--variant", "battery"], 64),
+            (["--variant", "general"], 32),
+            (["--variant", "general", "--batch_size", "7"], 7),
+        )
+        for arguments, expected in cases:
+            with self.subTest(arguments=arguments), patch.object(
+                sys,
+                "argv",
+                ["train_graph_report", *arguments],
+            ):
+                self.assertEqual(graph_report_trainer.parse_args().batch_size, expected)
+
+    def test_ablation_commands_resolve_batch_default_by_variant(self):
+        cases = (
+            (["--variant", "battery"], 64),
+            (["--variant", "general"], 32),
+            (["--variant", "general", "--batch_size", "7"], 7),
+        )
+        with TemporaryDirectory() as tmp:
+            for arguments, expected in cases:
+                printed = []
+                with self.subTest(arguments=arguments), patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "run_ablation_suite",
+                        *arguments,
+                        "--out_root",
+                        str(Path(tmp) / "out"),
+                        "--dry_run",
+                    ],
+                ), patch("builtins.print", side_effect=lambda message: printed.append(str(message))):
+                    ablation_suite.main()
+                commands = [shlex.split(message) for message in printed if "bstalignment.train_graph_report" in message]
+                self.assertTrue(commands)
+                self.assertTrue(all(command[command.index("--batch_size") + 1] == str(expected) for command in commands))
 
 
 class RunMetadataTests(unittest.TestCase):

@@ -87,7 +87,7 @@ def parse_args():
     p.add_argument("--dataset", type=str, default="mit")
     p.add_argument("--data_root", type=str, default="bstalignment/data")
     p.add_argument("--out_root", type=str, default="runs/graph_report_ablation")
-    p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--batch_size", type=int)
     p.add_argument("--cache_task_batch_size", type=int, default=FORMAL_CACHE_TASK_BATCH_SIZE)
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--pred_len", type=int, default=20)
@@ -105,7 +105,10 @@ def parse_args():
     p.add_argument("--training_strategy_version", type=str, default=TRAINING_STRATEGY_VERSION)
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--dry_run", action="store_true")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.batch_size is None:
+        args.batch_size = 64 if args.variant == "battery" else 32
+    return args
 
 
 def main():

@@ -99,7 +99,7 @@ def parse_args():
     p.add_argument("--require_precomputed_cache", action="store_true", help="Fail instead of falling back to online battery graph map construction")
     p.add_argument("--max_cycles", type=int, default=None)
     p.add_argument("--epochs", type=int, default=80)
-    p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--batch_size", type=int)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--loss", choices=["smooth_l1", "mse", "mae"], default="smooth_l1")
@@ -111,7 +111,10 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.batch_size is None:
+        args.batch_size = 64 if args.variant == "battery" else 32
+    return args
 
 
 def build_loaders(args) -> Tuple[DataLoader, DataLoader, DataLoader, int]:
