@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+
+
+BATTERY_BASE_CHANNELS = ("current", "voltage", "temperature", "capacity")
+BATTERY_SEQUENCE_CHANNELS = BATTERY_BASE_CHANNELS + ("ic_dqdv", "dv_dq")
+FULL_BATTERY_PROMPT_MAP_NAMES = tuple(
+    f"{channel}:{view}"
+    for channel in BATTERY_SEQUENCE_CHANNELS
+    for view in ("hankel", "d1", "d2")
+)[:10]
 
 
 @dataclass
@@ -61,6 +70,43 @@ def smooth_gradient(y: np.ndarray, x: np.ndarray, eps: float = 1e-6) -> np.ndarr
     return (dy / np.where(np.abs(dx) < eps, eps, dx)).astype(np.float32)
 
 
+def build_resampled_channels(
+    channels: Mapping[str, np.ndarray],
+    resample_len: int,
+    include_ic_dv: bool,
+    required_channels: Sequence[str] = (),
+) -> Dict[str, np.ndarray]:
+    missing = [name for name in required_channels if name not in channels or np.asarray(channels[name]).size == 0]
+    if missing:
+        raise ValueError(f"Missing required raw battery channels: {missing}")
+    base = {
+        name: robust_scale(resample_1d(values, resample_len))
+        for name, values in channels.items()
+        if values is not None and np.asarray(values).size > 0
+    }
+    if include_ic_dv:
+        if "capacity" not in base or "voltage" not in base:
+            raise ValueError("IC/DV requires non-empty capacity and voltage channels")
+        base["ic_dqdv"] = robust_scale(smooth_gradient(base["capacity"], base["voltage"]))
+        base["dv_dq"] = robust_scale(smooth_gradient(base["voltage"], base["capacity"]))
+    return base
+
+
+def build_battery_sequence(
+    channels: Mapping[str, np.ndarray],
+    resample_len: int = 128,
+    include_ic_dv: bool = True,
+) -> Tuple[np.ndarray, List[str]]:
+    base = build_resampled_channels(
+        channels,
+        resample_len=resample_len,
+        include_ic_dv=include_ic_dv,
+        required_channels=BATTERY_BASE_CHANNELS,
+    )
+    names = list(BATTERY_SEQUENCE_CHANNELS if include_ic_dv else BATTERY_BASE_CHANNELS)
+    return np.stack([base[name] for name in names], axis=-1).astype(np.float32), names
+
+
 def hankel_map(x: np.ndarray, delay_dim: int, delay_lag: int) -> np.ndarray:
     """Convert a 1D sequence to a 2D delay/Hankel map.
 
@@ -100,17 +146,11 @@ def build_multiview_maps(
     Hankel maps and derivative maps work for batteries, weather, traffic, and
     electricity. IC/DV is only enabled for battery SOH experiments.
     """
-    base = {}
-    for name, values in channels.items():
-        if values is None:
-            continue
-        base[name] = robust_scale(resample_1d(values, resample_len))
-
-    if include_ic_dv and "capacity" in base and "voltage" in base:
-        cap = base["capacity"]
-        volt = base["voltage"]
-        base["ic_dqdv"] = robust_scale(smooth_gradient(cap, volt))
-        base["dv_dvdq"] = robust_scale(smooth_gradient(volt, cap))
+    base = build_resampled_channels(
+        channels,
+        resample_len=resample_len,
+        include_ic_dv=include_ic_dv,
+    )
 
     maps: List[np.ndarray] = []
     names: List[str] = []
