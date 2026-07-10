@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pandas as pd
+
+from .training_strategy import TRAINING_STRATEGY_VERSION
 
 
 BATTERY_ABLATIONS = {
@@ -38,6 +42,30 @@ GENERAL_ABLATIONS = {
 }
 
 
+def has_matching_strategy_version(result_dir: Path, training_strategy_version: str) -> bool:
+    config_path = result_dir / "run_config.json"
+    if not config_path.is_file():
+        return False
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return isinstance(config, dict) and config.get("training_strategy_version") == training_strategy_version
+
+
+def should_skip_ablation(result_dir: Path, training_strategy_version: str, force_retrain: bool) -> bool:
+    return (
+        not force_retrain
+        and (result_dir / "test_metrics.json").is_file()
+        and has_matching_strategy_version(result_dir, training_strategy_version)
+    )
+
+
+def remove_ablation_output_if_forced(output_dir: Path, force_retrain: bool) -> None:
+    if force_retrain and output_dir.exists():
+        shutil.rmtree(output_dir)
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Run GraphReportTS ablation suite")
     p.add_argument("--variant", choices=["battery", "general"], default="battery")
@@ -57,6 +85,8 @@ def parse_args():
     p.add_argument("--precomputed_cache_dir", type=str, default=None)
     p.add_argument("--require_precomputed_cache", action="store_true")
     p.add_argument("--force_precompute_cache", action="store_true")
+    p.add_argument("--force_retrain", action="store_true")
+    p.add_argument("--training_strategy_version", type=str, default=TRAINING_STRATEGY_VERSION)
     p.add_argument("--device", type=str, default="cpu")
     p.add_argument("--dry_run", action="store_true")
     return p.parse_args()
@@ -68,11 +98,18 @@ def main():
     rows = []
     for name, flags in suite.items():
         out_dir = Path(args.out_root) / args.variant / args.dataset / name
-        metrics_path = out_dir / args.variant / args.dataset / "test_metrics.json"
-        if metrics_path.exists():
+        result_dir = out_dir / args.variant / args.dataset
+        metrics_path = result_dir / "test_metrics.json"
+        if should_skip_ablation(result_dir, args.training_strategy_version, args.force_retrain):
             print(f"skip completed ablation {args.dataset} {name}")
             rows.append(pd.read_json(metrics_path, typ="series").to_dict() | {"ablation": name})
             continue
+        if not args.dry_run:
+            remove_ablation_output_if_forced(out_dir, args.force_retrain)
+        start_fresh = args.force_retrain or not has_matching_strategy_version(
+            result_dir,
+            args.training_strategy_version,
+        )
         if args.variant == "battery" and args.precomputed_cache_dir:
             precompute_cmd = [
                 sys.executable,
@@ -146,6 +183,8 @@ def main():
             cmd.extend(["--precomputed_cache_dir", args.precomputed_cache_dir])
         if args.require_precomputed_cache:
             cmd.append("--require_precomputed_cache")
+        if start_fresh:
+            cmd.append("--no_resume")
         cmd.extend(flags)
         print(" ".join(cmd))
         if not args.dry_run:

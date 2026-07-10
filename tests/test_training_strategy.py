@@ -1,9 +1,12 @@
 from argparse import Namespace
+import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 
 import torch
 
+from bstalignment.run_ablation_suite import remove_ablation_output_if_forced, should_skip_ablation
 from bstalignment.train_battery_official_baselines import resolve_baseline_profile
 from bstalignment.training_strategy import (
     BASELINE_TRAINING_PROFILES,
@@ -68,7 +71,6 @@ class PipelineScriptTests(unittest.TestCase):
         for path in (
             Path("scripts/run_battery_main_full_hf.sh"),
             Path("scripts/run_battery_official_baselines.sh"),
-            Path("scripts/run_battery_ablations_full_hf.sh"),
         ):
             text = path.read_text(encoding="utf-8")
             self.assertIn("run_config.json", text, path)
@@ -77,6 +79,11 @@ class PipelineScriptTests(unittest.TestCase):
             self.assertNotIn("${OUT_ROOT}/cache/battery_graph", text, path)
         self.assertIn("runs/cache/battery_graph", Path("scripts/run_battery_main_full_hf.sh").read_text(encoding="utf-8"))
         self.assertIn("runs/cache/battery_graph", Path("scripts/run_battery_ablations_full_hf.sh").read_text(encoding="utf-8"))
+
+    def test_ablation_shell_passes_force_and_version_controls(self):
+        text = Path("scripts/run_battery_ablations_full_hf.sh").read_text(encoding="utf-8")
+        self.assertIn('--training_strategy_version "$TRAINING_STRATEGY_VERSION"', text)
+        self.assertIn("--force_retrain", text)
 
     def test_main_and_ablation_use_approved_workers_and_batch_size(self):
         for path in (
@@ -99,6 +106,79 @@ class PipelineScriptTests(unittest.TestCase):
         self.assertNotIn('--epochs "$EPOCHS"', text)
         self.assertNotIn('--lr "$LR"', text)
         self.assertNotIn('--early_stop_patience "$EARLY_STOP_PATIENCE"', text)
+
+
+class AblationCompletionPolicyTests(unittest.TestCase):
+    strategy_version = "v3-source-profiles-main-adaptive"
+
+    @staticmethod
+    def write_json(path, value):
+        path.write_text(json.dumps(value), encoding="utf-8")
+
+    def test_matching_version_with_both_result_files_skips(self):
+        with TemporaryDirectory() as tmp:
+            result_dir = Path(tmp)
+            self.write_json(result_dir / "test_metrics.json", {"mse": 0.1})
+            self.write_json(
+                result_dir / "run_config.json",
+                {"training_strategy_version": self.strategy_version},
+            )
+
+            self.assertTrue(should_skip_ablation(result_dir, self.strategy_version, force_retrain=False))
+
+    def test_missing_result_or_config_retrains(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            metrics_missing = root / "metrics_missing"
+            metrics_missing.mkdir()
+            self.write_json(
+                metrics_missing / "run_config.json",
+                {"training_strategy_version": self.strategy_version},
+            )
+            config_missing = root / "config_missing"
+            config_missing.mkdir()
+            self.write_json(config_missing / "test_metrics.json", {"mse": 0.1})
+
+            self.assertFalse(should_skip_ablation(metrics_missing, self.strategy_version, force_retrain=False))
+            self.assertFalse(should_skip_ablation(config_missing, self.strategy_version, force_retrain=False))
+
+    def test_malformed_or_mismatched_config_retrains(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            malformed = root / "malformed"
+            malformed.mkdir()
+            self.write_json(malformed / "test_metrics.json", {"mse": 0.1})
+            (malformed / "run_config.json").write_text("{not-json", encoding="utf-8")
+            invalid_encoding = root / "invalid_encoding"
+            invalid_encoding.mkdir()
+            self.write_json(invalid_encoding / "test_metrics.json", {"mse": 0.1})
+            (invalid_encoding / "run_config.json").write_bytes(b"\xff\xfe")
+            mismatched = root / "mismatched"
+            mismatched.mkdir()
+            self.write_json(mismatched / "test_metrics.json", {"mse": 0.1})
+            self.write_json(
+                mismatched / "run_config.json",
+                {"training_strategy_version": "v2-legacy"},
+            )
+
+            self.assertFalse(should_skip_ablation(malformed, self.strategy_version, force_retrain=False))
+            self.assertFalse(should_skip_ablation(invalid_encoding, self.strategy_version, force_retrain=False))
+            self.assertFalse(should_skip_ablation(mismatched, self.strategy_version, force_retrain=False))
+
+    def test_force_retrain_never_skips_and_removes_variant_output(self):
+        with TemporaryDirectory() as tmp:
+            variant_dir = Path(tmp) / "full"
+            result_dir = variant_dir / "battery" / "mit"
+            result_dir.mkdir(parents=True)
+            self.write_json(result_dir / "test_metrics.json", {"mse": 0.1})
+            self.write_json(
+                result_dir / "run_config.json",
+                {"training_strategy_version": self.strategy_version},
+            )
+
+            self.assertFalse(should_skip_ablation(result_dir, self.strategy_version, force_retrain=True))
+            remove_ablation_output_if_forced(variant_dir, force_retrain=True)
+            self.assertFalse(variant_dir.exists())
 
 
 class TrainingProfileTests(unittest.TestCase):

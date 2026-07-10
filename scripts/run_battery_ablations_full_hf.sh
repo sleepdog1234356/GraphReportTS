@@ -22,16 +22,10 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 PY="${PY:-python -u}"
 
-has_current_strategy_version() {
-  local out="$1"
-  [ -f "$out/run_config.json" ] && \
-    grep -Eq "\"training_strategy_version\"[[:space:]]*:[[:space:]]*\"${TRAINING_STRATEGY_VERSION}\"" "$out/run_config.json"
-}
-
-is_completed_current_strategy() {
-  local out="$1"
-  [ -f "$out/test_metrics.json" ] && has_current_strategy_version "$out"
-}
+CONTROL_ARGS=(--training_strategy_version "$TRAINING_STRATEGY_VERSION")
+if [ "$FORCE_RETRAIN" = "1" ]; then
+  CONTROL_ARGS+=(--force_retrain)
+fi
 
 for dataset in mit calce xjtu; do
   CACHE_ARGS=()
@@ -49,5 +43,6 @@ for dataset in mit calce xjtu; do
     --num_workers "$NUM_WORKERS" \
     --device cuda \
     --text_model "$TEXT_MODEL" \
+    "${CONTROL_ARGS[@]}" \
     "${CACHE_ARGS[@]}" 2>&1 | tee "${OUT_ROOT}/logs/ablation_${dataset}.log"
 done
