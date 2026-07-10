@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import subprocess
 import sys
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Iterable, List
@@ -12,15 +14,32 @@ from typing import Dict, Iterable, List
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 try:
     from .train_battery_baselines import BatterySequenceDataset, FEATURES
+    from .training_strategy import (
+        TRAINING_STRATEGY_VERSION,
+        baseline_regression_loss,
+        build_baseline_optimizer,
+        build_baseline_scheduler,
+        get_baseline_training_profile,
+        step_baseline_batch_scheduler,
+        step_baseline_epoch_scheduler,
+    )
     from .utils import AverageMeter, ensure_dir, save_json, seed_everything
 except ImportError:
     from train_battery_baselines import BatterySequenceDataset, FEATURES
+    from training_strategy import (
+        TRAINING_STRATEGY_VERSION,
+        baseline_regression_loss,
+        build_baseline_optimizer,
+        build_baseline_scheduler,
+        get_baseline_training_profile,
+        step_baseline_batch_scheduler,
+        step_baseline_epoch_scheduler,
+    )
     from utils import AverageMeter, ensure_dir, save_json, seed_everything
 
 
@@ -32,6 +51,20 @@ OFFICIAL_REPO_DIRS = {
     "timecma": Path("timecma"),
     "time_llm": Path("time_llm"),
 }
+
+
+def resolve_baseline_profile(args):
+    profile = get_baseline_training_profile(args.model)
+    updates = {}
+    if args.epochs is not None:
+        updates["max_epochs"] = args.epochs
+    if args.lr is not None:
+        updates["lr"] = args.lr
+    if args.weight_decay is not None:
+        updates["weight_decay"] = args.weight_decay
+    if args.early_stop_patience is not None:
+        updates["early_stop_patience"] = args.early_stop_patience
+    return replace(profile, **updates)
 
 
 @contextmanager
@@ -279,7 +312,7 @@ def metrics(pred: torch.Tensor, y: torch.Tensor) -> Dict[str, float]:
     return {"mse": mse, "mae": mae, "rmse": mse**0.5}
 
 
-def run_epoch(model, loader, device, opt=None) -> Dict[str, float]:
+def run_epoch(model, loader, device, profile, opt=None, batch_scheduler=None, gradient_clip=None) -> Dict[str, float]:
     train = opt is not None
     model.train(train)
     loss_meter = AverageMeter()
@@ -289,12 +322,14 @@ def run_epoch(model, loader, device, opt=None) -> Dict[str, float]:
             x = batch["x"].to(device)
             y = batch["y"].to(device)
             pred = model(x)
-            loss = F.smooth_l1_loss(pred, y)
+            loss = baseline_regression_loss(pred, y, profile)
             if train:
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
+                if gradient_clip is not None:
+                    torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], gradient_clip)
                 opt.step()
+                step_baseline_batch_scheduler(batch_scheduler, profile)
             n = x.size(0)
             loss_meter.update(float(loss.detach()), n)
             m = metrics(pred, y)
@@ -335,12 +370,12 @@ def parse_args():
     p.add_argument("--timecma_channel", type=int, default=128)
     p.add_argument("--hf_gpt2_model", type=str, default="openai-community/gpt2")
     p.add_argument("--hf_bert_model", type=str, default="google-bert/bert-base-uncased")
-    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--num_workers", type=int, default=0)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--weight_decay", type=float, default=1e-4)
-    p.add_argument("--early_stop_patience", type=int, default=8)
+    p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--weight_decay", type=float, default=None)
+    p.add_argument("--early_stop_patience", type=int, default=None)
     p.add_argument("--max_cycles", type=int, default=None)
     p.add_argument("--no_resume", action="store_true")
     p.add_argument("--seed", type=int, default=42)
@@ -350,6 +385,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    profile = resolve_baseline_profile(args)
     seed_everything(args.seed)
     device = torch.device(args.device)
     ds_kwargs = dict(
@@ -378,8 +414,22 @@ def main():
     test_loader = DataLoader(test_ds, shuffle=False, persistent_workers=False, **loader_kwargs)
 
     model = OfficialBaseline(args.model, args, len(FEATURES)).to(device)
-    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr, weight_decay=args.weight_decay)
     out_dir = ensure_dir(Path(args.out_dir) / args.dataset / args.model)
+    resume_path = None
+    resume_checkpoint = None
+    training_strategy_version = TRAINING_STRATEGY_VERSION
+    if not args.no_resume:
+        last_path = out_dir / "last.pt"
+        best_path = out_dir / "best.pt"
+        resume_path = last_path if last_path.exists() else best_path
+        if resume_path.exists():
+            resume_checkpoint = torch.load(resume_path, map_location=device)
+            if "training_profile" in resume_checkpoint:
+                profile = replace(profile, **resume_checkpoint["training_profile"])
+            training_strategy_version = resume_checkpoint.get("training_strategy_version", training_strategy_version)
+
+    opt = build_baseline_optimizer(model, profile)
+    scheduler = build_baseline_scheduler(opt, profile, steps_per_epoch=len(train_loader))
     source_dir = Path(args.external_root) / OFFICIAL_REPO_DIRS[args.model].parts[0]
     save_json(
         {
@@ -391,67 +441,88 @@ def main():
             "official_source_dir": str(source_dir),
             "official_source_commit": git_commit(source_dir),
             "adapter": "project-side battery sequence adapter with official model class",
+            "training_strategy_version": training_strategy_version,
+            "training_profile": profile.__dict__,
         },
         out_dir / "run_config.json",
     )
     best = float("inf")
     stale = 0
     start_epoch = 1
-    if not args.no_resume:
-        last_path = out_dir / "last.pt"
-        best_path = out_dir / "best.pt"
-        resume_path = last_path if last_path.exists() else best_path
-        if resume_path.exists():
-            ckpt = torch.load(resume_path, map_location=device)
-            model.load_state_dict(ckpt["model"])
-            if "optimizer" in ckpt:
-                opt.load_state_dict(ckpt["optimizer"])
-            val_metrics = ckpt.get("val_metrics", {})
-            best = float(ckpt.get("best", val_metrics.get("mse", best)))
-            stale = int(ckpt.get("stale", 0))
-            start_epoch = int(ckpt.get("epoch", 0)) + 1 if "epoch" in ckpt else 1
-            print(f"resumed from {resume_path} at epoch {start_epoch}; best val_mse={best:.6f}")
+    if resume_checkpoint is not None:
+        model.load_state_dict(resume_checkpoint["model"])
+        if "optimizer" in resume_checkpoint:
+            opt.load_state_dict(resume_checkpoint["optimizer"])
+        if scheduler is not None and resume_checkpoint.get("scheduler") is not None:
+            scheduler.load_state_dict(resume_checkpoint["scheduler"])
+        if "current_lr" in resume_checkpoint:
+            for group in opt.param_groups:
+                group["lr"] = float(resume_checkpoint["current_lr"])
+        val_metrics = resume_checkpoint.get("val_metrics", {})
+        best = float(resume_checkpoint.get("best", val_metrics.get("mse", best)))
+        stale = int(resume_checkpoint.get("stale", 0))
+        start_epoch = int(resume_checkpoint.get("epoch", 0)) + 1 if "epoch" in resume_checkpoint else 1
+        print(f"resumed from {resume_path} at epoch {start_epoch}; best val_mse={best:.6f}")
 
-    for epoch in range(start_epoch, args.epochs + 1):
-        train_m = run_epoch(model, train_loader, device, opt)
-        val_m = run_epoch(model, val_loader, device)
+    history_path = out_dir / "epoch_history.jsonl"
+    for epoch in range(start_epoch, profile.max_epochs + 1):
+        train_m = run_epoch(
+            model,
+            train_loader,
+            device,
+            profile,
+            opt,
+            batch_scheduler=scheduler,
+            gradient_clip=profile.gradient_clip,
+        )
+        val_m = run_epoch(model, val_loader, device, profile)
         print(f"epoch={epoch} train_loss={train_m['loss']:.6f} val_mse={val_m['mse']:.6f} val_mae={val_m['mae']:.6f}")
         if val_m["mse"] < best:
             best = val_m["mse"]
             stale = 0
-            torch.save(
-                {
-                    "model": model.state_dict(),
-                    "args": vars(args),
-                    "optimizer": opt.state_dict(),
-                    "epoch": epoch,
-                    "best": best,
-                    "stale": stale,
-                    "val_metrics": val_m,
-                },
-                out_dir / "best.pt",
-            )
-            save_json(val_m, out_dir / "val_metrics.json")
         else:
             stale += 1
-        torch.save(
-            {
-                "model": model.state_dict(),
-                "args": vars(args),
-                "optimizer": opt.state_dict(),
-                "epoch": epoch,
-                "best": best,
-                "stale": stale,
-                "val_metrics": val_m,
-            },
-            out_dir / "last.pt",
-        )
-        if stale >= args.early_stop_patience:
+        step_baseline_epoch_scheduler(scheduler, opt, profile, epoch)
+        checkpoint = {
+            "model": model.state_dict(),
+            "args": vars(args),
+            "training_strategy_version": training_strategy_version,
+            "training_profile": profile.__dict__,
+            "optimizer": opt.state_dict(),
+            "scheduler": scheduler.state_dict() if scheduler is not None else None,
+            "current_lr": opt.param_groups[0]["lr"],
+            "epoch": epoch,
+            "best": best,
+            "stale": stale,
+            "val_metrics": val_m,
+        }
+        if stale == 0:
+            torch.save(checkpoint, out_dir / "best.pt")
+            save_json(val_m, out_dir / "val_metrics.json")
+        torch.save(checkpoint, out_dir / "last.pt")
+        with history_path.open("a", encoding="utf-8") as history_file:
+            history_file.write(
+                json.dumps(
+                    {
+                        "epoch": epoch,
+                        "training_strategy_version": training_strategy_version,
+                        "training_profile": profile.__dict__,
+                        "current_lr": opt.param_groups[0]["lr"],
+                        "train_metrics": train_m,
+                        "val_metrics": val_m,
+                        "best_mse": best,
+                        "stale": stale,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+        if epoch >= profile.early_stop_start_epoch and stale >= profile.early_stop_patience:
             print(f"early stopping at epoch {epoch}; best val_mse={best:.6f}")
             break
     ckpt = torch.load(out_dir / "best.pt", map_location=device)
     model.load_state_dict(ckpt["model"])
-    test_m = run_epoch(model, test_loader, device)
+    test_m = run_epoch(model, test_loader, device, profile)
     save_json(test_m, out_dir / "test_metrics.json")
     print("test metrics:", test_m)
 

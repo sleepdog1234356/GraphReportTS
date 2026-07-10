@@ -1,7 +1,9 @@
+from argparse import Namespace
 import unittest
 
 import torch
 
+from bstalignment.train_battery_official_baselines import resolve_baseline_profile
 from bstalignment.training_strategy import (
     BASELINE_TRAINING_PROFILES,
     MAIN_TRAINING_PROFILE,
@@ -13,6 +15,21 @@ from bstalignment.training_strategy import (
     step_baseline_batch_scheduler,
     step_baseline_epoch_scheduler,
 )
+
+
+class BaselineTrainerIntegrationTests(unittest.TestCase):
+    def test_profile_is_not_overridden_when_cli_values_are_absent(self):
+        args = Namespace(model="timecma", epochs=None, lr=None, weight_decay=None, early_stop_patience=None)
+        profile = resolve_baseline_profile(args)
+        self.assertEqual(profile.max_epochs, 100)
+        self.assertEqual(profile.weight_decay, 1e-3)
+        self.assertEqual(profile.early_stop_start_epoch, 50)
+
+    def test_explicit_debug_override_is_visible(self):
+        args = Namespace(model="patchtst", epochs=2, lr=None, weight_decay=None, early_stop_patience=1)
+        profile = resolve_baseline_profile(args)
+        self.assertEqual(profile.max_epochs, 2)
+        self.assertEqual(profile.early_stop_patience, 1)
 
 
 class TrainingProfileTests(unittest.TestCase):
