@@ -444,6 +444,43 @@ class TrainerIntegrationTests(unittest.TestCase):
                 [1, 2, 3],
             )
 
+    def test_reconcile_normalizes_one_trailing_newline_before_append(self):
+        with TemporaryDirectory() as tmp:
+            history_path = Path(tmp) / "epoch_history.jsonl"
+            first_row = b'{"epoch": 1, "epoch_seconds": 1.0}'
+            history_path.write_bytes(first_row)
+
+            graph_report_trainer._reconcile_epoch_history(
+                history_path,
+                checkpoint_epoch=1,
+                checkpoint_epoch_seconds=[1.0],
+            )
+
+            self.assertEqual(history_path.read_bytes(), first_row + b"\n")
+            with history_path.open("a", encoding="utf-8", newline="") as handle:
+                handle.write('{"epoch": 2, "epoch_seconds": 2.0}\n')
+            self.assertEqual(
+                [json.loads(line)["epoch"] for line in history_path.read_text(encoding="utf-8").splitlines()],
+                [1, 2],
+            )
+
+    def test_resume_reconciliation_rejects_zero_and_negative_history_epochs(self):
+        cases = (
+            ('{"epoch": 0}\n', 0),
+            ('{"epoch": -1}\n{"epoch": 0}\n', 0),
+        )
+        with TemporaryDirectory() as tmp:
+            history_path = Path(tmp) / "epoch_history.jsonl"
+            for contents, checkpoint_epoch in cases:
+                with self.subTest(contents=contents):
+                    history_path.write_text(contents, encoding="utf-8")
+                    with self.assertRaisesRegex(RuntimeError, "epoch must be a positive integer"):
+                        graph_report_trainer._reconcile_epoch_history(
+                            history_path,
+                            checkpoint_epoch=checkpoint_epoch,
+                            checkpoint_epoch_seconds=None,
+                        )
+
     def test_resume_reconciliation_rejects_history_and_checkpoint_timing_anomalies(self):
         with TemporaryDirectory() as tmp:
             history_path = Path(tmp) / "epoch_history.jsonl"

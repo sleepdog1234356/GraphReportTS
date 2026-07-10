@@ -287,7 +287,8 @@ def _reconcile_epoch_history(
     if not history_path.exists():
         return checkpoint_durations or []
 
-    original_lines = history_path.read_text(encoding="utf-8").splitlines()
+    original_text = history_path.read_text(encoding="utf-8")
+    original_lines = original_text.splitlines()
     retained_lines: List[str] = []
     history_durations: List[float] = []
     timing_started = False
@@ -304,8 +305,10 @@ def _reconcile_epoch_history(
         if not isinstance(row, dict):
             raise RuntimeError(f"epoch history {history_path} line {line_number} must be a JSON object")
         row_epoch = row.get("epoch")
-        if isinstance(row_epoch, bool) or not isinstance(row_epoch, int):
-            raise RuntimeError(f"epoch history {history_path} line {line_number} has an invalid epoch")
+        if isinstance(row_epoch, bool) or not isinstance(row_epoch, int) or row_epoch < 1:
+            raise RuntimeError(
+                f"epoch history {history_path} line {line_number} epoch must be a positive integer"
+            )
         if row_epoch > checkpoint_epoch:
             break
         if expected_epoch is None:
@@ -340,12 +343,12 @@ def _reconcile_epoch_history(
         ):
             raise RuntimeError("checkpoint epoch_seconds does not match retained epoch history timing")
 
-    if len(retained_lines) != len(original_lines):
+    retained_text = "".join(line + "\n" for line in retained_lines)
+    if original_text != retained_text:
         temporary_path = history_path.with_name(f".{history_path.name}.resume.tmp")
         try:
             with temporary_path.open("w", encoding="utf-8", newline="") as handle:
-                for line in retained_lines:
-                    handle.write(line + "\n")
+                handle.write(retained_text)
             temporary_path.replace(history_path)
         finally:
             if temporary_path.exists():
