@@ -8,6 +8,7 @@ from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 import pickle
 import re
+import sys
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -17,6 +18,7 @@ import torch
 
 import bstalignment.data_battery_raw as battery_data
 import bstalignment.precompute_battery_sequence_cache as sequence_cache_precompute
+import bstalignment.train_graph_report as graph_report_trainer
 from bstalignment.data_battery_raw import BatteryRawGraphDataset, collate_graph_report_batch
 from bstalignment.graph_report_model import GraphReportTS, GraphReportTSConfig
 from bstalignment.graph_report_losses import masked_regression_loss
@@ -119,6 +121,45 @@ class CoreAblationModelTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "raw_sequence mode requires raw_sequences and forbids maps"):
             raw_model(torch.randn(1, 32, 3, 2, 3), ["p"], 20)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_all_core_variants_complete_one_optimizer_step_on_cuda(self):
+        device = torch.device("cuda")
+        variants = {
+            "no_hankel_graph": dict(battery_input_mode="raw_sequence"),
+            "no_report_prompt": dict(use_report_prompt=False),
+            "no_ic_dv": {},
+            "no_text_gate": dict(use_text_gate=False),
+        }
+        for name, updates in variants.items():
+            with self.subTest(name=name):
+                cfg = GraphReportTSConfig(
+                    variant="battery", d_model=8, output_dim=1, graph_layers=1,
+                    patch_size=2, patch_stride=1, topk_edges=1,
+                    use_hf_text_encoder=False, battery_history_len=2,
+                    temporal_heads=2, raw_sequence_len=16, raw_sequence_dim=6,
+                    **updates,
+                )
+                model = GraphReportTS(cfg).to(device)
+                optimizer = build_graph_report_optimizer(model, MAIN_TRAINING_PROFILE)
+                batch = {
+                    "prompt": ["battery prompt", "battery prompt"],
+                    "horizon": torch.tensor([20, 20], device=device),
+                    "history_features": torch.randn(2, 2, 8, device=device),
+                }
+                if name == "no_hankel_graph":
+                    batch["raw_sequences"] = torch.randn(2, 2, 16, 6, device=device)
+                else:
+                    map_channels = 12 if name == "no_ic_dv" else 18
+                    batch["maps"] = torch.randn(2, 2, map_channels, 2, 3, device=device)
+                output = graph_report_trainer._model_forward(model, batch)
+                self.assertEqual(output["pred"].shape, (2, 20, 1))
+                loss = output["pred"].square().mean()
+                self.assertTrue(torch.isfinite(loss))
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+
+
     def test_unknown_battery_input_mode_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "Unknown battery_input_mode: invalid"):
             GraphReportTS(self.config(battery_input_mode="invalid"))
@@ -166,6 +207,135 @@ class CoreAblationModelTests(unittest.TestCase):
             )
             self.assertEqual(len(state), 105)
             self.assertEqual(sha256(contract.encode()).hexdigest(), expected_signature)
+
+
+class TrainerIntegrationTests(unittest.TestCase):
+    def test_raw_sequence_parser_flags_keep_formal_batch_default(self):
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "train_graph_report",
+                "--variant", "battery",
+                "--battery_input_mode", "raw_sequence",
+                "--precomputed_sequence_cache_dir", "sequence-cache",
+                "--require_precomputed_sequence_cache",
+                "--protocol_stage", "ablation",
+                "--ablation_suite_version", "core-v1",
+                "--run_dir", "runs/core/battery/mit/no_hankel_graph",
+            ],
+        ):
+            args = graph_report_trainer.parse_args()
+
+        self.assertEqual(args.battery_input_mode, "raw_sequence")
+        self.assertEqual(args.precomputed_sequence_cache_dir, "sequence-cache")
+        self.assertTrue(args.require_precomputed_sequence_cache)
+        self.assertEqual(args.protocol_stage, "ablation")
+        self.assertEqual(args.ablation_suite_version, "core-v1")
+        self.assertEqual(args.run_dir, "runs/core/battery/mit/no_hankel_graph")
+        self.assertEqual(args.batch_size, 64)
+
+    def test_raw_sequence_forwarding_uses_representation_aware_payload(self):
+        raw_model = GraphReportTS(
+            GraphReportTSConfig(
+                variant="battery", d_model=8, output_dim=1, graph_layers=1,
+                patch_size=2, patch_stride=1, topk_edges=1,
+                use_hf_text_encoder=False, battery_history_len=32,
+                temporal_heads=2, raw_sequence_len=16, raw_sequence_dim=6,
+                battery_input_mode="raw_sequence",
+            )
+        )
+        batch = {
+            "raw_sequences": torch.randn(2, 32, 16, 6),
+            "prompt": ["p", "p"],
+            "horizon": torch.tensor([20, 20]),
+            "history_features": torch.randn(2, 32, 8),
+        }
+
+        out = graph_report_trainer._model_forward(raw_model, batch)
+
+        self.assertEqual(out["pred"].shape, (2, 20, 1))
+
+    def test_battery_loader_passes_only_the_selected_cache_payload(self):
+        cases = (
+            (
+                "hankel_graph",
+                {"precomputed_cache_dir": "graph-cache", "require_precomputed_cache": True},
+                ("input_representation", "precomputed_sequence_cache_dir", "require_precomputed_sequence_cache"),
+            ),
+            (
+                "raw_sequence",
+                {
+                    "input_representation": "sequence",
+                    "precomputed_sequence_cache_dir": "sequence-cache",
+                    "require_precomputed_sequence_cache": True,
+                },
+                ("precomputed_cache_dir", "require_precomputed_cache"),
+            ),
+        )
+        for input_mode, expected, forbidden in cases:
+            with self.subTest(input_mode=input_mode), patch.object(
+                sys,
+                "argv",
+                [
+                    "train_graph_report",
+                    "--battery_input_mode", input_mode,
+                    "--precomputed_cache_dir", "graph-cache",
+                    "--require_precomputed_cache",
+                    "--precomputed_sequence_cache_dir", "sequence-cache",
+                    "--require_precomputed_sequence_cache",
+                ],
+            ), patch.object(
+                graph_report_trainer,
+                "BatteryRawGraphDataset",
+                side_effect=lambda **kwargs: [kwargs],
+            ) as dataset, patch.object(
+                graph_report_trainer,
+                "DataLoader",
+                side_effect=lambda data, **kwargs: data,
+            ):
+                graph_report_trainer.build_loaders(graph_report_trainer.parse_args())
+
+            self.assertEqual(dataset.call_count, 3)
+            for call in dataset.call_args_list:
+                for key, value in expected.items():
+                    self.assertEqual(call.kwargs[key], value)
+                for key in forbidden:
+                    self.assertNotIn(key, call.kwargs)
+
+    def test_output_directory_defaults_to_legacy_layout_and_run_dir_is_direct(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy_args = Namespace(run_dir=None, out_dir=str(root / "legacy"), variant="battery", dataset="mit")
+            direct_args = Namespace(
+                run_dir=str(root / "core" / "battery" / "mit" / "no_hankel_graph"),
+                out_dir=str(root / "ignored"),
+                variant="battery",
+                dataset="mit",
+            )
+
+            self.assertEqual(
+                graph_report_trainer._resolve_out_dir(legacy_args),
+                root / "legacy" / "battery" / "mit",
+            )
+            self.assertEqual(
+                graph_report_trainer._resolve_out_dir(direct_args),
+                root / "core" / "battery" / "mit" / "no_hankel_graph",
+            )
+
+    def test_resume_timer_history_is_loaded_without_rewriting_rows(self):
+        with TemporaryDirectory() as tmp:
+            history_path = Path(tmp) / "epoch_history.jsonl"
+            original = (
+                '{"epoch": 1, "epoch_seconds": 1.25}\n'
+                '{"epoch": 2, "epoch_seconds": 2.5}\n'
+            )
+            history_path.write_text(original, encoding="utf-8")
+
+            seconds = graph_report_trainer._load_epoch_seconds(history_path)
+
+            self.assertEqual(seconds, [1.25, 2.5])
+            self.assertEqual(history_path.read_text(encoding="utf-8"), original)
 
 
 class ResampledBatterySequenceTests(unittest.TestCase):

@@ -466,6 +466,14 @@ class VariantBatchDefaultTests(unittest.TestCase):
             ):
                 self.assertEqual(graph_report_trainer.parse_args().batch_size, expected)
 
+    def test_graph_report_parser_preserves_legacy_output_defaults(self):
+        with patch.object(sys, "argv", ["train_graph_report"]):
+            args = graph_report_trainer.parse_args()
+        self.assertEqual(args.out_dir, "runs/graph_report_ts")
+        self.assertIsNone(args.run_dir)
+        self.assertEqual(args.protocol_stage, "main")
+        self.assertEqual(args.battery_input_mode, "hankel_graph")
+
     def test_ablation_commands_resolve_batch_default_by_variant(self):
         cases = (
             (["--variant", "battery"], 64),
@@ -1238,6 +1246,24 @@ class MainStrategyTests(unittest.TestCase):
 
 
 class MainTrainerPolicyTests(unittest.TestCase):
+    def test_graph_report_trainer_stays_on_the_formal_fp32_path(self):
+        source = Path("bstalignment/train_graph_report.py").read_text(encoding="utf-8")
+        self.assertNotIn("autocast", source)
+        self.assertNotIn("GradScaler", source)
+
+    def test_graph_report_trainer_records_timing_and_version_provenance(self):
+        source = Path("bstalignment/train_graph_report.py").read_text(encoding="utf-8")
+        for required in (
+            "time.perf_counter",
+            '"epoch_seconds"',
+            '"total_train_seconds"',
+            '"stopped_epoch"',
+            '"trainable_parameter_count"',
+            '"ablation_suite_version"',
+            '"run_summary.json"',
+        ):
+            self.assertIn(required, source)
+
     def test_empty_validation_is_rejected_without_test_fallback(self):
         with self.assertRaisesRegex(RuntimeError, "validation"):
             training_strategy.require_nonempty_splits([1], [], [1], "fixture trainer")

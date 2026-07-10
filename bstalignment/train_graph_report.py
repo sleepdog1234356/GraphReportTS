@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -60,6 +61,7 @@ def parse_args():
     p.add_argument("--dataset", type=str, default="mit")
     p.add_argument("--data_root", type=str, default="bstalignment/data")
     p.add_argument("--out_dir", type=str, default="runs/graph_report_ts")
+    p.add_argument("--run_dir", type=str, default=None)
     p.add_argument("--input_len", type=int, default=96)
     p.add_argument("--pred_len", type=int, default=20)
     p.add_argument("--history_len", type=int, default=32)
@@ -97,6 +99,11 @@ def parse_args():
     p.add_argument("--no_cache_items", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--precomputed_cache_dir", type=str, default=None, help="Read deterministic battery graph samples from this cache root when available")
     p.add_argument("--require_precomputed_cache", action="store_true", help="Fail instead of falling back to online battery graph map construction")
+    p.add_argument("--battery_input_mode", choices=["hankel_graph", "raw_sequence"], default="hankel_graph")
+    p.add_argument("--precomputed_sequence_cache_dir", type=str, default=None, help="Read deterministic battery raw-sequence samples from this cache root when available")
+    p.add_argument("--require_precomputed_sequence_cache", action="store_true", help="Fail instead of falling back to online battery sequence construction")
+    p.add_argument("--protocol_stage", choices=["main", "ablation"], default="main")
+    p.add_argument("--ablation_suite_version", type=str, default=None)
     p.add_argument("--max_cycles", type=int, default=None)
     p.add_argument("--epochs", type=int, default=80)
     p.add_argument("--batch_size", type=int)
@@ -132,11 +139,20 @@ def build_loaders(args) -> Tuple[DataLoader, DataLoader, DataLoader, int]:
             include_ic_dv=not args.no_ic_dv,
             allow_summary_fallback=args.allow_summary_fallback,
             cache_items=args.cache_items and not args.no_cache_items,
-            precomputed_cache_dir=args.precomputed_cache_dir,
-            require_precomputed_cache=args.require_precomputed_cache,
             seed=args.seed,
             max_cycles=args.max_cycles,
         )
+        if args.battery_input_mode == "raw_sequence":
+            ds_kwargs.update(
+                input_representation="sequence",
+                precomputed_sequence_cache_dir=args.precomputed_sequence_cache_dir,
+                require_precomputed_sequence_cache=args.require_precomputed_sequence_cache,
+            )
+        else:
+            ds_kwargs.update(
+                precomputed_cache_dir=args.precomputed_cache_dir,
+                require_precomputed_cache=args.require_precomputed_cache,
+            )
         train_ds = BatteryRawGraphDataset(split="train", **ds_kwargs)
         val_ds = BatteryRawGraphDataset(split="val", **ds_kwargs)
         test_ds = BatteryRawGraphDataset(split="test", **ds_kwargs)
@@ -211,12 +227,38 @@ def _model_forward(model: GraphReportTS, batch: Dict[str, Any]) -> Dict[str, tor
     if model.cfg.variant == "battery" and not model.cfg.use_relative_steps:
         steps = batch.get("target_steps")
     return model(
-        batch["maps"],
+        batch.get("maps"),
         batch["prompt"],
         batch["horizon"],
         steps=steps,
         history_features=batch.get("history_features"),
+        raw_sequences=batch.get("raw_sequences"),
     )
+
+
+def _batch_size(batch: Dict[str, Any]) -> int:
+    source = batch.get("maps")
+    if source is None:
+        source = batch["raw_sequences"]
+    return int(source.size(0))
+
+
+def _resolve_out_dir(args) -> Path:
+    if args.run_dir is None:
+        return ensure_dir(Path(args.out_dir) / args.variant / args.dataset)
+    return ensure_dir(Path(args.run_dir))
+
+
+def _load_epoch_seconds(history_path: Path) -> List[float]:
+    if not history_path.exists():
+        return []
+    durations: List[float] = []
+    with history_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            row = json.loads(line)
+            if "epoch_seconds" in row:
+                durations.append(float(row["epoch_seconds"]))
+    return durations
 
 
 def _loss_weights(args, profile, epoch: int) -> Dict[str, float]:
@@ -255,7 +297,7 @@ def evaluate(
         batch = to_device(batch, device)
         out = _model_forward(model, batch)
         loss = graph_report_loss(out, batch["y"], batch["mask"], weights, loss_type=loss_type)
-        n = batch["maps"].size(0)
+        n = _batch_size(batch)
         for k, v in loss.items():
             meters[k].update(float(v.detach()), n)
         _update_gate_stats(gate_stats, out.get("gate"))
@@ -286,13 +328,13 @@ def main():
             observed_cycles=args.history_len,
             prediction_cycles=args.pred_len,
             batch_size=args.batch_size,
-            stage="main",
+            stage=args.protocol_stage,
             context="GraphReportTS battery trainer",
         )
     seed_everything(args.seed)
     cfg = ExperimentConfig()
     ensure_research_dirs(cfg)
-    out_dir = ensure_dir(Path(args.out_dir) / args.variant / args.dataset)
+    out_dir = _resolve_out_dir(args)
     device = torch.device(args.device)
 
     train_loader, val_loader, test_loader, output_dim = build_loaders(args)
@@ -323,6 +365,8 @@ def main():
         use_relative_steps=not args.absolute_step_decoder,
         temporal_layers=args.temporal_layers,
         temporal_heads=args.temporal_heads,
+        battery_input_mode=args.battery_input_mode,
+        raw_sequence_len=args.resample_len,
     )
     model = GraphReportTS(model_cfg).to(device)
     with torch.no_grad():
@@ -336,6 +380,7 @@ def main():
 
     profile = MAIN_TRAINING_PROFILE
     training_strategy_version = TRAINING_STRATEGY_VERSION
+    trainable_parameter_count = int(sum(p.numel() for p in model.parameters() if p.requires_grad))
     resume_path = None
     resume_checkpoint = None
     if not args.no_resume:
@@ -357,14 +402,20 @@ def main():
             "args": vars(args),
             "model_cfg": model_cfg.__dict__,
             "output_dim": output_dim,
+            "protocol_stage": args.protocol_stage,
             "training_strategy_version": training_strategy_version,
             "training_profile": profile.__dict__,
+            "ablation_suite_version": args.ablation_suite_version,
+            "trainable_parameter_count": trainable_parameter_count,
         },
         out_dir / "run_config.json",
     )
     best = float("inf")
     stale = 0
     start_epoch = 1
+    best_epoch = 0
+    stopped_epoch = 0
+    epoch_seconds: List[float] = []
     if resume_checkpoint is not None:
         model.load_state_dict(resume_checkpoint["model"])
         if "optimizer" in resume_checkpoint:
@@ -379,9 +430,17 @@ def main():
         best = float(resume_checkpoint.get("best", val_metrics.get("mse", best)))
         stale = int(resume_checkpoint.get("stale", 0))
         start_epoch = int(resume_checkpoint.get("epoch", 0)) + 1 if "epoch" in resume_checkpoint else 1
+        best_epoch = int(resume_checkpoint.get("best_epoch", resume_checkpoint.get("epoch", 0)))
+        stopped_epoch = int(resume_checkpoint.get("epoch", 0))
+        checkpoint_epoch_seconds = resume_checkpoint.get("epoch_seconds")
+        if checkpoint_epoch_seconds is None:
+            epoch_seconds = _load_epoch_seconds(out_dir / "epoch_history.jsonl")
+        else:
+            epoch_seconds = [float(value) for value in checkpoint_epoch_seconds]
         print(f"resumed from {resume_path} at epoch {start_epoch}; best val_mse={best:.6f}")
 
     for epoch in range(start_epoch, profile.max_epochs + 1):
+        epoch_started = time.perf_counter()
         model.train()
         if model_cfg.freeze_text and text_backbone is not None:
             text_backbone.eval()
@@ -399,18 +458,22 @@ def main():
             loss["total"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), profile.gradient_clip)
             opt.step()
-            n = batch["maps"].size(0)
+            n = _batch_size(batch)
             for k, v in loss.items():
                 meters[k].update(float(v.detach()), n)
             _update_gate_stats(gate_stats, out.get("gate"))
             pbar.set_postfix({"loss": meters["total"].avg})
         train_gate = _finalize_gate_stats(gate_stats)
         val = evaluate(model, val_loader, device, weights, args.loss, gate_path=out_dir / f"val_gates_epoch_{epoch}.csv")
+        epoch_duration = float(time.perf_counter() - epoch_started)
+        epoch_seconds.append(epoch_duration)
+        stopped_epoch = epoch
         scheduler.step_validation(epoch, val["mse"])
         score = val["mse"]
         improved = score < best
         if improved:
             best = score
+            best_epoch = epoch
         stale = update_graph_report_stale(epoch, stale, improved, profile)
         checkpoint = {
             "model": model.state_dict(),
@@ -418,16 +481,21 @@ def main():
             "args": vars(args),
             "training_strategy_version": training_strategy_version,
             "training_profile": profile.__dict__,
+            "ablation_suite_version": args.ablation_suite_version,
+            "trainable_parameter_count": trainable_parameter_count,
             "optimizer": opt.state_dict(),
             "scheduler": scheduler.state_dict(),
             "group_lrs": graph_report_group_lrs(opt),
             "epoch": epoch,
+            "best_epoch": best_epoch,
             "best": best,
             "stale": stale,
             "val_metrics": val,
+            "epoch_seconds": epoch_seconds,
         }
         epoch_row = {
             "epoch": epoch,
+            "epoch_seconds": epoch_duration,
             "training_strategy_version": training_strategy_version,
             "core_lr": epoch_lrs["core"],
             "semantic_lr": epoch_lrs["semantic"],
@@ -453,6 +521,19 @@ def main():
         if should_stop_graph_report(epoch, stale, profile):
             print(f"early stopping at epoch {epoch}; best val_mse={best:.6f}")
             break
+    total_train_seconds = float(sum(epoch_seconds))
+    save_json(
+        {
+            "best_epoch": int(best_epoch),
+            "stopped_epoch": int(stopped_epoch),
+            "mean_epoch_seconds": float(total_train_seconds / len(epoch_seconds)) if epoch_seconds else 0.0,
+            "total_train_seconds": total_train_seconds,
+            "trainable_parameter_count": trainable_parameter_count,
+            "training_strategy_version": training_strategy_version,
+            "ablation_suite_version": args.ablation_suite_version,
+        },
+        out_dir / "run_summary.json",
+    )
     ckpt = torch.load(out_dir / "best.pt", map_location=device)
     model.load_state_dict(ckpt["model"])
     test = evaluate(model, test_loader, device, eval_weights, args.loss, gate_path=out_dir / "test_gates.csv")
