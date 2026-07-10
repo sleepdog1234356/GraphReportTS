@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from argparse import Namespace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -10,6 +11,7 @@ import torch
 
 import bstalignment.data_battery_raw as battery_data
 from bstalignment.data_battery_raw import BatteryRawGraphDataset, collate_graph_report_batch
+from bstalignment.precompute_battery_sequence_cache import precompute_sequence_split
 from bstalignment.raw_signal import (
     BATTERY_SEQUENCE_CHANNELS,
     FULL_BATTERY_PROMPT_MAP_NAMES,
@@ -228,3 +230,55 @@ class SequenceDatasetTests(unittest.TestCase):
         self.assertEqual(cache_path.parent, Path("cache") / "calce" / "train")
         self.assertEqual(len(cache_path.name), 12)
         self.assertEqual(cache_path, path_factory(Path("cache"), dict(config)))
+
+
+class SequenceCacheTests(unittest.TestCase):
+    def test_sequence_cache_matches_direct_dataset_without_map_calls(self):
+        from tests.test_training_strategy import BatteryDataFixtureMixin
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            BatteryDataFixtureMixin.write_processed_data(root, [1, 1, 1, 1])
+            args = Namespace(
+                dataset="calce",
+                data_root=str(root),
+                cache_dir=str(root / "sequence_cache"),
+                pred_len=20,
+                history_len=32,
+                resample_len=16,
+                seed=42,
+                max_cycles=None,
+                batch_size=4,
+                num_workers=0,
+                force=True,
+            )
+            with patch(
+                "bstalignment.data_battery_raw.build_multiview_maps",
+                side_effect=AssertionError("graph path called"),
+            ):
+                cache_path = precompute_sequence_split(args, "train")
+            direct = BatteryRawGraphDataset(
+                dataset_name="calce",
+                data_root=root,
+                split="train",
+                history_len=32,
+                max_horizon=20,
+                resample_len=16,
+                input_representation="sequence",
+            )
+            cached = BatteryRawGraphDataset(
+                dataset_name="calce",
+                data_root=root,
+                split="train",
+                history_len=32,
+                max_horizon=20,
+                resample_len=16,
+                input_representation="sequence",
+                precomputed_sequence_cache_dir=str(root / "sequence_cache"),
+                require_precomputed_sequence_cache=True,
+            )
+            self.assertTrue(cache_path.exists())
+            self.assertEqual(len(cached), len(direct))
+            for key in ("raw_sequences", "y", "mask", "target_steps", "history_features", "history_cycles"):
+                torch.testing.assert_close(cached[0][key], direct[0][key], rtol=0.0, atol=0.0)
+            self.assertEqual(cached[0]["prompt"], direct[0]["prompt"])

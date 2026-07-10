@@ -300,6 +300,8 @@ class BatteryRawGraphDataset(Dataset):
         cycle_cache_size: int = 4096,
         precomputed_cache_dir: Optional[str] = None,
         require_precomputed_cache: bool = False,
+        precomputed_sequence_cache_dir: Optional[str] = None,
+        require_precomputed_sequence_cache: bool = False,
         seed: int = 42,
         max_cycles: Optional[int] = None,
         history_len: int = 32,
@@ -324,6 +326,10 @@ class BatteryRawGraphDataset(Dataset):
             precomputed_cache_dir is not None or require_precomputed_cache
         ):
             raise ValueError("Graph cache arguments are incompatible with sequence representation")
+        if self.input_representation == "graph" and (
+            precomputed_sequence_cache_dir is not None or require_precomputed_sequence_cache
+        ):
+            raise ValueError("Sequence cache arguments require sequence representation")
         self.allow_summary_fallback = bool(allow_summary_fallback)
         self.history_len = max(int(history_len), 1)
         self.cache_items = bool(cache_items)
@@ -332,6 +338,10 @@ class BatteryRawGraphDataset(Dataset):
         self._cycle_map_cache: OrderedDict[Tuple[str, str, int], Tuple[np.ndarray, List[str]]] = OrderedDict()
         self.precomputed_cache_dir = Path(precomputed_cache_dir) if precomputed_cache_dir else None
         self.require_precomputed_cache = bool(require_precomputed_cache)
+        self.precomputed_sequence_cache_dir = (
+            Path(precomputed_sequence_cache_dir) if precomputed_sequence_cache_dir else None
+        )
+        self.require_precomputed_sequence_cache = bool(require_precomputed_sequence_cache)
         self.cycle_scale = 1.0
         self.cache_config = battery_graph_cache_config(
             dataset_name=self.dataset_name,
@@ -348,10 +358,21 @@ class BatteryRawGraphDataset(Dataset):
             max_cycles=max_cycles,
             history_len=self.history_len,
         )
+        self.sequence_cache_config = battery_sequence_cache_config(
+            dataset_name=self.dataset_name,
+            split=self.split,
+            max_horizon=self.max_horizon,
+            resample_len=self.resample_len,
+            allow_summary_fallback=self.allow_summary_fallback,
+            seed=seed,
+            max_cycles=max_cycles,
+            history_len=self.history_len,
+        )
         self._precomputed = False
         self._cache_path: Optional[Path] = None
         self._cache_maps = None
         self._cache_cycle_maps = None
+        self._cache_cycle_sequences = None
         self._cache_history_indices = None
         self._cache_y = None
         self._cache_mask = None
@@ -361,6 +382,16 @@ class BatteryRawGraphDataset(Dataset):
         self._cache_history_cycles = None
         self._cache_layout = "sample_history"
         self._cache_meta: List[Dict[str, Any]] = []
+        if (
+            self.precomputed_sequence_cache_dir is not None
+            and self._try_load_precomputed_sequence_cache()
+        ):
+            return
+        if self.require_precomputed_sequence_cache:
+            expected = battery_sequence_cache_path(
+                self.precomputed_sequence_cache_dir or "", self.sequence_cache_config
+            )
+            raise FileNotFoundError(f"Required battery sequence cache not found or invalid: {expected}")
         if self.precomputed_cache_dir is not None and self._try_load_precomputed_cache():
             return
         if self.require_precomputed_cache:
@@ -373,6 +404,64 @@ class BatteryRawGraphDataset(Dataset):
             self._load_mit(seed=seed, max_cycles=max_cycles)
         else:
             self._load_processed(max_cycles=max_cycles, seed=seed)
+
+    def _try_load_precomputed_sequence_cache(self) -> bool:
+        if self.precomputed_sequence_cache_dir is None:
+            return False
+        cache_path = battery_sequence_cache_path(
+            self.precomputed_sequence_cache_dir, self.sequence_cache_config
+        )
+        manifest_path = cache_path / "manifest.json"
+        if not manifest_path.exists():
+            return False
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if (
+            manifest.get("layout") != "cycle_sequence_history"
+            or manifest.get("config") != self.sequence_cache_config
+        ):
+            return False
+        files = manifest.get("files", {})
+        required = [
+            "cycle_sequences",
+            "history_indices",
+            "y",
+            "mask",
+            "horizon",
+            "target_steps",
+            "history_features",
+            "history_cycles",
+            "meta",
+        ]
+        if any(not (cache_path / str(files.get(name, ""))).exists() for name in required):
+            return False
+        self._cache_path = cache_path
+        self._cache_layout = "cycle_sequence_history"
+        self._cache_cycle_sequences = np.load(cache_path / files["cycle_sequences"])
+        self._cache_history_indices = np.load(cache_path / files["history_indices"])
+        self._cache_y = np.load(cache_path / files["y"])
+        self._cache_mask = np.load(cache_path / files["mask"])
+        self._cache_horizon = np.load(cache_path / files["horizon"])
+        self._cache_target_steps = np.load(cache_path / files["target_steps"])
+        self._cache_history_features = np.load(cache_path / files["history_features"])
+        self._cache_history_cycles = np.load(cache_path / files["history_cycles"])
+        with (cache_path / files["meta"]).open("r", encoding="utf-8") as f:
+            self._cache_meta = [json.loads(line) for line in f if line.strip()]
+        sample_count = int(manifest.get("sample_count", -1))
+        if (
+            sample_count < 0
+            or sample_count != len(self._cache_meta)
+            or sample_count != int(self._cache_y.shape[0])
+        ):
+            return False
+        self.cycle_scale = float(manifest.get("cycle_scale", 1.0))
+        self._precomputed = True
+        self.samples = []
+        self.records = []
+        self.processed_cells = []
+        return True
 
     def _try_load_precomputed_cache(self) -> bool:
         if self.precomputed_cache_dir is None:
@@ -633,17 +722,25 @@ class BatteryRawGraphDataset(Dataset):
         horizon = int(self._cache_horizon[idx])
         width = horizon
         meta = self._cache_meta[idx]
-        if self._cache_layout == "cycle_history":
+        if self._cache_layout == "cycle_sequence_history":
+            if self._cache_cycle_sequences is None or self._cache_history_indices is None:
+                raise RuntimeError("Precomputed cycle-sequence cache arrays are not loaded")
+            hist_idx = np.asarray(self._cache_history_indices[idx], dtype=np.int64)
+            input_key = "raw_sequences"
+            input_arr = np.array(self._cache_cycle_sequences[hist_idx], copy=True)
+        elif self._cache_layout == "cycle_history":
             if self._cache_cycle_maps is None or self._cache_history_indices is None:
                 raise RuntimeError("Precomputed cycle-history cache arrays are not loaded")
             hist_idx = np.asarray(self._cache_history_indices[idx], dtype=np.int64)
-            maps_arr = np.array(self._cache_cycle_maps[hist_idx], copy=True)
+            input_key = "maps"
+            input_arr = np.array(self._cache_cycle_maps[hist_idx], copy=True)
         else:
             if self._cache_maps is None:
                 raise RuntimeError("Precomputed sample-history map cache is not loaded")
-            maps_arr = np.array(self._cache_maps[idx], copy=True)
+            input_key = "maps"
+            input_arr = np.array(self._cache_maps[idx], copy=True)
         return {
-            "maps": torch.tensor(maps_arr, dtype=torch.float32),
+            input_key: torch.tensor(input_arr, dtype=torch.float32),
             "y": torch.tensor(np.array(self._cache_y[idx, :width], copy=True), dtype=torch.float32),
             "mask": torch.tensor(np.array(self._cache_mask[idx, :width], copy=True), dtype=torch.bool),
             "horizon": torch.tensor(horizon, dtype=torch.long),
