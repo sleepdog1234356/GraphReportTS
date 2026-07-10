@@ -21,7 +21,14 @@ try:
     )
     from .data_mit import CellRecord, add_cycle_features, load_mit_battery_pkls, split_cells
     from .experiment_config import BATTERY_DATASET_NOTES
-    from .raw_signal import build_multiview_maps, build_report_from_array, current_to_capacity
+    from .raw_signal import (
+        BATTERY_SEQUENCE_CHANNELS,
+        FULL_BATTERY_PROMPT_MAP_NAMES,
+        build_battery_sequence,
+        build_multiview_maps,
+        build_report_from_array,
+        current_to_capacity,
+    )
 except ImportError:
     from battery_protocol import (
         BATTERY_CYCLE_SCALE_PROTOCOL,
@@ -32,11 +39,19 @@ except ImportError:
     )
     from data_mit import CellRecord, add_cycle_features, load_mit_battery_pkls, split_cells
     from experiment_config import BATTERY_DATASET_NOTES
-    from raw_signal import build_multiview_maps, build_report_from_array, current_to_capacity
+    from raw_signal import (
+        BATTERY_SEQUENCE_CHANNELS,
+        FULL_BATTERY_PROMPT_MAP_NAMES,
+        build_battery_sequence,
+        build_multiview_maps,
+        build_report_from_array,
+        current_to_capacity,
+    )
 
 
 RAW_BATTERY_CHANNELS = ["current", "voltage", "temperature", "capacity"]
 BATTERY_GRAPH_CACHE_VERSION = 5
+BATTERY_SEQUENCE_CACHE_VERSION = "battery-sequence-cycle-history-v1"
 BATTERY_HISTORY_FEATURE_SCHEMA = [
     "capacity_value",
     "capacity_zscore",
@@ -92,6 +107,38 @@ def battery_graph_cache_hash(config: Dict[str, Any]) -> str:
 
 
 def battery_graph_cache_path(cache_root: str | Path, config: Dict[str, Any]) -> Path:
+    return Path(cache_root) / str(config["dataset"]) / str(config["split"]) / battery_graph_cache_hash(config)
+
+
+def battery_sequence_cache_config(
+    dataset_name: str,
+    split: str,
+    max_horizon: int,
+    resample_len: int,
+    allow_summary_fallback: bool,
+    seed: int,
+    max_cycles: int | None,
+    history_len: int,
+) -> dict[str, Any]:
+    return {
+        "version": BATTERY_SEQUENCE_CACHE_VERSION,
+        "dataset": dataset_name.lower(),
+        "split": split,
+        "max_horizon": int(max_horizon),
+        "resample_len": int(resample_len),
+        "allow_summary_fallback": bool(allow_summary_fallback),
+        "seed": int(seed),
+        "max_cycles": None if max_cycles is None else int(max_cycles),
+        "history_len": int(history_len),
+        "channel_order": list(BATTERY_SEQUENCE_CHANNELS),
+        "ic_dv_formula_version": "robust-scaled-smoothed-gradient-v1",
+        "history_feature_schema": list(BATTERY_HISTORY_FEATURE_SCHEMA),
+        "target_protocol": BATTERY_TARGET_PROTOCOL,
+        "cycle_scale_protocol": BATTERY_CYCLE_SCALE_PROTOCOL,
+    }
+
+
+def battery_sequence_cache_path(cache_root: str | Path, config: dict[str, Any]) -> Path:
     return Path(cache_root) / str(config["dataset"]) / str(config["split"]) / battery_graph_cache_hash(config)
 
 
@@ -256,6 +303,7 @@ class BatteryRawGraphDataset(Dataset):
         seed: int = 42,
         max_cycles: Optional[int] = None,
         history_len: int = 32,
+        input_representation: str = "graph",
     ):
         self.dataset_name = dataset_name.lower()
         self.data_root = Path(data_root)
@@ -267,6 +315,11 @@ class BatteryRawGraphDataset(Dataset):
         self.include_derivatives = bool(include_derivatives)
         self.include_hankel = bool(include_hankel)
         self.include_ic_dv = bool(include_ic_dv)
+        if input_representation not in {"graph", "sequence"}:
+            raise ValueError(f"Unknown battery input_representation: {input_representation}")
+        self.input_representation = input_representation
+        if self.input_representation == "sequence" and not self.include_ic_dv:
+            raise ValueError("Formal sequence representation requires IC/DV")
         self.allow_summary_fallback = bool(allow_summary_fallback)
         self.history_len = max(int(history_len), 1)
         self.cache_items = bool(cache_items)
@@ -446,7 +499,9 @@ class BatteryRawGraphDataset(Dataset):
             self._cycle_map_cache.popitem(last=False)
         return maps, names
 
-    def _build_maps_from_channels(self, channels: Dict[str, np.ndarray]) -> Tuple[np.ndarray, List[str]]:
+    def _build_cycle_input_from_channels(self, channels: Dict[str, np.ndarray]) -> Tuple[np.ndarray, List[str]]:
+        if self.input_representation == "sequence":
+            return build_battery_sequence(channels, self.resample_len, include_ic_dv=True)
         return build_multiview_maps(
             channels,
             resample_len=self.resample_len,
@@ -457,7 +512,7 @@ class BatteryRawGraphDataset(Dataset):
             include_ic_dv=self.include_ic_dv,
         )
 
-    def _mit_cycle_maps(self, rec: CellRecord, cycle_id: int) -> Tuple[np.ndarray, List[str]]:
+    def _mit_cycle_input(self, rec: CellRecord, cycle_id: int) -> Tuple[np.ndarray, List[str]]:
         def build() -> Tuple[np.ndarray, List[str]]:
             channels = _extract_mit_cycle_channels(rec, cycle_id)
             if not any(len(v) for v in channels.values()):
@@ -468,11 +523,16 @@ class BatteryRawGraphDataset(Dataset):
                         "Use allow_summary_fallback only for smoke tests."
                     )
                 channels = _summary_pseudo_channels(rec, cycle_id)
-            return self._build_maps_from_channels(channels)
+            return self._build_cycle_input_from_channels(channels)
 
         return self._cached_cycle_maps(("mit", rec.cell_id, int(cycle_id)), build)
 
-    def _processed_cycle_maps(self, cell: Dict[str, Any], row_idx: int) -> Tuple[np.ndarray, List[str]]:
+    def _mit_cycle_maps(self, rec: CellRecord, cycle_id: int) -> Tuple[np.ndarray, List[str]]:
+        if self.input_representation != "graph":
+            raise RuntimeError("Graph cycle maps require input_representation=graph")
+        return self._mit_cycle_input(rec, cycle_id)
+
+    def _processed_cycle_input(self, cell: Dict[str, Any], row_idx: int) -> Tuple[np.ndarray, List[str]]:
         cycle_id = int(cell["cycle_id"][row_idx])
 
         def build() -> Tuple[np.ndarray, List[str]]:
@@ -482,9 +542,14 @@ class BatteryRawGraphDataset(Dataset):
                 "temperature": np.asarray(cell["temperature"][row_idx], dtype=np.float32),
                 "capacity": np.asarray(cell["capacity"][row_idx], dtype=np.float32),
             }
-            return self._build_maps_from_channels(channels)
+            return self._build_cycle_input_from_channels(channels)
 
         return self._cached_cycle_maps((str(self.dataset_name), str(cell["cell_id"]), cycle_id), build)
+
+    def _processed_cycle_maps(self, cell: Dict[str, Any], row_idx: int) -> Tuple[np.ndarray, List[str]]:
+        if self.input_representation != "graph":
+            raise RuntimeError("Graph cycle maps require input_representation=graph")
+        return self._processed_cycle_input(cell, row_idx)
 
     def _mit_history_features(self, df: pd.DataFrame, start: int, stop: int) -> np.ndarray:
         hist = df.iloc[start:stop]
@@ -531,7 +596,7 @@ class BatteryRawGraphDataset(Dataset):
         prompt += (
             f" Recent {self.history_len} cycles are provided as direct numeric and raw-map input; "
             f"older history is summarized in this prompt. Battery adapter: cell_id={cell_id}; "
-            f"cycle={cycle_id}; channels={', '.join(map_names[:10])}; target=future SOH."
+            f"cycle={cycle_id}; channels={', '.join(FULL_BATTERY_PROMPT_MAP_NAMES)}; target=future SOH."
         )
         return prompt
 
@@ -595,11 +660,11 @@ class BatteryRawGraphDataset(Dataset):
         start = row_idx - self.history_len + 1
         hist_df = df.iloc[start : row_idx + 1]
         future = df.iloc[row_idx + 1 : row_idx + 1 + horizon]
-        map_rows: List[np.ndarray] = []
+        input_rows: List[np.ndarray] = []
         map_names: List[str] = []
         for hist_cycle in hist_df["cycle"].to_numpy(dtype=np.int64):
-            maps_i, names_i = self._mit_cycle_maps(rec, int(hist_cycle))
-            map_rows.append(maps_i)
+            maps_i, names_i = self._mit_cycle_input(rec, int(hist_cycle))
+            input_rows.append(maps_i)
             if not map_names:
                 map_names = names_i
         older = df.iloc[:start]
@@ -609,8 +674,9 @@ class BatteryRawGraphDataset(Dataset):
             summary = hist_df[["QD", "IR", "chargetime"]].to_numpy(dtype=np.float32)
         prompt = self._prompt_from_history(summary, ["QD", "IR", "chargetime"], horizon, rec.cell_id, cycle_id, map_names)
         y = future["SOH"].to_numpy(dtype=np.float32)
+        input_key = "maps" if self.input_representation == "graph" else "raw_sequences"
         item = {
-            "maps": torch.tensor(np.stack(map_rows, axis=0), dtype=torch.float32),
+            input_key: torch.tensor(np.stack(input_rows, axis=0), dtype=torch.float32),
             "history_features": torch.tensor(self._mit_history_features(df, start, row_idx + 1), dtype=torch.float32),
             "history_cycles": torch.tensor(hist_df["cycle"].to_numpy(dtype=np.int64), dtype=torch.long),
             "y": torch.tensor(y, dtype=torch.float32),
@@ -630,11 +696,11 @@ class BatteryRawGraphDataset(Dataset):
         cycle_id = int(cell["cycle_id"][row_idx])
         future_slice = slice(row_idx + 1, row_idx + 1 + horizon)
         start = row_idx - self.history_len + 1
-        map_rows: List[np.ndarray] = []
+        input_rows: List[np.ndarray] = []
         map_names: List[str] = []
         for hist_row in range(start, row_idx + 1):
-            maps_i, names_i = self._processed_cycle_maps(cell, hist_row)
-            map_rows.append(maps_i)
+            maps_i, names_i = self._processed_cycle_input(cell, hist_row)
+            input_rows.append(maps_i)
             if not map_names:
                 map_names = names_i
         older_stop = max(start, 1)
@@ -661,8 +727,9 @@ class BatteryRawGraphDataset(Dataset):
         n = len(cell["cycle_id"])
         target_steps = np.asarray(cell["cycle_id"][future_slice], dtype=np.int64)
         y = np.asarray(cell["soh"][future_slice], dtype=np.float32)
+        input_key = "maps" if self.input_representation == "graph" else "raw_sequences"
         item = {
-            "maps": torch.tensor(np.stack(map_rows, axis=0), dtype=torch.float32),
+            input_key: torch.tensor(np.stack(input_rows, axis=0), dtype=torch.float32),
             "history_features": torch.tensor(self._processed_history_features(cell, start, row_idx + 1, n), dtype=torch.float32),
             "history_cycles": torch.tensor(np.asarray(cell["cycle_id"][start : row_idx + 1], dtype=np.int64), dtype=torch.long),
             "y": torch.tensor(y, dtype=torch.float32),
@@ -677,29 +744,42 @@ class BatteryRawGraphDataset(Dataset):
 
 
 def collate_graph_report_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    has_maps = ["maps" in item for item in batch]
+    if any(has_maps) and not all(has_maps):
+        raise ValueError("Cannot collate mixed graph and sequence battery samples")
+    input_key = "maps" if all(has_maps) else "raw_sequences"
     max_h = max(int(b["horizon"]) for b in batch)
-    max_t = max(b["maps"].shape[0] for b in batch)
-    max_c = max(b["maps"].shape[1] for b in batch)
-    max_hmap = max(b["maps"].shape[2] for b in batch)
-    max_wmap = max(b["maps"].shape[3] for b in batch)
+    max_t = max(b[input_key].shape[0] for b in batch)
     feat_dim = max(b["history_features"].shape[-1] for b in batch)
-    maps = torch.zeros(len(batch), max_t, max_c, max_hmap, max_wmap, dtype=torch.float32)
+    if input_key == "maps":
+        max_c = max(b["maps"].shape[1] for b in batch)
+        max_hmap = max(b["maps"].shape[2] for b in batch)
+        max_wmap = max(b["maps"].shape[3] for b in batch)
+        inputs = torch.zeros(len(batch), max_t, max_c, max_hmap, max_wmap, dtype=torch.float32)
+    else:
+        max_l = max(b["raw_sequences"].shape[1] for b in batch)
+        max_c = max(b["raw_sequences"].shape[2] for b in batch)
+        inputs = torch.zeros(len(batch), max_t, max_l, max_c, dtype=torch.float32)
     history_features = torch.zeros(len(batch), max_t, feat_dim, dtype=torch.float32)
     history_cycles = torch.zeros(len(batch), max_t, dtype=torch.long)
     y = torch.zeros(len(batch), max_h, dtype=torch.float32)
     mask = torch.zeros(len(batch), max_h, dtype=torch.bool)
     target_steps = torch.zeros(len(batch), max_h, dtype=torch.long)
     for i, b in enumerate(batch):
-        t, c, hm, wm = b["maps"].shape
         steps = len(b["y"])
-        maps[i, :t, :c, :hm, :wm] = b["maps"]
+        if input_key == "maps":
+            t, c, hm, wm = b["maps"].shape
+            inputs[i, :t, :c, :hm, :wm] = b["maps"]
+        else:
+            t, length, c = b["raw_sequences"].shape
+            inputs[i, :t, :length, :c] = b["raw_sequences"]
         history_features[i, : b["history_features"].shape[0], : b["history_features"].shape[1]] = b["history_features"]
         history_cycles[i, : len(b["history_cycles"])] = b["history_cycles"]
         y[i, :steps] = b["y"]
         mask[i, :steps] = True
         target_steps[i, :steps] = b["target_steps"]
     return {
-        "maps": maps,
+        input_key: inputs,
         "y": y,
         "mask": mask,
         "horizon": torch.stack([b["horizon"] for b in batch]),
