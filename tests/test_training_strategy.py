@@ -515,7 +515,9 @@ class PipelineScriptTests(unittest.TestCase):
     @staticmethod
     def run_formal_script(script, out_root, **overrides):
         executable = Path(sys.executable).as_posix()
-        control_python = f"/mnt/{executable[0].lower()}/{executable[3:]}"
+        control_python = executable
+        if sys.platform == "win32":
+            control_python = f"/mnt/{executable[0].lower()}/{executable[3:]}"
         settings = {
             "OUT_ROOT": out_root.as_posix(),
             "FORCE_RETRAIN": "0",
