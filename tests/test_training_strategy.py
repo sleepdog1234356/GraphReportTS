@@ -656,20 +656,39 @@ class PipelineScriptTests(unittest.TestCase):
         self.assertIn("runs/cache/battery_graph", Path("scripts/run_battery_main_full_hf.sh").read_text(encoding="utf-8"))
         self.assertIn("runs/cache/battery_graph", Path("scripts/run_battery_ablations_full_hf.sh").read_text(encoding="utf-8"))
 
-    def test_ablation_shell_passes_force_and_version_controls(self):
+    def test_formal_ablation_shell_delegates_to_core_suite_with_independent_force_control(self):
+        ablation = Path("scripts/run_battery_ablations_full_hf.sh").read_text(encoding="utf-8")
+        pipeline = Path("scripts/run_battery_v3_training_strategy_pipeline.sh").read_text(encoding="utf-8")
+
+        self.assertIn("bstalignment.run_core_ablation_suite", ablation)
+        self.assertIn("ABLATION_FORCE_RETRAIN", ablation)
+        self.assertIn("readlink -f", ablation)
+        self.assertNotIn("bstalignment.run_ablation_suite", ablation)
+        self.assertNotIn("FORCE_RETRAIN", ablation.replace("ABLATION_FORCE_RETRAIN", ""))
+        self.assertIn('export ABLATION_FORCE_RETRAIN="${ABLATION_FORCE_RETRAIN:-0}"', pipeline)
+
+    def test_formal_ablation_shell_separates_code_from_active_assets(self):
         text = Path("scripts/run_battery_ablations_full_hf.sh").read_text(encoding="utf-8")
-        self.assertIn('--training_strategy_version "$TRAINING_STRATEGY_VERSION"', text)
-        self.assertIn("--force_retrain", text)
+        required = (
+            'SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"',
+            'CODE_ROOT="${ABLATION_CODE_ROOT:-',
+            'ASSET_ROOT="${1:-$CODE_ROOT}"',
+            'BATTERY_SEQUENCE_CACHE_DIR:-runs/cache/battery_sequence',
+            '--data_root "$ASSET_ROOT/bstalignment/data"',
+            '--full_result_root "$OUT_ROOT/graph_report_ts/battery"',
+            '--out_root "$OUT_ROOT/graph_report_core_ablation"',
+            '--full_reference_commit "$FULL_REFERENCE_COMMIT"',
+        )
+        for value in required:
+            self.assertIn(value, text)
 
     def test_main_and_ablation_use_approved_workers_and_batch_size(self):
-        for path in (
-            Path("scripts/run_battery_main_full_hf.sh"),
-            Path("scripts/run_battery_ablations_full_hf.sh"),
-        ):
-            text = path.read_text(encoding="utf-8")
-            self.assertIn('BATCH_SIZE="${', text, path)
-            self.assertIn(':-64}"', text, path)
-            self.assertIn('NUM_WORKERS="${NUM_WORKERS:-16}"', text, path)
+        main = Path("scripts/run_battery_main_full_hf.sh").read_text(encoding="utf-8")
+        self.assertIn('BATCH_SIZE="${BATCH_SIZE:-64}"', main)
+        self.assertIn('NUM_WORKERS="${NUM_WORKERS:-16}"', main)
+        ablation = Path("scripts/run_battery_ablations_full_hf.sh").read_text(encoding="utf-8")
+        self.assertIn("--batch_size 64", ablation)
+        self.assertIn("--num_workers 16", ablation)
         baseline = Path("scripts/run_battery_official_baselines.sh").read_text(encoding="utf-8")
         self.assertIn('BATCH_SIZE="${BASELINE_BATCH_SIZE:-128}"', baseline)
         self.assertIn('NUM_WORKERS="${BASELINE_NUM_WORKERS:-8}"', baseline)
@@ -680,8 +699,7 @@ class PipelineScriptTests(unittest.TestCase):
         pipeline = Path("scripts/run_battery_v3_training_strategy_pipeline.sh").read_text(encoding="utf-8")
         self.assertIn('CACHE_TASK_BATCH_SIZE="${CACHE_TASK_BATCH_SIZE:-128}"', main)
         self.assertIn('--batch_size "$CACHE_TASK_BATCH_SIZE"', main)
-        self.assertIn('CACHE_TASK_BATCH_SIZE="${CACHE_TASK_BATCH_SIZE:-128}"', ablations)
-        self.assertIn('--cache_task_batch_size "$CACHE_TASK_BATCH_SIZE"', ablations)
+        self.assertIn('--cache_task_batch_size 128', ablations)
         self.assertIn('CACHE_TASK_BATCH_SIZE="${CACHE_TASK_BATCH_SIZE:-128}"', pipeline)
         self.assertIn("export CACHE_TASK_BATCH_SIZE", pipeline)
 
@@ -841,7 +859,6 @@ class PipelineScriptTests(unittest.TestCase):
         cases = (
             ("scripts/run_battery_main_full_hf.sh", {"HISTORY_LEN": "31"}),
             ("scripts/run_battery_official_baselines.sh", {"INPUT_LEN": "31"}),
-            ("scripts/run_battery_ablations_full_hf.sh", {"PRED_LEN": "19"}),
             ("scripts/run_battery_v3_training_strategy_pipeline.sh", {"HISTORY_LEN": "31"}),
         )
         with TemporaryDirectory(dir=Path.cwd()) as tmp:
@@ -910,6 +927,28 @@ class PipelineScriptTests(unittest.TestCase):
         tee_command = "tee runs/full_hf_v3_training_strategy_nosoh/logs/v3_start.log"
         self.assertIn(mkdir_command, workflow)
         self.assertLess(workflow.index(mkdir_command), workflow.index(tee_command))
+
+    def test_public_docs_describe_the_exact_core_ablation_matrix_and_recovery_policy(self):
+        documents = (
+            Path("README.md").read_text(encoding="utf-8"),
+            Path("docs/work_report.md").read_text(encoding="utf-8"),
+        )
+        variants = ("no_hankel_graph", "no_report_prompt", "no_ic_dv", "no_text_gate")
+
+        for text in documents:
+            with self.subTest(document=text[:40]):
+                self.assertIn("core-v1", text)
+                self.assertIn("12 new jobs", text)
+                self.assertIn("`full`", text)
+                self.assertIn("reused", text)
+                for variant in variants:
+                    self.assertIn(f"`{variant}`", text)
+                self.assertIn("no_hankel_map", text)
+                self.assertIn("BATTERY_SEQUENCE_CACHE_DIR", text)
+                self.assertIn("ABLATION_FORCE_RETRAIN", text)
+                self.assertIn("FULL_REFERENCE_COMMIT", text)
+                for row in ("full", *variants):
+                    self.assertIn(f"| `{row}` |", text)
 
 
 class AblationCompletionPolicyTests(unittest.TestCase):

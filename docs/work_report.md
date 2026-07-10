@@ -86,11 +86,11 @@ Battery datasets:
 
 Formal training uses raw current, voltage, temperature, and capacity sequences. The summary-derived fallback path remains only for smoke tests through `--allow_summary_fallback`.
 
-To reduce repeated CPU-side map construction, `bstalignment/precompute_battery_graph_cache.py` precomputes deterministic graph caches for each split. The v3 cache is cycle-level rather than sample-level: it stores `cycle_maps.npy` and per-sample `history_indices.npy`.
+To reduce repeated CPU-side map construction, `bstalignment/precompute_battery_graph_cache.py` precomputes deterministic graph caches for each split. The v3 cache is cycle-level rather than sample-level: it stores `cycle_maps.npy` and per-sample `history_indices.npy`. The structural raw-sequence ablation uses a separate deterministic sequence cache under `BATTERY_SEQUENCE_CACHE_DIR` (default `runs/cache/battery_sequence`); the core runner validates prompt and target identity between graph and sequence representations before training.
 
 ## 4. V3 Training Strategy
 
-The formal entrypoint is `scripts/run_battery_v3_training_strategy_pipeline.sh`, which writes to `runs/full_hf_v3_training_strategy_nosoh` in the exact order `main -> baselines -> ablations`. The main stage covers MIT, CALCE, and XJTU before the official baseline and ablation stages. The pipeline defaults to `FORCE_RETRAIN=1`; a later `FORCE_RETRAIN=0` invocation resumes or skips only runs whose `test_metrics.json` and `run_config.json` match the current v3 strategy version.
+The formal entrypoint is `scripts/run_battery_v3_training_strategy_pipeline.sh`, which writes to `runs/full_hf_v3_training_strategy_nosoh` in the exact order `main -> baselines -> ablations`. The main stage covers MIT, CALCE, and XJTU before the official baseline and ablation stages. The pipeline defaults to `FORCE_RETRAIN=1` for main/baseline work, while the separately exported `ABLATION_FORCE_RETRAIN=0` preserves valid core-ablation results and resumes compatible checkpoints. The top-level force value is not routed into ablations.
 
 The approved RTX 4090 configuration uses batch 64 for GraphReportTS main/ablations, batch 128 for baselines, independent `CACHE_TASK_BATCH_SIZE=128` CPU cache scheduling, 16 workers for main/cache/ablations, and 8 workers for baselines. A full-model 32/20 preflight measured 33.116 GiB peak allocated CUDA memory at batch 64; batch 128 exhausted the 48 GiB device during the graph encoder forward pass.
 
@@ -117,30 +117,21 @@ For the no-historical-SOH formal comparison, baseline inputs are `capacity_summa
 
 ## 6. Ablation Design
 
-The original ablation suite toggles the main design choices:
+The formal runner is `bstalignment/run_core_ablation_suite.py` with suite identity `core-v1`. Each dataset summary contains this exact five-row matrix:
 
-- IC/DV battery maps
-- Hankel maps
-- derivative maps
-- dynamic graph attention
-- domain structural edges
-- report prompt
-- cross-modal fusion
-- unified decoder versus separate heads
+| Row | Execution policy | Representation or controlled change |
+| --- | --- | --- |
+| `full` | reused from the completed main result | full `hankel_graph` model |
+| `no_hankel_graph` | newly trained | raw cycle sequences; no map/graph encoder |
+| `no_report_prompt` | newly trained | graph model without the report prompt |
+| `no_ic_dv` | newly trained | graph model without IC/DV map channels |
+| `no_text_gate` | newly trained | graph model with the learned text gate disabled |
 
-The runner is `bstalignment/run_ablation_suite.py`. It writes one run directory per ablation and an `ablation_summary.csv` table.
+The three reused `full` rows are imported, not retrained. Four variants on each of MIT, CALCE, and XJTU therefore produce exactly 12 new jobs. This replaces the legacy formal 16-item entry. In particular, the legacy `no_hankel_map` removed Hankel channels but kept the graph/map encoder; the new structural `no_hankel_graph` switches to the unpatched raw-sequence encoder and its sequence cache.
 
-For v3, the ablation suite retains the original map/graph ablations and adds:
+The formal shell is `scripts/run_battery_ablations_full_hf.sh ACTIVE_ASSET_ROOT`. It resolves its implementation location with `readlink -f`; `ABLATION_CODE_ROOT` can override that code root, while the positional asset root continues to supply data, existing main results, caches, and outputs. Graph variants use `BATTERY_GRAPH_CACHE_DIR`, and `no_hankel_graph` uses `BATTERY_SEQUENCE_CACHE_DIR`. `FULL_REFERENCE_COMMIT` pins the reused full-result identity. `ABLATION_FORCE_RETRAIN=0` is the recovery-safe default: matching complete variants skip and matching incomplete variants resume; `ABLATION_FORCE_RETRAIN=1` explicitly retrains only the four core variants, never `full`.
 
-- `no_numeric_history`
-- `no_multi_cycle_raw`
-- `single_cycle_raw`
-- `no_text_gate`
-- `no_semantic_alignment`
-- `no_align_loss`
-- `absolute_step_decoder`
-
-These ablations evaluate the new architecture under the no-historical-SOH input contract, not the stopped old pipeline. The formal v3 run writes to `runs/full_hf_v3_training_strategy_nosoh`, which keeps results isolated from legacy output directories.
+This code-root/asset-root split supports an atomic replacement of only the future ablation shell entry. Such a replacement does not restart or signal the current main/baseline process and does not alter its working tree; the reviewed core implementation is consumed only after the parent pipeline reaches `ablations`. On validation failure, preserve current training plus valid main/baseline/ablation artifacts, verify a corrected implementation commit, and atomically repoint the future entry. Do not restore the legacy 16-item runner.
 
 ## 7. Training Workflow
 
@@ -159,13 +150,13 @@ Typical battery workflow:
 Formal v3 no-historical-SOH workflow:
 
 1. Verify the no-SOH leakage tests locally or in the remote `graphreport` environment.
-2. Sync code to the remote server after the stopped old pipeline is no longer running.
+2. Prepare and preflight a reviewed detached code worktree; atomically repoint only the future ablation entry without changing the active worktree or current training process.
 3. Run GraphReportTS main models on MIT, CALCE, and XJTU first.
 4. Train official baselines with their source-native profiles.
-5. Run v3 ablations with the same main-model adaptive strategy.
+5. Reuse the three compatible full results and train the 12 `core-v1` ablation jobs with the same main-model adaptive strategy.
 6. Compare future-only metrics across the no-SOH baselines, main model, and ablations.
 
-The formal script is `scripts/run_battery_v3_training_strategy_pipeline.sh`. It should run with `FORCE_RETRAIN=1` for a new formal run. Baseline profiles intentionally retain their source-native, non-identical epoch budgets.
+The formal script is `scripts/run_battery_v3_training_strategy_pipeline.sh`. `FORCE_RETRAIN=1` may be used for a new formal main/baseline run, independently of the recovery-safe `ABLATION_FORCE_RETRAIN=0` default. Baseline profiles intentionally retain their source-native, non-identical epoch budgets.
 
 Remote status at the moment this report was updated:
 

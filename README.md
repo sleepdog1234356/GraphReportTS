@@ -105,18 +105,19 @@ The gate is a required module, not an optional simplification. Training and eval
 
 Semantic alignment should be weak and controllable. The default alignment weight should be much smaller than the earlier `0.01`, with support for `w_align=0`, weak values such as `0.001`, and optional warmup. Alignment should be token-aware and closer to TimeCMA-style cross-modality alignment than a single global context/text contrastive loss.
 
-### V2 Ablations
+### Formal Core Ablations
 
-The ablation suite should be adjusted for the new model:
+The formal `core-v1` comparison is deliberately focused. Each dataset summary has exactly five rows:
 
-- `no_numeric_history`
-- `no_multi_cycle_raw`
-- `single_cycle_raw`
-- `no_text_gate`
-- `no_semantic_alignment`
-- `no_align_loss`
-- `absolute_step_decoder`
-- existing map/graph ablations: `no_ic_dv`, `no_hankel_map`, `no_derivative_map`, `static_graph`, `no_domain_edges`
+| Row | Execution policy | Model change |
+| --- | --- | --- |
+| `full` | reused from the completed formal main run | unchanged `hankel_graph` model |
+| `no_hankel_graph` | newly trained | replaces the entire map/graph encoder path with the unpatched raw-sequence encoder |
+| `no_report_prompt` | newly trained | removes the report prompt |
+| `no_ic_dv` | newly trained | removes IC/DV maps while retaining the graph path |
+| `no_text_gate` | newly trained | disables the learned text gate |
+
+That is four trained variants across MIT, CALCE, and XJTU: 12 new jobs, not a new training job for `full`. The legacy `no_hankel_map` only removed Hankel-map channels while retaining the map/graph architecture; the structural `no_hankel_graph` variant removes that architecture and consumes raw cycle sequences instead.
 
 ## Repository Layout
 
@@ -282,9 +283,9 @@ The formal entrypoint is:
 bash scripts/run_battery_v3_training_strategy_pipeline.sh "$(pwd)"
 ```
 
-The pipeline writes only to `runs/full_hf_v3_training_strategy_nosoh` and executes in the exact order `main -> baselines -> ablations`: GraphReportTS on MIT, CALCE, and XJTU; the six official baselines for each dataset; then the full battery ablation suite. It is fail-fast between stages. Its default `FORCE_RETRAIN=1` regenerates the formal run; use the cloud workflow's `FORCE_RETRAIN=0` resume command only after a prior v3 run has created matching completion metadata.
+The pipeline writes only to `runs/full_hf_v3_training_strategy_nosoh` and executes in the exact order `main -> baselines -> ablations`: GraphReportTS on MIT, CALCE, and XJTU; the six official baselines for each dataset; then the focused core ablation suite. It is fail-fast between stages. Its top-level `FORCE_RETRAIN` controls main and baseline work only; it is intentionally not routed into the ablation stage. The independent `ABLATION_FORCE_RETRAIN` defaults to `0`, so a restarted pipeline preserves valid core-ablation work unless an operator explicitly requests retraining.
 
-Formal v3 batch identity is fixed: GraphReportTS main and battery ablations use training batch `64`, official baselines use training batch `128`, and graph-cache CPU scheduling uses the independent `CACHE_TASK_BATCH_SIZE=128` with 16 cache workers. Matching `run_config.json` metadata includes the exact typed stage batch size, so stale batch-128 GraphReportTS outputs cannot resume or skip a batch-64 formal run.
+Formal v3 batch identity is fixed: GraphReportTS main and battery ablations use training batch `64`, official baselines use training batch `128`, and graph/sequence-cache CPU scheduling uses the independent `CACHE_TASK_BATCH_SIZE=128` with 16 cache workers. Matching `run_config.json` metadata includes the exact typed stage batch size, so stale batch-128 GraphReportTS outputs cannot resume or skip a batch-64 formal run.
 
 The main model keeps the DistilBERT backbone frozen and in evaluation mode. AdamW uses separate main/core and semantic parameter-group learning rates (`1e-3` and `3e-4`), a 5-epoch LR warmup from 10% to the target rates, followed by a validation-MSE plateau scheduler and early stopping. The delayed/ramped alignment is zero for epochs 1-5, rises linearly during epochs 6-15 to `w_align=0.001`, and then remains constant. The regression loss is SmoothL1 and checkpoints are selected by validation MSE.
 
@@ -294,24 +295,17 @@ The v2 outputs remain legacy references. They used a unified fixed AdamW/SmoothL
 
 ## Ablations
 
-Battery ablations cover IC/DV maps, Hankel maps, derivative maps, dynamic graph attention, domain edges, report prompts, cross-modal fusion, and decoder style.
+The formal runner is `bstalignment.run_core_ablation_suite`, exposed through `scripts/run_battery_ablations_full_hf.sh ACTIVE_ASSET_ROOT`. It produces the exact `core-v1` five-row matrix shown above. The completed main results supply the reused `full` rows; only `no_hankel_graph`, `no_report_prompt`, `no_ic_dv`, and `no_text_gate` are trained, for 12 new jobs total.
 
 ```bash
-python -m bstalignment.run_ablation_suite \
-  --variant battery \
-  --dataset mit \
-  --data_root bstalignment/data \
-  --out_root runs/graph_report_ablation \
-  --pred_len 20 \
-  --text_model hf_models/distilbert-base-uncased
+ABLATION_FORCE_RETRAIN=0 \
+BATTERY_SEQUENCE_CACHE_DIR=runs/cache/battery_sequence \
+bash scripts/run_battery_ablations_full_hf.sh "$(pwd)"
 ```
 
-Plot ablation tables:
+`no_hankel_graph` reads the sequence cache under `BATTERY_SEQUENCE_CACHE_DIR`; graph variants keep using `BATTERY_GRAPH_CACHE_DIR`. Before training, the runner checks prompt/target identity across the representation-specific caches. `FULL_REFERENCE_COMMIT` binds every summary to the intended completed main-model commit. Set `ABLATION_FORCE_RETRAIN=1` only to discard and retrain the four core variants; the `full` row is still reused. `ABLATION_CODE_ROOT` may explicitly select the implementation worktree when needed.
 
-```bash
-python -m bstalignment.plot_experiment_tables \
-  --table runs/graph_report_ablation/battery/mit/ablation_summary.csv
-```
+The shell resolves its own path with `readlink -f`, so an atomic future-stage symlink can select a reviewed code worktree while the positional `ACTIVE_ASSET_ROOT` continues to point at the active datasets, caches, main results, and output tree. Replacing only this future ablation entry does not restart, signal, rewrite, or change the source path of a currently running main/baseline Python process; the new code is used only when the pipeline reaches the ablation command. If preflight or identity validation fails, keep current training and valid outputs untouched, fix and verify a new implementation commit, then repoint the future-stage entry atomically rather than falling back to the legacy 16-item runner.
 
 ## Inference
 
