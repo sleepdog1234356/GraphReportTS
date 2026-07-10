@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from argparse import Namespace
+from contextlib import redirect_stdout
 from dataclasses import asdict
 from hashlib import sha256
+import io
 import json
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
@@ -29,7 +31,363 @@ from bstalignment.raw_signal import (
     build_battery_sequence,
     build_multiview_maps,
 )
+from bstalignment.run_core_ablation_suite import (
+    CORE_ABLATION_SUITE_VERSION,
+    CORE_BATTERY_ABLATIONS,
+    core_run_config_matches,
+    main as run_core_ablation_main,
+    require_reusable_full_reference,
+    verify_prompt_cache_identity,
+)
 from bstalignment.training_strategy import MAIN_TRAINING_PROFILE, build_graph_report_optimizer
+from bstalignment.training_strategy import TRAINING_STRATEGY_VERSION
+
+
+class CoreAblationRunnerTests(unittest.TestCase):
+    FULL_ARGUMENTS = {
+        "variant": "battery",
+        "dataset": "mit",
+        "history_len": 32,
+        "pred_len": 20,
+        "batch_size": 64,
+        "seed": 42,
+        "no_ic_dv": False,
+        "no_hankel_map": False,
+        "no_derivative_map": False,
+        "no_report_prompt": False,
+        "no_cross_modal": False,
+        "no_text_gate": False,
+        "no_semantic_alignment": False,
+        "no_align_loss": False,
+    }
+    FULL_MODEL_CONFIG = {
+        "variant": "battery",
+        "freeze_text": True,
+        "use_hf_text_encoder": True,
+        "use_report_prompt": True,
+        "use_cross_modal_fusion": True,
+        "use_dynamic_graph": True,
+        "use_domain_edges": True,
+        "unified_decoder": True,
+        "battery_history_len": 32,
+        "history_feature_dim": 8,
+        "use_multi_cycle_raw": True,
+        "single_cycle_raw": False,
+        "use_numeric_history": True,
+        "use_text_gate": True,
+        "use_semantic_alignment": True,
+        "use_relative_steps": True,
+    }
+
+    def _write_full_result(self, result: Path, **config_updates) -> None:
+        result.mkdir(parents=True, exist_ok=True)
+        (result / "best.pt").write_bytes(b"checkpoint")
+        (result / "test_metrics.json").write_text(
+            '{"mse": 0.1, "mae": 0.2, "rmse": 0.316}', encoding="utf-8"
+        )
+        config = {
+            "training_strategy_version": TRAINING_STRATEGY_VERSION,
+            "args": dict(self.FULL_ARGUMENTS),
+            "model_cfg": dict(self.FULL_MODEL_CONFIG),
+        }
+        for dotted_name, value in config_updates.items():
+            container, name = dotted_name.split("__", 1)
+            if container == "root":
+                config[name] = value
+            else:
+                config[container][name] = value
+        (result / "run_config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    @staticmethod
+    def _core_config(dataset: str, ablation: str) -> dict:
+        args = dict(CoreAblationRunnerTests.FULL_ARGUMENTS)
+        args.update({
+            "no_dynamic_graph": False,
+            "no_domain_edges": False,
+            "separate_heads": False,
+            "no_numeric_history": False,
+            "no_multi_cycle_raw": False,
+            "single_cycle_raw": False,
+            "absolute_step_decoder": False,
+        })
+        args["dataset"] = dataset
+        args["protocol_stage"] = "ablation"
+        args["ablation_suite_version"] = "core-v1"
+        args["battery_input_mode"] = "raw_sequence" if ablation == "no_hankel_graph" else "hankel_graph"
+        if ablation != "no_hankel_graph":
+            args[ablation] = True
+        model_cfg = dict(CoreAblationRunnerTests.FULL_MODEL_CONFIG)
+        model_cfg["battery_input_mode"] = args["battery_input_mode"]
+        if ablation == "no_report_prompt":
+            model_cfg["use_report_prompt"] = False
+        elif ablation == "no_text_gate":
+            model_cfg["use_text_gate"] = False
+        return {
+            "training_strategy_version": TRAINING_STRATEGY_VERSION,
+            "protocol_stage": "ablation",
+            "ablation_suite_version": "core-v1",
+            "args": args,
+            "model_cfg": model_cfg,
+        }
+
+    def test_formal_matrix_contains_only_four_single_factor_variants(self):
+        self.assertEqual(CORE_ABLATION_SUITE_VERSION, "core-v1")
+        self.assertEqual(
+            list(CORE_BATTERY_ABLATIONS),
+            ["no_hankel_graph", "no_report_prompt", "no_ic_dv", "no_text_gate"],
+        )
+        self.assertTrue(all(isinstance(tokens, tuple) for tokens in CORE_BATTERY_ABLATIONS.values()))
+
+    def test_full_reference_requires_complete_matching_artifacts(self):
+        with TemporaryDirectory() as tmp:
+            result = Path(tmp)
+            self._write_full_result(result)
+            row = require_reusable_full_reference(result, "mit", TRAINING_STRATEGY_VERSION)
+            self.assertEqual(row["result_source"], "reused_main")
+            self.assertEqual(row["mse"], 0.1)
+
+    def test_full_reference_rejects_mismatches_without_modifying_reference(self):
+        cases = {
+            "dataset": ("args__dataset", "calce"),
+            "seed": ("args__seed", 7),
+            "batch": ("args__batch_size", 32),
+            "model flag": ("model_cfg__use_text_gate", False),
+            "strategy": ("root__training_strategy_version", "legacy"),
+            "explicit sequence mode": ("args__battery_input_mode", "raw_sequence"),
+        }
+        for name, (field, value) in cases.items():
+            with self.subTest(name=name), TemporaryDirectory() as tmp:
+                result = Path(tmp) / "full"
+                self._write_full_result(result, **{field: value})
+                before = {path.relative_to(result): path.read_bytes() for path in result.iterdir()}
+                with self.assertRaisesRegex(RuntimeError, r"dataset=mit.*expected=.*observed=.*path="):
+                    require_reusable_full_reference(result, "mit", TRAINING_STRATEGY_VERSION)
+                self.assertTrue(result.is_dir())
+                self.assertEqual(
+                    before,
+                    {path.relative_to(result): path.read_bytes() for path in result.iterdir()},
+                )
+
+    def test_full_reference_rejects_missing_and_malformed_artifacts_non_destructively(self):
+        cases = ("best.pt", "test_metrics.json", "run_config.json")
+        for missing in cases:
+            with self.subTest(missing=missing), TemporaryDirectory() as tmp:
+                result = Path(tmp) / "full"
+                self._write_full_result(result)
+                (result / missing).unlink()
+                with self.assertRaisesRegex(RuntimeError, r"dataset=mit.*path="):
+                    require_reusable_full_reference(result, "mit", TRAINING_STRATEGY_VERSION)
+                self.assertTrue(result.is_dir())
+        with TemporaryDirectory() as tmp:
+            result = Path(tmp) / "full"
+            self._write_full_result(result)
+            (result / "run_config.json").write_text("{broken", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, r"dataset=mit.*expected=.*observed=.*path="):
+                require_reusable_full_reference(result, "mit", TRAINING_STRATEGY_VERSION)
+            self.assertTrue(result.is_dir())
+
+    def test_prompt_cache_identity_checks_sample_count_order_identity_and_prompt(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            reference = root / "reference"
+            candidate = root / "candidate"
+            reference.mkdir()
+            candidate.mkdir()
+            rows = [
+                {"cell_id": "a", "cycle": 32, "prompt": "same"},
+                {"cell_id": "b", "cycle": 33, "prompt": "same again"},
+            ]
+            text = "\n".join(json.dumps(row) for row in rows) + "\n"
+            (reference / "meta.jsonl").write_text(text, encoding="utf-8")
+            (candidate / "meta.jsonl").write_text(text, encoding="utf-8")
+            verify_prompt_cache_identity(reference, candidate)
+            (candidate / "meta.jsonl").write_text(json.dumps(rows[0]) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "Prompt sample count mismatch"):
+                verify_prompt_cache_identity(reference, candidate)
+            changed = [dict(rows[0]), dict(rows[1], prompt="different")]
+            (candidate / "meta.jsonl").write_text(
+                "\n".join(json.dumps(row) for row in changed), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(RuntimeError, "Prompt mismatch dataset sample=1"):
+                verify_prompt_cache_identity(reference, candidate)
+
+    def test_core_config_matching_is_variant_exact_and_rejects_legacy_suite(self):
+        with TemporaryDirectory() as tmp:
+            result = Path(tmp)
+            config = self._core_config("mit", "no_text_gate")
+            (result / "run_config.json").write_text(json.dumps(config), encoding="utf-8")
+            self.assertTrue(core_run_config_matches(result, "mit", "no_text_gate", TRAINING_STRATEGY_VERSION))
+            config["args"]["no_ic_dv"] = True
+            (result / "run_config.json").write_text(json.dumps(config), encoding="utf-8")
+            self.assertFalse(core_run_config_matches(result, "mit", "no_text_gate", TRAINING_STRATEGY_VERSION))
+            config = self._core_config("mit", "no_text_gate")
+            config["args"]["no_dynamic_graph"] = True
+            (result / "run_config.json").write_text(json.dumps(config), encoding="utf-8")
+            self.assertFalse(core_run_config_matches(result, "mit", "no_text_gate", TRAINING_STRATEGY_VERSION))
+            config = self._core_config("mit", "no_text_gate")
+            config.pop("ablation_suite_version")
+            (result / "run_config.json").write_text(json.dumps(config), encoding="utf-8")
+            self.assertFalse(core_run_config_matches(result, "mit", "no_text_gate", TRAINING_STRATEGY_VERSION))
+
+    def test_default_dry_run_emits_twelve_train_commands_without_artifacts(self):
+        with TemporaryDirectory() as tmp, patch(
+            "bstalignment.run_core_ablation_suite.subprocess.run"
+        ) as run:
+            run.return_value.stdout = "source-commit\n"
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                run_core_ablation_main([
+                    "--full_result_root", str(Path(tmp) / "missing-full"),
+                    "--graph_cache_dir", str(Path(tmp) / "missing-graph"),
+                    "--sequence_cache_dir", str(Path(tmp) / "missing-sequence"),
+                    "--out_root", str(Path(tmp) / "out"),
+                    "--text_model", str(Path(tmp) / "missing-model"),
+                    "--full_reference_commit", "full-commit",
+                    "--dry_run",
+                ])
+            train_lines = [
+                line for line in stdout.getvalue().splitlines()
+                if "bstalignment.train_graph_report" in line
+            ]
+            self.assertEqual(len(train_lines), 12)
+            self.assertTrue(all("--run_dir" in line and "--out_dir" not in line for line in train_lines))
+
+    def test_matching_incomplete_result_resumes_complete_result_skips_and_mismatch_is_preserved(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = root / "no_text_gate"
+            result.mkdir()
+            config = self._core_config("mit", "no_text_gate")
+            (result / "run_config.json").write_text(json.dumps(config), encoding="utf-8")
+            (result / "last.pt").write_bytes(b"last")
+            self.assertTrue(core_run_config_matches(result, "mit", "no_text_gate", TRAINING_STRATEGY_VERSION))
+            config["args"]["seed"] = 99
+            (result / "run_config.json").write_text(json.dumps(config), encoding="utf-8")
+            before = (result / "last.pt").read_bytes()
+            self.assertFalse(core_run_config_matches(result, "mit", "no_text_gate", TRAINING_STRATEGY_VERSION))
+            self.assertEqual((result / "last.pt").read_bytes(), before)
+
+    def test_normal_execution_writes_full_plus_four_variant_rows(self):
+        with TemporaryDirectory() as tmp, patch(
+            "bstalignment.run_core_ablation_suite.verify_prompt_cache_identity"
+        ), patch("bstalignment.run_core_ablation_suite.subprocess.run") as run:
+            root = Path(tmp)
+            full = root / "full" / "mit"
+            self._write_full_result(full)
+            (full / "run_summary.json").write_text(json.dumps({
+                "best_epoch": 7, "stopped_epoch": 25, "mean_epoch_seconds": 1.5,
+                "total_train_seconds": 37.5, "trainable_parameter_count": 100,
+            }), encoding="utf-8")
+
+            def fake_run(command, **kwargs):
+                completed = Namespace(stdout="source-commit\n", returncode=0)
+                if "bstalignment.train_graph_report" in command:
+                    run_dir = Path(command[command.index("--run_dir") + 1])
+                    ablation = run_dir.name
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                    (run_dir / "run_config.json").write_text(
+                        json.dumps(self._core_config("mit", ablation)), encoding="utf-8"
+                    )
+                    (run_dir / "best.pt").write_bytes(b"best")
+                    (run_dir / "test_metrics.json").write_text(
+                        '{"mse": 0.2, "mae": 0.3, "rmse": 0.447}', encoding="utf-8"
+                    )
+                    (run_dir / "run_summary.json").write_text(json.dumps({
+                        "best_epoch": 8, "stopped_epoch": 30, "mean_epoch_seconds": 2.0,
+                        "total_train_seconds": 60.0, "trainable_parameter_count": 90,
+                    }), encoding="utf-8")
+                return completed
+
+            run.side_effect = fake_run
+            run_core_ablation_main([
+                "--datasets", "mit",
+                "--full_result_root", str(root / "full"),
+                "--graph_cache_dir", str(root / "graph"),
+                "--sequence_cache_dir", str(root / "sequence"),
+                "--out_root", str(root / "out"),
+                "--text_model", str(root / "text-model"),
+                "--full_reference_commit", "full-commit",
+            ])
+            summary_path = root / "out" / "battery" / "mit" / "core_ablation_summary.csv"
+            rows = summary_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(rows), 6)
+            self.assertIn("dataset", rows[0].split(","))
+            self.assertIn("full", rows[1])
+            self.assertTrue((root / "out" / "battery" / "core_ablation_summary.csv").is_file())
+            train_commands = [
+                call.args[0] for call in run.call_args_list
+                if "bstalignment.train_graph_report" in call.args[0]
+            ]
+            self.assertEqual(len(train_commands), 4)
+            self.assertTrue(all("--no_resume" in command for command in train_commands))
+
+    def test_runner_resumes_matching_last_skips_complete_and_preserves_mismatch(self):
+        with TemporaryDirectory() as tmp, patch(
+            "bstalignment.run_core_ablation_suite.verify_prompt_cache_identity"
+        ), patch("bstalignment.run_core_ablation_suite.subprocess.run") as run:
+            root = Path(tmp)
+            self._write_full_result(root / "full" / "mit")
+            result = root / "out" / "battery" / "mit" / "no_text_gate"
+            result.mkdir(parents=True)
+            (result / "run_config.json").write_text(
+                json.dumps(self._core_config("mit", "no_text_gate")), encoding="utf-8"
+            )
+            (result / "last.pt").write_bytes(b"resume-me")
+
+            def fake_run(command, **kwargs):
+                if command[:3] == ["git", "rev-parse", "HEAD"]:
+                    return Namespace(stdout="source-commit\n", returncode=0)
+                if "bstalignment.train_graph_report" in command:
+                    (result / "best.pt").write_bytes(b"best")
+                    (result / "test_metrics.json").write_text(
+                        '{"mse": 0.2, "mae": 0.3, "rmse": 0.447}', encoding="utf-8"
+                    )
+                    (result / "run_summary.json").write_text(json.dumps({
+                        "best_epoch": 8, "stopped_epoch": 30, "mean_epoch_seconds": 2.0,
+                        "total_train_seconds": 60.0, "trainable_parameter_count": 90,
+                    }), encoding="utf-8")
+                return Namespace(stdout="", returncode=0)
+
+            run.side_effect = fake_run
+            argv = [
+                "--datasets", "mit", "--ablations", "no_text_gate",
+                "--full_result_root", str(root / "full"),
+                "--graph_cache_dir", str(root / "graph"),
+                "--sequence_cache_dir", str(root / "sequence"),
+                "--out_root", str(root / "out"),
+                "--text_model", str(root / "text-model"),
+                "--full_reference_commit", "full-commit",
+            ]
+            run_core_ablation_main(argv)
+            train_commands = [
+                call.args[0] for call in run.call_args_list
+                if "bstalignment.train_graph_report" in call.args[0]
+            ]
+            self.assertEqual(len(train_commands), 1)
+            self.assertNotIn("--no_resume", train_commands[0])
+            self.assertEqual((result / "last.pt").read_bytes(), b"resume-me")
+            precompute_commands = [
+                call.args[0] for call in run.call_args_list
+                if any("precompute_battery" in str(token) for token in call.args[0])
+            ]
+            self.assertEqual(len(precompute_commands), 1)
+            self.assertIn("bstalignment.precompute_battery_graph_cache", precompute_commands[0])
+            self.assertNotIn("--no_ic_dv", precompute_commands[0])
+
+            run.reset_mock()
+            run_core_ablation_main(argv)
+            self.assertFalse(any(
+                "bstalignment.train_graph_report" in call.args[0]
+                for call in run.call_args_list
+            ))
+
+            config = self._core_config("mit", "no_text_gate")
+            config["args"]["seed"] = 99
+            (result / "run_config.json").write_text(json.dumps(config), encoding="utf-8")
+            before = {path.name: path.read_bytes() for path in result.iterdir()}
+            with self.assertRaisesRegex(RuntimeError, "mismatched metadata"):
+                run_core_ablation_main(argv)
+            self.assertEqual(before, {path.name: path.read_bytes() for path in result.iterdir()})
 
 
 class CoreAblationModelTests(unittest.TestCase):
