@@ -185,6 +185,26 @@ class SequenceDatasetTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Graph cycle maps require input_representation=graph"):
                 ds._processed_cycle_maps(ds.processed_cells[0], 0)
 
+    def test_sequence_representation_rejects_graph_cache_arguments(self):
+        from tests.test_training_strategy import BatteryDataFixtureMixin
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            BatteryDataFixtureMixin.write_processed_data(root, [1, 1, 1, 1])
+            cases = {
+                "cache directory": {"precomputed_cache_dir": str(root / "graph_cache")},
+                "required cache": {"require_precomputed_cache": True},
+            }
+            for label, cache_kwargs in cases.items():
+                with self.subTest(label=label):
+                    with self.assertRaisesRegex(ValueError, "(?i)graph cache.*sequence representation"):
+                        BatteryRawGraphDataset(
+                            dataset_name="calce",
+                            data_root=root,
+                            input_representation="sequence",
+                            **cache_kwargs,
+                        )
+
     def test_sequence_cache_config_and_path_encode_formal_input_identity(self):
         config_factory = getattr(battery_data, "battery_sequence_cache_config", None)
         path_factory = getattr(battery_data, "battery_sequence_cache_path", None)

@@ -320,6 +320,10 @@ class BatteryRawGraphDataset(Dataset):
         self.input_representation = input_representation
         if self.input_representation == "sequence" and not self.include_ic_dv:
             raise ValueError("Formal sequence representation requires IC/DV")
+        if self.input_representation == "sequence" and (
+            precomputed_cache_dir is not None or require_precomputed_cache
+        ):
+            raise ValueError("Graph cache arguments are incompatible with sequence representation")
         self.allow_summary_fallback = bool(allow_summary_fallback)
         self.history_len = max(int(history_len), 1)
         self.cache_items = bool(cache_items)
