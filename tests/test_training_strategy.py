@@ -1,9 +1,17 @@
 import unittest
 
+import torch
+
 from bstalignment.training_strategy import (
     BASELINE_TRAINING_PROFILES,
     MAIN_TRAINING_PROFILE,
     TRAINING_STRATEGY_VERSION,
+    baseline_regression_loss,
+    build_baseline_optimizer,
+    build_baseline_scheduler,
+    get_baseline_training_profile,
+    step_baseline_batch_scheduler,
+    step_baseline_epoch_scheduler,
 )
 
 
@@ -40,3 +48,33 @@ class TrainingProfileTests(unittest.TestCase):
         self.assertEqual(MAIN_TRAINING_PROFILE.early_stop_start_epoch, 20)
         self.assertEqual(MAIN_TRAINING_PROFILE.early_stop_patience, 20)
         self.assertTrue(TRAINING_STRATEGY_VERSION.startswith("v3-"))
+
+
+class BaselineMechanicsTests(unittest.TestCase):
+    def test_one_cycle_steps_per_batch(self):
+        model = torch.nn.Linear(2, 1)
+        profile = get_baseline_training_profile("patchtst")
+        optimizer = build_baseline_optimizer(model, profile)
+        scheduler = build_baseline_scheduler(optimizer, profile, steps_per_epoch=4)
+        before = scheduler.last_epoch
+        step_baseline_batch_scheduler(scheduler, profile)
+        self.assertEqual(scheduler.last_epoch, before + 1)
+
+    def test_type1_halves_lr_each_epoch(self):
+        model = torch.nn.Linear(2, 1)
+        profile = get_baseline_training_profile("itransformer")
+        optimizer = build_baseline_optimizer(model, profile)
+        scheduler = build_baseline_scheduler(optimizer, profile, steps_per_epoch=4)
+        step_baseline_epoch_scheduler(scheduler, optimizer, profile, epoch=2)
+        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 5e-5)
+
+    def test_timecma_cosine_and_mse(self):
+        model = torch.nn.Linear(2, 1)
+        profile = get_baseline_training_profile("timecma")
+        optimizer = build_baseline_optimizer(model, profile)
+        scheduler = build_baseline_scheduler(optimizer, profile, steps_per_epoch=4)
+        self.assertIsInstance(optimizer, torch.optim.AdamW)
+        self.assertIsInstance(scheduler, torch.optim.lr_scheduler.CosineAnnealingLR)
+        pred = torch.tensor([[1.0, 3.0]])
+        target = torch.tensor([[0.0, 1.0]])
+        self.assertEqual(float(baseline_regression_loss(pred, target, profile)), 2.5)

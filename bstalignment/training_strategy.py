@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
+import torch.nn.functional as F
+
 
 TRAINING_STRATEGY_VERSION = "v3-source-profiles-main-adaptive"
 
@@ -41,6 +44,57 @@ def get_baseline_training_profile(name: str) -> BaselineTrainingProfile:
         return BASELINE_TRAINING_PROFILES[name]
     except KeyError as exc:
         raise ValueError(f"No training profile for official baseline: {name}") from exc
+
+
+def build_baseline_optimizer(model, profile):
+    params = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if profile.optimizer == "adam":
+        return torch.optim.Adam(params, lr=profile.lr, weight_decay=profile.weight_decay)
+    if profile.optimizer == "adamw":
+        return torch.optim.AdamW(params, lr=profile.lr, weight_decay=profile.weight_decay)
+    raise ValueError(f"Unsupported optimizer: {profile.optimizer}")
+
+
+def build_baseline_scheduler(optimizer, profile, steps_per_epoch):
+    if profile.scheduler == "one_cycle":
+        return torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=profile.lr,
+            epochs=profile.max_epochs,
+            steps_per_epoch=steps_per_epoch,
+            pct_start=float(profile.pct_start),
+        )
+    if profile.scheduler == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=int(profile.cosine_t_max),
+            eta_min=profile.eta_min,
+        )
+    if profile.scheduler == "type1":
+        return None
+    raise ValueError(f"Unsupported scheduler: {profile.scheduler}")
+
+
+def baseline_regression_loss(pred, target, profile):
+    if profile.loss == "mse":
+        return F.mse_loss(pred, target)
+    raise ValueError(f"Unsupported baseline loss: {profile.loss}")
+
+
+def step_baseline_batch_scheduler(scheduler, profile):
+    if profile.scheduler_step == "batch" and scheduler is not None:
+        scheduler.step()
+
+
+def step_baseline_epoch_scheduler(scheduler, optimizer, profile, epoch):
+    if profile.scheduler_step != "epoch":
+        return
+    if profile.scheduler == "type1":
+        lr = profile.lr * (0.5 ** max(epoch - 1, 0))
+        for group in optimizer.param_groups:
+            group["lr"] = lr
+    elif scheduler is not None:
+        scheduler.step()
 
 
 @dataclass(frozen=True)
