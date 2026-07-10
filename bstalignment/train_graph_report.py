@@ -16,6 +16,16 @@ try:
     from .experiment_config import ExperimentConfig, ensure_research_dirs
     from .graph_report_losses import graph_report_loss, regression_metrics
     from .graph_report_model import GraphReportTS, GraphReportTSConfig
+    from .training_strategy import (
+        MAIN_TRAINING_PROFILE,
+        MainTrainingProfile,
+        TRAINING_STRATEGY_VERSION,
+        GraphReportScheduler,
+        build_graph_report_optimizer,
+        graph_report_align_weight,
+        graph_report_group_lrs,
+        should_stop_graph_report,
+    )
     from .utils import AverageMeter, ensure_dir, save_json, seed_everything, to_device
 except ImportError:
     from data_battery_raw import BatteryRawGraphDataset, collate_graph_report_batch
@@ -23,6 +33,16 @@ except ImportError:
     from experiment_config import ExperimentConfig, ensure_research_dirs
     from graph_report_losses import graph_report_loss, regression_metrics
     from graph_report_model import GraphReportTS, GraphReportTSConfig
+    from training_strategy import (
+        MAIN_TRAINING_PROFILE,
+        MainTrainingProfile,
+        TRAINING_STRATEGY_VERSION,
+        GraphReportScheduler,
+        build_graph_report_optimizer,
+        graph_report_align_weight,
+        graph_report_group_lrs,
+        should_stop_graph_report,
+    )
     from utils import AverageMeter, ensure_dir, save_json, seed_everything, to_device
 
 
@@ -187,13 +207,11 @@ def _model_forward(model: GraphReportTS, batch: Dict[str, Any]) -> Dict[str, tor
     )
 
 
-def _loss_weights(args, epoch: Optional[int] = None) -> Dict[str, float]:
+def _loss_weights(args, profile, epoch: int) -> Dict[str, float]:
     if args.no_report_prompt or args.no_cross_modal or args.no_align_loss or args.no_semantic_alignment:
         align = 0.0
     else:
-        align = float(args.w_align)
-    if epoch is not None and int(args.align_warmup_epochs) > 0:
-        align *= min(float(epoch) / float(args.align_warmup_epochs), 1.0)
+        align = graph_report_align_weight(epoch, profile)
     return {"align": align}
 
 
@@ -291,41 +309,75 @@ def main():
         init_batch = next(iter(train_loader))
         init_batch = to_device(init_batch, device)
         _ = _model_forward(model, init_batch)
-    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.lr, weight_decay=args.weight_decay)
-    eval_weights = _loss_weights(args)
+    text_backbone = getattr(getattr(model, "text_encoder", None), "backbone", None)
+    if model_cfg.freeze_text and text_backbone is not None:
+        assert all(not parameter.requires_grad for parameter in text_backbone.parameters())
+        text_backbone.eval()
 
-    save_json({"args": vars(args), "model_cfg": model_cfg.__dict__, "output_dim": output_dim}, out_dir / "run_config.json")
-    best = float("inf")
-    stale = 0
-    start_epoch = 1
+    profile = MAIN_TRAINING_PROFILE
+    training_strategy_version = TRAINING_STRATEGY_VERSION
+    resume_path = None
+    resume_checkpoint = None
     if not args.no_resume:
         last_path = out_dir / "last.pt"
         best_path = out_dir / "best.pt"
         resume_path = last_path if last_path.exists() else best_path
         if resume_path.exists():
-            ckpt = torch.load(resume_path, map_location=device)
-            model.load_state_dict(ckpt["model"])
-            if "optimizer" in ckpt:
-                opt.load_state_dict(ckpt["optimizer"])
-            val_metrics = ckpt.get("val_metrics", {})
-            best = float(ckpt.get("best", val_metrics.get("mse", best)))
-            stale = int(ckpt.get("stale", 0))
-            start_epoch = int(ckpt.get("epoch", 0)) + 1 if "epoch" in ckpt else 1
-            print(f"resumed from {resume_path} at epoch {start_epoch}; best val_mse={best:.6f}")
+            resume_checkpoint = torch.load(resume_path, map_location=device)
+            if "training_profile" in resume_checkpoint:
+                profile = MainTrainingProfile(**resume_checkpoint["training_profile"])
+            training_strategy_version = resume_checkpoint.get("training_strategy_version", training_strategy_version)
 
-    for epoch in range(start_epoch, args.epochs + 1):
+    opt = build_graph_report_optimizer(model, profile)
+    scheduler = GraphReportScheduler(opt, profile)
+    eval_weights = _loss_weights(args, profile, profile.max_epochs)
+
+    save_json(
+        {
+            "args": vars(args),
+            "model_cfg": model_cfg.__dict__,
+            "output_dim": output_dim,
+            "training_strategy_version": training_strategy_version,
+            "training_profile": profile.__dict__,
+        },
+        out_dir / "run_config.json",
+    )
+    best = float("inf")
+    stale = 0
+    start_epoch = 1
+    if resume_checkpoint is not None:
+        model.load_state_dict(resume_checkpoint["model"])
+        if "optimizer" in resume_checkpoint:
+            opt.load_state_dict(resume_checkpoint["optimizer"])
+        if "scheduler" in resume_checkpoint:
+            scheduler.load_state_dict(resume_checkpoint["scheduler"])
+        if "group_lrs" in resume_checkpoint:
+            group_lrs = resume_checkpoint["group_lrs"]
+            for group in opt.param_groups:
+                group["lr"] = float(group_lrs[group["role"]])
+        val_metrics = resume_checkpoint.get("val_metrics", {})
+        best = float(resume_checkpoint.get("best", val_metrics.get("mse", best)))
+        stale = int(resume_checkpoint.get("stale", 0))
+        start_epoch = int(resume_checkpoint.get("epoch", 0)) + 1 if "epoch" in resume_checkpoint else 1
+        print(f"resumed from {resume_path} at epoch {start_epoch}; best val_mse={best:.6f}")
+
+    for epoch in range(start_epoch, profile.max_epochs + 1):
         model.train()
+        if model_cfg.freeze_text and text_backbone is not None:
+            text_backbone.eval()
+        scheduler.start_epoch(epoch)
+        epoch_lrs = graph_report_group_lrs(opt)
         meters = {k: AverageMeter() for k in ["total", "reg", "align"]}
         gate_stats = _empty_gate_stats()
-        weights = _loss_weights(args, epoch)
-        pbar = tqdm(train_loader, desc=f"{args.variant}/{args.dataset} epoch {epoch}/{args.epochs}")
+        weights = _loss_weights(args, profile, epoch)
+        pbar = tqdm(train_loader, desc=f"{args.variant}/{args.dataset} epoch {epoch}/{profile.max_epochs}")
         for batch in pbar:
             batch = to_device(batch, device)
             out = _model_forward(model, batch)
             loss = graph_report_loss(out, batch["y"], batch["mask"], weights, loss_type=args.loss)
             opt.zero_grad(set_to_none=True)
             loss["total"].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), profile.gradient_clip)
             opt.step()
             n = batch["maps"].size(0)
             for k, v in loss.items():
@@ -334,8 +386,36 @@ def main():
             pbar.set_postfix({"loss": meters["total"].avg})
         train_gate = _finalize_gate_stats(gate_stats)
         val = evaluate(model, val_loader, device, weights, args.loss, gate_path=out_dir / f"val_gates_epoch_{epoch}.csv")
+        scheduler.step_validation(epoch, val["mse"])
+        score = val["mse"]
+        improved = score < best
+        if improved:
+            best = score
+        if epoch <= profile.early_stop_start_epoch:
+            stale = 0
+        elif improved:
+            stale = 0
+        else:
+            stale += 1
+        checkpoint = {
+            "model": model.state_dict(),
+            "model_cfg": model_cfg.__dict__,
+            "args": vars(args),
+            "training_strategy_version": training_strategy_version,
+            "training_profile": profile.__dict__,
+            "optimizer": opt.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "group_lrs": graph_report_group_lrs(opt),
+            "epoch": epoch,
+            "best": best,
+            "stale": stale,
+            "val_metrics": val,
+        }
         epoch_row = {
             "epoch": epoch,
+            "training_strategy_version": training_strategy_version,
+            "core_lr": epoch_lrs["core"],
+            "semantic_lr": epoch_lrs["semantic"],
             "align_weight": weights["align"],
             "train_loss": meters["total"].avg,
             "train_reg": meters["reg"].avg,
@@ -347,30 +427,15 @@ def main():
             f.write(json.dumps(epoch_row, ensure_ascii=False, sort_keys=True) + "\n")
         print(
             f"epoch={epoch} val_mse={val['mse']:.6f} val_mae={val['mae']:.6f} "
-            f"val_loss={val['total']:.6f} gate_mean={val['gate_mean']:.4f} align_w={weights['align']:.5f}"
+            f"val_loss={val['total']:.6f} gate_mean={val['gate_mean']:.4f} align_w={weights['align']:.5f} "
+            f"core_lr={epoch_lrs['core']:.8f} semantic_lr={epoch_lrs['semantic']:.8f} "
+            f"training_strategy_version={training_strategy_version}"
         )
-        score = val["mse"]
-        if score < best - args.early_stop_min_delta:
-            best = score
-            stale = 0
-            torch.save({"model": model.state_dict(), "model_cfg": model_cfg.__dict__, "args": vars(args), "val_metrics": val}, out_dir / "best.pt")
+        if improved:
+            torch.save(checkpoint, out_dir / "best.pt")
             save_json(val, out_dir / "val_metrics.json")
-        else:
-            stale += 1
-        torch.save(
-            {
-                "model": model.state_dict(),
-                "model_cfg": model_cfg.__dict__,
-                "args": vars(args),
-                "optimizer": opt.state_dict(),
-                "epoch": epoch,
-                "best": best,
-                "stale": stale,
-                "val_metrics": val,
-            },
-            out_dir / "last.pt",
-        )
-        if stale >= args.early_stop_patience:
+        torch.save(checkpoint, out_dir / "last.pt")
+        if should_stop_graph_report(epoch, stale, profile):
             print(f"early stopping at epoch {epoch}; best val_mse={best:.6f}")
             break
     ckpt = torch.load(out_dir / "best.pt", map_location=device)

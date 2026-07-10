@@ -16,6 +16,7 @@ from bstalignment.training_strategy import (
     get_baseline_training_profile,
     graph_report_align_weight,
     graph_report_group_lrs,
+    should_stop_graph_report,
     step_baseline_batch_scheduler,
     step_baseline_epoch_scheduler,
 )
@@ -204,3 +205,10 @@ class MainStrategyTests(unittest.TestCase):
         self.assertEqual(graph_report_align_weight(5, MAIN_TRAINING_PROFILE), 0.0)
         self.assertAlmostEqual(graph_report_align_weight(6, MAIN_TRAINING_PROFILE), 1e-4)
         self.assertAlmostEqual(graph_report_align_weight(15, MAIN_TRAINING_PROFILE), 1e-3)
+
+
+class MainTrainerPolicyTests(unittest.TestCase):
+    def test_early_stop_counter_is_inactive_before_epoch_20(self):
+        self.assertFalse(should_stop_graph_report(epoch=19, stale=100, profile=MAIN_TRAINING_PROFILE))
+        self.assertFalse(should_stop_graph_report(epoch=38, stale=19, profile=MAIN_TRAINING_PROFILE))
+        self.assertTrue(should_stop_graph_report(epoch=39, stale=20, profile=MAIN_TRAINING_PROFILE))
