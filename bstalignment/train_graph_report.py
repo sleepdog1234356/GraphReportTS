@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 from pathlib import Path
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -249,16 +250,128 @@ def _resolve_out_dir(args) -> Path:
     return ensure_dir(Path(args.run_dir))
 
 
-def _load_epoch_seconds(history_path: Path) -> List[float]:
+def _resume_checkpoint_path(out_dir: Path) -> Optional[Path]:
+    last_path = out_dir / "last.pt"
+    if last_path.exists():
+        return last_path
+    best_path = out_dir / "best.pt"
+    return best_path if best_path.exists() else None
+
+
+def _epoch_duration(value: Any, context: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError(f"{context} must be a finite non-negative number")
+    duration = float(value)
+    if not math.isfinite(duration) or duration < 0.0:
+        raise RuntimeError(f"{context} must be a finite non-negative number")
+    return duration
+
+
+def _reconcile_epoch_history(
+    history_path: Path,
+    checkpoint_epoch: int,
+    checkpoint_epoch_seconds: Optional[Any],
+) -> List[float]:
+    if isinstance(checkpoint_epoch, bool) or not isinstance(checkpoint_epoch, int) or checkpoint_epoch < 0:
+        raise RuntimeError("checkpoint epoch must be a non-negative integer")
+    checkpoint_durations: Optional[List[float]] = None
+    if checkpoint_epoch_seconds is not None:
+        if not isinstance(checkpoint_epoch_seconds, (list, tuple)):
+            raise RuntimeError("checkpoint epoch_seconds must be a sequence")
+        checkpoint_durations = [
+            _epoch_duration(value, f"checkpoint epoch_seconds[{index}]")
+            for index, value in enumerate(checkpoint_epoch_seconds)
+        ]
+        if len(checkpoint_durations) > checkpoint_epoch:
+            raise RuntimeError("checkpoint epoch_seconds has more entries than the checkpoint epoch")
     if not history_path.exists():
-        return []
-    durations: List[float] = []
-    with history_path.open("r", encoding="utf-8") as handle:
-        for line in handle:
+        return checkpoint_durations or []
+
+    original_lines = history_path.read_text(encoding="utf-8").splitlines()
+    retained_lines: List[str] = []
+    history_durations: List[float] = []
+    timing_started = False
+    expected_epoch: Optional[int] = None
+    for line_number, line in enumerate(original_lines, start=1):
+        if expected_epoch is not None and expected_epoch > checkpoint_epoch:
+            break
+        try:
             row = json.loads(line)
-            if "epoch_seconds" in row:
-                durations.append(float(row["epoch_seconds"]))
-    return durations
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise RuntimeError(
+                f"epoch history {history_path} line {line_number} is invalid before checkpoint epoch {checkpoint_epoch}"
+            ) from exc
+        if not isinstance(row, dict):
+            raise RuntimeError(f"epoch history {history_path} line {line_number} must be a JSON object")
+        row_epoch = row.get("epoch")
+        if isinstance(row_epoch, bool) or not isinstance(row_epoch, int):
+            raise RuntimeError(f"epoch history {history_path} line {line_number} has an invalid epoch")
+        if row_epoch > checkpoint_epoch:
+            break
+        if expected_epoch is None:
+            expected_epoch = row_epoch
+        if row_epoch != expected_epoch:
+            raise RuntimeError(
+                f"epoch history {history_path} expected epoch {expected_epoch}, found {row_epoch}"
+            )
+        retained_lines.append(line)
+        if "epoch_seconds" in row:
+            timing_started = True
+            history_durations.append(
+                _epoch_duration(row["epoch_seconds"], f"epoch history epoch {row_epoch} epoch_seconds")
+            )
+        elif timing_started:
+            raise RuntimeError(
+                f"epoch history {history_path} has a timing gap at epoch {row_epoch}"
+            )
+        expected_epoch += 1
+
+    if retained_lines and expected_epoch is not None and expected_epoch - 1 != checkpoint_epoch:
+        raise RuntimeError(
+            f"epoch history {history_path} ends at epoch {expected_epoch - 1}, "
+            f"before checkpoint epoch {checkpoint_epoch}"
+        )
+    if checkpoint_durations is not None and retained_lines:
+        if not history_durations and checkpoint_durations:
+            raise RuntimeError("checkpoint epoch_seconds does not match retained epoch history timing")
+        if history_durations and (
+            len(history_durations) > len(checkpoint_durations)
+            or checkpoint_durations[-len(history_durations):] != history_durations
+        ):
+            raise RuntimeError("checkpoint epoch_seconds does not match retained epoch history timing")
+
+    if len(retained_lines) != len(original_lines):
+        temporary_path = history_path.with_name(f".{history_path.name}.resume.tmp")
+        try:
+            with temporary_path.open("w", encoding="utf-8", newline="") as handle:
+                for line in retained_lines:
+                    handle.write(line + "\n")
+            temporary_path.replace(history_path)
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
+    return checkpoint_durations if checkpoint_durations is not None else history_durations
+
+
+def _run_summary_payload(
+    *,
+    best_epoch: int,
+    stopped_epoch: int,
+    epoch_seconds: List[float],
+    trainable_parameter_count: int,
+    training_strategy_version: str,
+    ablation_suite_version: Optional[str],
+) -> Dict[str, Any]:
+    total_train_seconds = float(sum(epoch_seconds))
+    return {
+        "best_epoch": int(best_epoch),
+        "stopped_epoch": int(stopped_epoch),
+        "mean_epoch_seconds": float(total_train_seconds / len(epoch_seconds)) if epoch_seconds else 0.0,
+        "total_train_seconds": total_train_seconds,
+        "trainable_parameter_count": int(trainable_parameter_count),
+        "training_strategy_version": training_strategy_version,
+        "ablation_suite_version": ablation_suite_version,
+    }
 
 
 def _loss_weights(args, profile, epoch: int) -> Dict[str, float]:
@@ -384,10 +497,8 @@ def main():
     resume_path = None
     resume_checkpoint = None
     if not args.no_resume:
-        last_path = out_dir / "last.pt"
-        best_path = out_dir / "best.pt"
-        resume_path = last_path if last_path.exists() else best_path
-        if resume_path.exists():
+        resume_path = _resume_checkpoint_path(out_dir)
+        if resume_path is not None:
             resume_checkpoint = torch.load(resume_path, map_location=device)
             require_checkpoint_strategy_version(resume_checkpoint, "GraphReportTS trainer")
             if "training_profile" in resume_checkpoint:
@@ -429,14 +540,17 @@ def main():
         val_metrics = resume_checkpoint.get("val_metrics", {})
         best = float(resume_checkpoint.get("best", val_metrics.get("mse", best)))
         stale = int(resume_checkpoint.get("stale", 0))
-        start_epoch = int(resume_checkpoint.get("epoch", 0)) + 1 if "epoch" in resume_checkpoint else 1
+        checkpoint_epoch = resume_checkpoint.get("epoch", 0)
+        if isinstance(checkpoint_epoch, bool) or not isinstance(checkpoint_epoch, int) or checkpoint_epoch < 0:
+            raise RuntimeError("GraphReportTS trainer checkpoint epoch must be a non-negative integer")
+        start_epoch = checkpoint_epoch + 1
         best_epoch = int(resume_checkpoint.get("best_epoch", resume_checkpoint.get("epoch", 0)))
-        stopped_epoch = int(resume_checkpoint.get("epoch", 0))
-        checkpoint_epoch_seconds = resume_checkpoint.get("epoch_seconds")
-        if checkpoint_epoch_seconds is None:
-            epoch_seconds = _load_epoch_seconds(out_dir / "epoch_history.jsonl")
-        else:
-            epoch_seconds = [float(value) for value in checkpoint_epoch_seconds]
+        stopped_epoch = checkpoint_epoch
+        epoch_seconds = _reconcile_epoch_history(
+            out_dir / "epoch_history.jsonl",
+            checkpoint_epoch=checkpoint_epoch,
+            checkpoint_epoch_seconds=resume_checkpoint.get("epoch_seconds"),
+        )
         print(f"resumed from {resume_path} at epoch {start_epoch}; best val_mse={best:.6f}")
 
     for epoch in range(start_epoch, profile.max_epochs + 1):
@@ -521,17 +635,15 @@ def main():
         if should_stop_graph_report(epoch, stale, profile):
             print(f"early stopping at epoch {epoch}; best val_mse={best:.6f}")
             break
-    total_train_seconds = float(sum(epoch_seconds))
     save_json(
-        {
-            "best_epoch": int(best_epoch),
-            "stopped_epoch": int(stopped_epoch),
-            "mean_epoch_seconds": float(total_train_seconds / len(epoch_seconds)) if epoch_seconds else 0.0,
-            "total_train_seconds": total_train_seconds,
-            "trainable_parameter_count": trainable_parameter_count,
-            "training_strategy_version": training_strategy_version,
-            "ablation_suite_version": args.ablation_suite_version,
-        },
+        _run_summary_payload(
+            best_epoch=best_epoch,
+            stopped_epoch=stopped_epoch,
+            epoch_seconds=epoch_seconds,
+            trainable_parameter_count=trainable_parameter_count,
+            training_strategy_version=training_strategy_version,
+            ablation_suite_version=args.ablation_suite_version,
+        ),
         out_dir / "run_summary.json",
     )
     ckpt = torch.load(out_dir / "best.pt", map_location=device)

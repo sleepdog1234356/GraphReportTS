@@ -210,6 +210,17 @@ class CoreAblationModelTests(unittest.TestCase):
 
 
 class TrainerIntegrationTests(unittest.TestCase):
+    def test_resume_checkpoint_prefers_last_and_falls_back_to_best(self):
+        with TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            self.assertIsNone(graph_report_trainer._resume_checkpoint_path(out_dir))
+            best_path = out_dir / "best.pt"
+            best_path.write_bytes(b"best")
+            self.assertEqual(graph_report_trainer._resume_checkpoint_path(out_dir), best_path)
+            last_path = out_dir / "last.pt"
+            last_path.write_bytes(b"last")
+            self.assertEqual(graph_report_trainer._resume_checkpoint_path(out_dir), last_path)
+
     def test_raw_sequence_parser_flags_keep_formal_batch_default(self):
         with patch.object(
             sys,
@@ -323,19 +334,154 @@ class TrainerIntegrationTests(unittest.TestCase):
                 root / "core" / "battery" / "mit" / "no_hankel_graph",
             )
 
-    def test_resume_timer_history_is_loaded_without_rewriting_rows(self):
+    def test_best_checkpoint_fallback_truncates_history_before_resumed_append(self):
         with TemporaryDirectory() as tmp:
             history_path = Path(tmp) / "epoch_history.jsonl"
-            original = (
-                '{"epoch": 1, "epoch_seconds": 1.25}\n'
-                '{"epoch": 2, "epoch_seconds": 2.5}\n'
+            original_lines = [
+                json.dumps({"epoch": epoch, "marker": f"row-{epoch}", "epoch_seconds": float(epoch)}) + "\n"
+                for epoch in range(1, 6)
+            ]
+            history_path.write_text("".join(original_lines), encoding="utf-8")
+
+            seconds = graph_report_trainer._reconcile_epoch_history(
+                history_path,
+                checkpoint_epoch=3,
+                checkpoint_epoch_seconds=[1.0, 2.0, 3.0],
             )
-            history_path.write_text(original, encoding="utf-8")
 
-            seconds = graph_report_trainer._load_epoch_seconds(history_path)
+            self.assertEqual(seconds, [1.0, 2.0, 3.0])
+            self.assertEqual(history_path.read_text(encoding="utf-8"), "".join(original_lines[:3]))
+            with history_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"epoch": 4, "epoch_seconds": 4.0}) + "\n")
+            seconds.append(4.0)
+            rows = [json.loads(line) for line in history_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([row["epoch"] for row in rows], [1, 2, 3, 4])
+            summary = graph_report_trainer._run_summary_payload(
+                best_epoch=3,
+                stopped_epoch=4,
+                epoch_seconds=seconds,
+                trainable_parameter_count=123,
+                training_strategy_version="strategy-v3",
+                ablation_suite_version="core-v1",
+            )
+            self.assertEqual(summary["total_train_seconds"], 10.0)
+            self.assertEqual(summary["mean_epoch_seconds"], 2.5)
 
-            self.assertEqual(seconds, [1.25, 2.5])
-            self.assertEqual(history_path.read_text(encoding="utf-8"), original)
+    def test_legacy_checkpoint_without_timing_uses_only_retained_available_history(self):
+        with TemporaryDirectory() as tmp:
+            history_path = Path(tmp) / "epoch_history.jsonl"
+            history_path.write_text(
+                '{"epoch": 1, "legacy": true}\n'
+                '{"epoch": 2, "legacy": true}\n'
+                '{"epoch": 3, "epoch_seconds": 99.0}\n',
+                encoding="utf-8",
+            )
+
+            seconds = graph_report_trainer._reconcile_epoch_history(
+                history_path,
+                checkpoint_epoch=2,
+                checkpoint_epoch_seconds=None,
+            )
+
+            self.assertEqual(seconds, [])
+            self.assertEqual(
+                [json.loads(line)["epoch"] for line in history_path.read_text(encoding="utf-8").splitlines()],
+                [1, 2],
+            )
+            with history_path.open("a", encoding="utf-8") as handle:
+                handle.write('{"epoch": 3, "epoch_seconds": 3.5}\n')
+            self.assertEqual(
+                graph_report_trainer._reconcile_epoch_history(
+                    history_path,
+                    checkpoint_epoch=3,
+                    checkpoint_epoch_seconds=[3.5],
+                ),
+                [3.5],
+            )
+
+    def test_checkpoint_only_resume_allows_a_later_contiguous_history_suffix(self):
+        with TemporaryDirectory() as tmp:
+            history_path = Path(tmp) / "epoch_history.jsonl"
+            self.assertEqual(
+                graph_report_trainer._reconcile_epoch_history(
+                    history_path,
+                    checkpoint_epoch=2,
+                    checkpoint_epoch_seconds=[1.0, 2.0],
+                ),
+                [1.0, 2.0],
+            )
+            history_path.write_text('{"epoch": 3, "epoch_seconds": 3.0}\n', encoding="utf-8")
+
+            seconds = graph_report_trainer._reconcile_epoch_history(
+                history_path,
+                checkpoint_epoch=3,
+                checkpoint_epoch_seconds=[1.0, 2.0, 3.0],
+            )
+
+            self.assertEqual(seconds, [1.0, 2.0, 3.0])
+            self.assertEqual(json.loads(history_path.read_text(encoding="utf-8"))["epoch"], 3)
+
+    def test_malformed_tail_after_checkpoint_epoch_is_truncated(self):
+        with TemporaryDirectory() as tmp:
+            history_path = Path(tmp) / "epoch_history.jsonl"
+            history_path.write_text(
+                '{"epoch": 1, "epoch_seconds": 1.0}\n'
+                '{"epoch": 2, "epoch_seconds": 2.0}\n'
+                '{"epoch": 3, "epoch_seconds": 3.0}\n'
+                '{"epoch": 4,',
+                encoding="utf-8",
+            )
+
+            seconds = graph_report_trainer._reconcile_epoch_history(
+                history_path,
+                checkpoint_epoch=3,
+                checkpoint_epoch_seconds=[1.0, 2.0, 3.0],
+            )
+
+            self.assertEqual(seconds, [1.0, 2.0, 3.0])
+            self.assertEqual(
+                [json.loads(line)["epoch"] for line in history_path.read_text(encoding="utf-8").splitlines()],
+                [1, 2, 3],
+            )
+
+    def test_resume_reconciliation_rejects_history_and_checkpoint_timing_anomalies(self):
+        with TemporaryDirectory() as tmp:
+            history_path = Path(tmp) / "epoch_history.jsonl"
+            history_path.write_text(
+                '{"epoch": 1, "epoch_seconds": 1.0}\n'
+                '{"epoch": 2, "epoch_seconds": 2.0}\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "checkpoint epoch_seconds.*history"):
+                graph_report_trainer._reconcile_epoch_history(
+                    history_path,
+                    checkpoint_epoch=2,
+                    checkpoint_epoch_seconds=[1.0],
+                )
+
+            history_path.write_text(
+                '{"epoch": 1, "epoch_seconds": 1.0}\n'
+                '{"epoch": 1, "epoch_seconds": 1.0}\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "expected epoch 2"):
+                graph_report_trainer._reconcile_epoch_history(
+                    history_path,
+                    checkpoint_epoch=2,
+                    checkpoint_epoch_seconds=[1.0, 1.0],
+                )
+
+            history_path.write_text(
+                '{"epoch": 1, "epoch_seconds": 1.0}\n'
+                '{"epoch": 2, "legacy": true}\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "timing gap"):
+                graph_report_trainer._reconcile_epoch_history(
+                    history_path,
+                    checkpoint_epoch=2,
+                    checkpoint_epoch_seconds=[1.0],
+                )
 
 
 class ResampledBatterySequenceTests(unittest.TestCase):
