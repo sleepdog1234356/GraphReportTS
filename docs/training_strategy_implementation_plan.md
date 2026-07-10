@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Keep the leak-free, no-historical-SOH input schema unchanged.
-- Keep input length 32 cycles, prediction length 20 steps, batch size 128, and seed 42 for formal battery comparisons.
+- Keep input length 32 cycles, prediction length 20 steps, and seed 42 for formal battery comparisons. Use batch size 64 for GraphReportTS main/ablations after the full-model RTX 4090 preflight, while official baselines retain batch size 128.
 - Keep the DistilBERT backbone frozen; train only its projection and downstream semantic modules.
 - Select checkpoints only with validation MSE; evaluate the test split only after training.
 - Use `runs/full_hf_v3_training_strategy_nosoh` and never mix v2 metrics into v3 summaries.

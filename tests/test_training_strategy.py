@@ -550,7 +550,9 @@ class PipelineScriptTests(unittest.TestCase):
         text = Path("scripts/run_battery_v3_training_strategy_pipeline.sh").read_text(encoding="utf-8")
         self.assertIn('NUM_WORKERS="${NUM_WORKERS:-16}"', text)
         self.assertIn('BASELINE_NUM_WORKERS="${BASELINE_NUM_WORKERS:-8}"', text)
-        self.assertIn('BATCH_SIZE="${BATCH_SIZE:-128}"', text)
+        self.assertIn('BATCH_SIZE="${BATCH_SIZE:-64}"', text)
+        self.assertIn('ABLATION_BATCH_SIZE="${ABLATION_BATCH_SIZE:-64}"', text)
+        self.assertIn('BASELINE_BATCH_SIZE="${BASELINE_BATCH_SIZE:-128}"', text)
         self.assertIn('BATTERY_GRAPH_CACHE_DIR:-runs/cache/battery_graph', text)
         for setting in (
             "OMP_NUM_THREADS",
@@ -588,7 +590,7 @@ class PipelineScriptTests(unittest.TestCase):
         ):
             text = path.read_text(encoding="utf-8")
             self.assertIn('BATCH_SIZE="${', text, path)
-            self.assertIn(':-128}"', text, path)
+            self.assertIn(':-64}"', text, path)
             self.assertIn('NUM_WORKERS="${NUM_WORKERS:-16}"', text, path)
         baseline = Path("scripts/run_battery_official_baselines.sh").read_text(encoding="utf-8")
         self.assertIn('BATCH_SIZE="${BASELINE_BATCH_SIZE:-128}"', baseline)
@@ -770,6 +772,8 @@ class PipelineScriptTests(unittest.TestCase):
         self.assertIn("[B, 32, N_patch, D]", report)
         self.assertIn("RTX4090 48GiB", workflow)
         self.assertIn("208 CPU threads", workflow)
+        self.assertIn("batch size 64 for main/ablations", workflow)
+        self.assertIn("batch size 128 for baselines", workflow)
         self.assertIn("FORCE_RETRAIN=0", workflow)
         self.assertIn("no AMP", workflow)
         mkdir_command = "mkdir -p runs/full_hf_v3_training_strategy_nosoh/logs"

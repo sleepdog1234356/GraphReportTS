@@ -86,11 +86,13 @@ Battery datasets:
 
 Formal training uses raw current, voltage, temperature, and capacity sequences. The summary-derived fallback path remains only for smoke tests through `--allow_summary_fallback`.
 
-To reduce repeated CPU-side map construction, `bstalignment/precompute_battery_graph_cache.py` precomputes deterministic graph caches for each split. For v2, this cache is cycle-level rather than sample-level: it stores `cycle_maps.npy` and per-sample `history_indices.npy`.
+To reduce repeated CPU-side map construction, `bstalignment/precompute_battery_graph_cache.py` precomputes deterministic graph caches for each split. The v3 cache is cycle-level rather than sample-level: it stores `cycle_maps.npy` and per-sample `history_indices.npy`.
 
 ## 4. V3 Training Strategy
 
 The formal entrypoint is `scripts/run_battery_v3_training_strategy_pipeline.sh`, which writes to `runs/full_hf_v3_training_strategy_nosoh` in the exact order `main -> baselines -> ablations`. The main stage covers MIT, CALCE, and XJTU before the official baseline and ablation stages. The pipeline defaults to `FORCE_RETRAIN=1`; a later `FORCE_RETRAIN=0` invocation resumes or skips only runs whose `test_metrics.json` and `run_config.json` match the current v3 strategy version.
+
+The approved RTX 4090 configuration uses batch 64 for GraphReportTS main/ablations, batch 128 for baselines, 16 workers for main/cache/ablations, and 8 workers for baselines. A full-model 32/20 preflight measured 33.116 GiB peak allocated CUDA memory at batch 64; batch 128 exhausted the 48 GiB device during the graph encoder forward pass.
 
 The battery data contract is exactly 32 observed cycles followed by 20 future-only labels, with no terminal partial horizons. Historical SOH remains excluded from every model input. `cycle_ratio` uses train-only dataset-global cycle scaling: the maximum cycle ID from the seeded training-cell split is reused unchanged for train, validation, and test, with no clipping above 1.0.
 

@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="${1:-$(pwd)}"
 OUT_ROOT="${OUT_ROOT:-runs/full_hf_v3_training_strategy_nosoh}"
-BATCH_SIZE="${BATCH_SIZE:-128}"
+BATCH_SIZE="${BATCH_SIZE:-64}"
 PRED_LEN="${PRED_LEN:-20}"
 HISTORY_LEN="${HISTORY_LEN:-32}"
 NUM_WORKERS="${NUM_WORKERS:-16}"
