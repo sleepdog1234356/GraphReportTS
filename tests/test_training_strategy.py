@@ -8,10 +8,14 @@ from bstalignment.training_strategy import (
     BASELINE_TRAINING_PROFILES,
     MAIN_TRAINING_PROFILE,
     TRAINING_STRATEGY_VERSION,
+    GraphReportScheduler,
     baseline_regression_loss,
     build_baseline_optimizer,
     build_baseline_scheduler,
+    build_graph_report_optimizer,
     get_baseline_training_profile,
+    graph_report_align_weight,
+    graph_report_group_lrs,
     step_baseline_batch_scheduler,
     step_baseline_epoch_scheduler,
 )
@@ -74,6 +78,8 @@ class BaselineMechanicsTests(unittest.TestCase):
         optimizer = build_baseline_optimizer(model, profile)
         scheduler = build_baseline_scheduler(optimizer, profile, steps_per_epoch=4)
         before = scheduler.last_epoch
+        model(torch.ones(1, 2)).sum().backward()
+        optimizer.step()
         step_baseline_batch_scheduler(scheduler, profile)
         self.assertEqual(scheduler.last_epoch, before + 1)
 
@@ -95,3 +101,48 @@ class BaselineMechanicsTests(unittest.TestCase):
         pred = torch.tensor([[1.0, 3.0]])
         target = torch.tensor([[0.0, 1.0]])
         self.assertEqual(float(baseline_regression_loss(pred, target, profile)), 2.5)
+
+
+class TinyGraphReport(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.graph_encoder = torch.nn.Linear(2, 2)
+        self.context_norm = torch.nn.LayerNorm(2)
+        self.decoder = torch.nn.Embedding(4, 2)
+        self.text_encoder = torch.nn.Module()
+        self.text_encoder.backbone = torch.nn.Linear(2, 2)
+        self.text_encoder.proj = torch.nn.Linear(2, 2)
+        self.semantic_fusion = torch.nn.Linear(2, 2)
+        for parameter in self.text_encoder.backbone.parameters():
+            parameter.requires_grad = False
+
+
+class MainStrategyTests(unittest.TestCase):
+    def test_parameter_groups_cover_trainable_parameters_once(self):
+        model = TinyGraphReport()
+        optimizer = build_graph_report_optimizer(model, MAIN_TRAINING_PROFILE)
+        optimized = [parameter for group in optimizer.param_groups for parameter in group["params"]]
+        expected = [parameter for parameter in model.parameters() if parameter.requires_grad]
+        self.assertEqual({id(parameter) for parameter in optimized}, {id(parameter) for parameter in expected})
+        self.assertEqual(len(optimized), len({id(parameter) for parameter in optimized}))
+        self.assertFalse(any(parameter.requires_grad for parameter in model.text_encoder.backbone.parameters()))
+
+    def test_lr_warmup_plateau_and_state_restore(self):
+        model = TinyGraphReport()
+        optimizer = build_graph_report_optimizer(model, MAIN_TRAINING_PROFILE)
+        scheduler = GraphReportScheduler(optimizer, MAIN_TRAINING_PROFILE)
+        scheduler.start_epoch(1)
+        first = graph_report_group_lrs(optimizer)
+        scheduler.start_epoch(5)
+        full = graph_report_group_lrs(optimizer)
+        self.assertAlmostEqual(first["core"], 1e-4)
+        self.assertAlmostEqual(full["core"], 1e-3)
+        state = scheduler.state_dict()
+        restored = GraphReportScheduler(optimizer, MAIN_TRAINING_PROFILE)
+        restored.load_state_dict(state)
+        self.assertEqual(restored.state_dict(), state)
+
+    def test_align_weight_is_delayed_and_ramped(self):
+        self.assertEqual(graph_report_align_weight(5, MAIN_TRAINING_PROFILE), 0.0)
+        self.assertAlmostEqual(graph_report_align_weight(6, MAIN_TRAINING_PROFILE), 1e-4)
+        self.assertAlmostEqual(graph_report_align_weight(15, MAIN_TRAINING_PROFILE), 1e-3)
