@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 
 
-TRAINING_STRATEGY_VERSION = "v3-source-profiles-main-adaptive-fixed-horizon-train-scale"
+TRAINING_STRATEGY_VERSION = "v3-source-profiles-main-adaptive-fixed-horizon-train-scale-batch64"
 
 
 def require_nonempty_splits(train_dataset, val_dataset, test_dataset, trainer_name: str) -> None:

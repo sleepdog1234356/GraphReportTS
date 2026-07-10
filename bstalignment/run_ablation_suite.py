@@ -8,7 +8,12 @@ from pathlib import Path
 
 import pandas as pd
 
-from .battery_protocol import require_formal_battery_protocol, run_config_matches
+from .battery_protocol import (
+    FORMAL_CACHE_TASK_BATCH_SIZE,
+    require_formal_battery_protocol,
+    require_formal_cache_task_batch_size,
+    run_config_matches,
+)
 from .training_strategy import TRAINING_STRATEGY_VERSION
 
 
@@ -82,7 +87,8 @@ def parse_args():
     p.add_argument("--dataset", type=str, default="mit")
     p.add_argument("--data_root", type=str, default="bstalignment/data")
     p.add_argument("--out_root", type=str, default="runs/graph_report_ablation")
-    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--cache_task_batch_size", type=int, default=FORMAL_CACHE_TASK_BATCH_SIZE)
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--pred_len", type=int, default=20)
     p.add_argument("--history_len", type=int, default=32)
@@ -108,6 +114,12 @@ def main():
         require_formal_battery_protocol(
             observed_cycles=args.history_len,
             prediction_cycles=args.pred_len,
+            batch_size=args.batch_size,
+            stage="ablation",
+            context="GraphReportTS battery ablation suite",
+        )
+        require_formal_cache_task_batch_size(
+            batch_size=args.cache_task_batch_size,
             context="GraphReportTS battery ablation suite",
         )
     suite = BATTERY_ABLATIONS if args.variant == "battery" else GENERAL_ABLATIONS
@@ -149,7 +161,7 @@ def main():
                 "--history_len",
                 str(args.history_len),
                 "--batch_size",
-                str(args.batch_size),
+                str(args.cache_task_batch_size),
                 "--num_workers",
                 str(args.num_workers),
                 "--splits",

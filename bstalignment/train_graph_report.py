@@ -99,7 +99,7 @@ def parse_args():
     p.add_argument("--require_precomputed_cache", action="store_true", help="Fail instead of falling back to online battery graph map construction")
     p.add_argument("--max_cycles", type=int, default=None)
     p.add_argument("--epochs", type=int, default=80)
-    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--loss", choices=["smooth_l1", "mse", "mae"], default="smooth_l1")
@@ -282,6 +282,8 @@ def main():
         require_formal_battery_protocol(
             observed_cycles=args.history_len,
             prediction_cycles=args.pred_len,
+            batch_size=args.batch_size,
+            stage="main",
             context="GraphReportTS battery trainer",
         )
     seed_everything(args.seed)

@@ -11,12 +11,14 @@ HF_GPT2_MODEL="${HF_GPT2_MODEL:-hf_models/openai-community__gpt2}"
 HF_BERT_MODEL="${HF_BERT_MODEL:-hf_models/google-bert__bert-base-uncased}"
 BASELINE_MODELS="${BASELINE_MODELS:-patchtst itransformer timecma timesnet dlinear time_llm}"
 FORCE_RETRAIN="${FORCE_RETRAIN:-0}"
-TRAINING_STRATEGY_VERSION="v3-source-profiles-main-adaptive-fixed-horizon-train-scale"
+TRAINING_STRATEGY_VERSION="v3-source-profiles-main-adaptive-fixed-horizon-train-scale-batch64"
 cd "$ROOT"
 CONTROL_PY="${CONTROL_PY:-python}"
 $CONTROL_PY -m bstalignment.battery_protocol validate-formal-protocol \
   --observed-cycles "$INPUT_LEN" \
   --prediction-cycles "$PRED_LEN" \
+  --batch-size "$BATCH_SIZE" \
+  --stage baseline \
   --context "Formal official baseline runner"
 mkdir -p "$OUT_ROOT/logs"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"

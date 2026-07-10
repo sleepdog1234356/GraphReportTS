@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="${1:-$(pwd)}"
 OUT_ROOT="${OUT_ROOT:-runs/full_hf_v3_training_strategy_nosoh}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
+CACHE_TASK_BATCH_SIZE="${CACHE_TASK_BATCH_SIZE:-128}"
 PRED_LEN="${PRED_LEN:-20}"
 HISTORY_LEN="${HISTORY_LEN:-32}"
 NUM_WORKERS="${NUM_WORKERS:-16}"
@@ -11,12 +12,15 @@ FORCE_RETRAIN="${FORCE_RETRAIN:-0}"
 USE_GRAPH_CACHE="${USE_BATTERY_GRAPH_CACHE:-1}"
 GRAPH_CACHE_DIR="${BATTERY_GRAPH_CACHE_DIR:-runs/cache/battery_graph}"
 TEXT_MODEL="${TEXT_MODEL:-hf_models/distilbert-base-uncased}"
-TRAINING_STRATEGY_VERSION="v3-source-profiles-main-adaptive-fixed-horizon-train-scale"
+TRAINING_STRATEGY_VERSION="v3-source-profiles-main-adaptive-fixed-horizon-train-scale-batch64"
 cd "$ROOT"
 CONTROL_PY="${CONTROL_PY:-python}"
 $CONTROL_PY -m bstalignment.battery_protocol validate-formal-protocol \
   --observed-cycles "$HISTORY_LEN" \
   --prediction-cycles "$PRED_LEN" \
+  --batch-size "$BATCH_SIZE" \
+  --stage main \
+  --cache-task-batch-size "$CACHE_TASK_BATCH_SIZE" \
   --context "Formal GraphReportTS main runner"
 mkdir -p "$OUT_ROOT/logs"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
@@ -68,7 +72,7 @@ for dataset in mit calce xjtu; do
       --cache_dir "$GRAPH_CACHE_DIR" \
       --pred_len "$PRED_LEN" \
       --history_len "$HISTORY_LEN" \
-      --batch_size "$BATCH_SIZE" \
+      --batch_size "$CACHE_TASK_BATCH_SIZE" \
       --num_workers "$NUM_WORKERS" \
       --splits train val test
     CACHE_ARGS=(--precomputed_cache_dir "$GRAPH_CACHE_DIR" --require_precomputed_cache)

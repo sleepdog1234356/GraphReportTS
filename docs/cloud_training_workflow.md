@@ -94,7 +94,7 @@ FORCE_RETRAIN=1 bash scripts/run_battery_v3_training_strategy_pipeline.sh "$(pwd
   2>&1 | tee runs/full_hf_v3_training_strategy_nosoh/logs/v3_start.log
 ```
 
-Run it on the approved server configuration: RTX4090 48GiB, 208 CPU threads, batch size 64 for main/ablations, batch size 128 for baselines, 16 workers for main/cache/ablations, and 8 workers for baselines. A full-model preflight measured 33.116 GiB peak allocated CUDA memory at main batch 64; main batch 128 exhausted the 48 GiB device. Cache workers construct unique cycle maps in bounded parallel batches while the parent process owns deterministic memmap writes and publication. Main, cache, and ablation stages share `runs/cache/battery_graph`; all stages share the v3 output root. This protocol adds no AMP.
+Run it on the approved server configuration: RTX4090 48GiB, 208 CPU threads, batch size 64 for main/ablations, batch size 128 for baselines, `CACHE_TASK_BATCH_SIZE=128` for independent CPU cache scheduling, 16 workers for main/cache/ablations, and 8 workers for baselines. A full-model preflight measured 33.116 GiB peak allocated CUDA memory at main batch 64; main batch 128 exhausted the 48 GiB device. Cache workers construct unique cycle maps in bounded parallel batches while the parent process owns deterministic memmap writes and publication. Main, cache, and ablation stages share `runs/cache/battery_graph`; all stages share the v3 output root. This protocol adds no AMP.
 
 Check the pipeline and stage logs:
 

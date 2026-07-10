@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 import bstalignment.battery_protocol as battery_protocol
+import bstalignment.run_ablation_suite as ablation_suite
 from bstalignment.data_battery_raw import (
     BATTERY_GRAPH_CACHE_VERSION,
     BatteryRawGraphDataset,
@@ -364,22 +365,33 @@ class BatteryWindowProtocolTests(BatteryDataFixtureMixin, unittest.TestCase):
 
 
 class FormalBatteryProtocolTests(unittest.TestCase):
-    def test_exact_formal_protocol_is_accepted_and_nonconforming_lengths_are_rejected(self):
+    def test_exact_formal_protocol_is_accepted_and_nonconforming_values_are_rejected(self):
         battery_protocol.require_formal_battery_protocol(
             observed_cycles=battery_protocol.BATTERY_INPUT_CYCLES,
             prediction_cycles=battery_protocol.BATTERY_PREDICTION_CYCLES,
+            batch_size=64,
+            stage="main",
             context="test",
         )
-        for observed_cycles, prediction_cycles in ((31, 20), (32, 19), (33, 20), (32, 21)):
-            with self.subTest(observed_cycles=observed_cycles, prediction_cycles=prediction_cycles):
-                with self.assertRaisesRegex(ValueError, "exactly 32 observed cycles and 20 future-only targets"):
+        cases = (
+            ("main", 31, 20, 64, "exactly 32 observed cycles and 20 future-only targets"),
+            ("main", 32, 19, 64, "exactly 32 observed cycles and 20 future-only targets"),
+            ("main", 32, 20, 128, "batch_size=64"),
+            ("ablation", 32, 20, 128, "batch_size=64"),
+            ("baseline", 32, 20, 64, "batch_size=128"),
+        )
+        for stage, observed_cycles, prediction_cycles, batch_size, error in cases:
+            with self.subTest(stage=stage, observed_cycles=observed_cycles, prediction_cycles=prediction_cycles, batch_size=batch_size):
+                with self.assertRaisesRegex(ValueError, error):
                     battery_protocol.require_formal_battery_protocol(
                         observed_cycles=observed_cycles,
                         prediction_cycles=prediction_cycles,
+                        batch_size=batch_size,
+                        stage=stage,
                         context="test",
                     )
 
-    def test_direct_battery_entrypoints_reject_nonconforming_formal_v3_lengths(self):
+    def test_direct_battery_entrypoints_reject_nonconforming_formal_v3_batch_sizes(self):
         commands = (
             [
                 sys.executable,
@@ -389,11 +401,13 @@ class FormalBatteryProtocolTests(unittest.TestCase):
                 "--variant",
                 "battery",
                 "--history_len",
-                "31",
+                "32",
                 "--pred_len",
                 "20",
                 "--device",
                 "cpu",
+                "--batch_size",
+                "128",
             ],
             [
                 sys.executable,
@@ -407,9 +421,11 @@ class FormalBatteryProtocolTests(unittest.TestCase):
                 "--input_len",
                 "32",
                 "--pred_len",
-                "19",
+                "20",
                 "--device",
                 "cpu",
+                "--batch_size",
+                "64",
             ],
             [
                 sys.executable,
@@ -419,17 +435,19 @@ class FormalBatteryProtocolTests(unittest.TestCase):
                 "--variant",
                 "battery",
                 "--history_len",
-                "31",
+                "32",
                 "--pred_len",
                 "20",
                 "--dry_run",
+                "--batch_size",
+                "128",
             ],
         )
         for command in commands:
             with self.subTest(module=command[3]):
                 result = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn("exactly 32 observed cycles and 20 future-only targets", result.stdout + result.stderr)
+                self.assertIn("requires", result.stdout + result.stderr)
 
 
 class RunMetadataTests(unittest.TestCase):
@@ -439,6 +457,7 @@ class RunMetadataTests(unittest.TestCase):
     def valid_config(stage):
         args = {"pred_len": 20}
         args["input_len" if stage == "baseline" else "history_len"] = 32
+        args["batch_size"] = 128 if stage == "baseline" else 64
         return {"training_strategy_version": TRAINING_STRATEGY_VERSION, "args": args}
 
     def test_valid_typed_root_metadata_matches_every_formal_stage(self):
@@ -470,10 +489,16 @@ class RunMetadataTests(unittest.TestCase):
             ),
             "missing_args": json.dumps({"training_strategy_version": self.strategy_version}),
             "wrong_value": json.dumps(
-                {"training_strategy_version": self.strategy_version, "args": {"history_len": 31, "pred_len": 20}}
+                {"training_strategy_version": self.strategy_version, "args": {"history_len": 31, "pred_len": 20, "batch_size": 64}}
             ),
             "wrong_type": json.dumps(
-                {"training_strategy_version": self.strategy_version, "args": {"history_len": "32", "pred_len": True}}
+                {"training_strategy_version": self.strategy_version, "args": {"history_len": "32", "pred_len": True, "batch_size": "64"}}
+            ),
+            "wrong_batch": json.dumps(
+                {"training_strategy_version": self.strategy_version, "args": {"history_len": 32, "pred_len": 20, "batch_size": 128}}
+            ),
+            "boolean_batch": json.dumps(
+                {"training_strategy_version": self.strategy_version, "args": {"history_len": 32, "pred_len": 20, "batch_size": True}}
             ),
         }
         with TemporaryDirectory() as tmp:
@@ -510,6 +535,7 @@ class PipelineScriptTests(unittest.TestCase):
     def formal_config(stage, version=TRAINING_STRATEGY_VERSION):
         args = {"pred_len": 20}
         args["input_len" if stage == "baseline" else "history_len"] = 32
+        args["batch_size"] = 128 if stage == "baseline" else 64
         return {"training_strategy_version": version, "args": args}
 
     @staticmethod
@@ -553,6 +579,7 @@ class PipelineScriptTests(unittest.TestCase):
         self.assertIn('BATCH_SIZE="${BATCH_SIZE:-64}"', text)
         self.assertIn('ABLATION_BATCH_SIZE="${ABLATION_BATCH_SIZE:-64}"', text)
         self.assertIn('BASELINE_BATCH_SIZE="${BASELINE_BATCH_SIZE:-128}"', text)
+        self.assertIn('CACHE_TASK_BATCH_SIZE="${CACHE_TASK_BATCH_SIZE:-128}"', text)
         self.assertIn('BATTERY_GRAPH_CACHE_DIR:-runs/cache/battery_graph', text)
         for setting in (
             "OMP_NUM_THREADS",
@@ -572,6 +599,7 @@ class PipelineScriptTests(unittest.TestCase):
             self.assertIn("run_config.json", text, path)
             self.assertIn("test_metrics.json", text, path)
             self.assertIn("v3-source-profiles-main-adaptive", text, path)
+            self.assertIn("-batch64", text, path)
             self.assertIn("run-config-matches", text, path)
             self.assertNotIn("grep", text, path)
             self.assertNotIn("${OUT_ROOT}/cache/battery_graph", text, path)
@@ -595,6 +623,58 @@ class PipelineScriptTests(unittest.TestCase):
         baseline = Path("scripts/run_battery_official_baselines.sh").read_text(encoding="utf-8")
         self.assertIn('BATCH_SIZE="${BASELINE_BATCH_SIZE:-128}"', baseline)
         self.assertIn('NUM_WORKERS="${BASELINE_NUM_WORKERS:-8}"', baseline)
+
+    def test_cache_task_batch_is_independent_of_training_batch(self):
+        main = Path("scripts/run_battery_main_full_hf.sh").read_text(encoding="utf-8")
+        ablations = Path("scripts/run_battery_ablations_full_hf.sh").read_text(encoding="utf-8")
+        pipeline = Path("scripts/run_battery_v3_training_strategy_pipeline.sh").read_text(encoding="utf-8")
+        self.assertIn('CACHE_TASK_BATCH_SIZE="${CACHE_TASK_BATCH_SIZE:-128}"', main)
+        self.assertIn('--batch_size "$CACHE_TASK_BATCH_SIZE"', main)
+        self.assertIn('CACHE_TASK_BATCH_SIZE="${CACHE_TASK_BATCH_SIZE:-128}"', ablations)
+        self.assertIn('--cache_task_batch_size "$CACHE_TASK_BATCH_SIZE"', ablations)
+        self.assertIn('CACHE_TASK_BATCH_SIZE="${CACHE_TASK_BATCH_SIZE:-128}"', pipeline)
+        self.assertIn("export CACHE_TASK_BATCH_SIZE", pipeline)
+
+    def test_legacy_battery_shell_entrypoints_preflight_formal_batch_and_cache_settings(self):
+        for path, stage, cache_arg in (
+            (Path("scripts/run_battery_main.sh"), "main", '--batch_size "$CACHE_TASK_BATCH_SIZE"'),
+            (Path("scripts/run_battery_ablations.sh"), "ablation", '--cache_task_batch_size "$CACHE_TASK_BATCH_SIZE"'),
+        ):
+            with self.subTest(path=path):
+                text = path.read_text(encoding="utf-8")
+                self.assertIn('CACHE_TASK_BATCH_SIZE="${CACHE_TASK_BATCH_SIZE:-128}"', text)
+                self.assertIn('NUM_WORKERS="${NUM_WORKERS:-16}"', text)
+                self.assertIn('CONTROL_PY="${CONTROL_PY:-python}"', text)
+                self.assertIn("validate-formal-protocol", text)
+                self.assertIn('--batch-size "$BATCH_SIZE"', text)
+                self.assertIn(f"--stage {stage}", text)
+                self.assertIn('--cache-task-batch-size "$CACHE_TASK_BATCH_SIZE"', text)
+                self.assertIn(cache_arg, text)
+
+    def test_ablation_precompute_uses_cache_task_batch_size(self):
+        commands = []
+        with TemporaryDirectory() as tmp:
+            with patch.object(
+                sys,
+                "argv",
+                [
+                    "run_ablation_suite",
+                    "--variant", "battery",
+                    "--dataset", "mit",
+                    "--out_root", str(Path(tmp) / "out"),
+                    "--batch_size", "64",
+                    "--cache_task_batch_size", "128",
+                    "--precomputed_cache_dir", str(Path(tmp) / "cache"),
+                    "--no_hf_text",
+                ],
+            ), patch("bstalignment.run_ablation_suite.subprocess.run", side_effect=lambda command, check: commands.append(command)), patch("builtins.print"):
+                ablation_suite.main()
+        precompute_commands = [
+            command for command in commands if any("precompute_battery_graph_cache" in part for part in command)
+        ]
+        self.assertTrue(precompute_commands)
+        for command in precompute_commands:
+            self.assertEqual(command[command.index("--batch_size") + 1], "128")
 
     def test_baseline_script_does_not_force_profile_budgets(self):
         text = Path("scripts/run_battery_official_baselines.sh").read_text(encoding="utf-8")
@@ -650,13 +730,13 @@ class PipelineScriptTests(unittest.TestCase):
             "wrong_protocol": json.dumps(
                 {
                     "training_strategy_version": TRAINING_STRATEGY_VERSION,
-                    "args": {"history_len": 31, "input_len": 31, "pred_len": 20},
+                    "args": {"history_len": 31, "input_len": 31, "pred_len": 20, "batch_size": 64},
                 }
             ),
             "wrong_type": json.dumps(
                 {
                     "training_strategy_version": TRAINING_STRATEGY_VERSION,
-                    "args": {"history_len": "32", "input_len": "32", "pred_len": True},
+                    "args": {"history_len": "32", "input_len": "32", "pred_len": True, "batch_size": "64"},
                 }
             ),
         }
@@ -791,6 +871,7 @@ class AblationCompletionPolicyTests(unittest.TestCase):
 
     def formal_config(self, **args):
         protocol_args = {"history_len": 32, "pred_len": 20}
+        protocol_args["batch_size"] = 64
         protocol_args.update(args)
         return {"training_strategy_version": self.strategy_version, "args": protocol_args}
 
@@ -873,7 +954,7 @@ class AblationCompletionPolicyTests(unittest.TestCase):
                 nested_decoy / "run_config.json",
                 {
                     "training_strategy_version": "v2-legacy",
-                    "args": {"history_len": 32, "pred_len": 20},
+                    "args": {"history_len": 32, "pred_len": 20, "batch_size": 64},
                     "decoy": {"training_strategy_version": self.strategy_version},
                 },
             )
@@ -1135,6 +1216,14 @@ class MainTrainerPolicyTests(unittest.TestCase):
             Path("bstalignment/train_graph_report.py"),
         ):
             self.assertIn("require_checkpoint_strategy_version", path.read_text(encoding="utf-8"), path)
+
+    def test_batch_128_checkpoint_version_is_rejected(self):
+        self.assertEqual(TRAINING_STRATEGY_VERSION, "v3-source-profiles-main-adaptive-fixed-horizon-train-scale-batch64")
+        with self.assertRaisesRegex(RuntimeError, "training strategy version"):
+            training_strategy.require_checkpoint_strategy_version(
+                {"training_strategy_version": "v3-source-profiles-main-adaptive-fixed-horizon-train-scale"},
+                "fixture trainer",
+            )
 
     def test_stale_count_starts_at_epoch_20_and_stops_after_20_failures(self):
         stale = update_graph_report_stale(

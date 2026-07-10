@@ -13,10 +13,11 @@ BATTERY_INPUT_CYCLES = 32
 BATTERY_PREDICTION_CYCLES = 20
 BATTERY_TARGET_PROTOCOL = "32-observed-20-future-only-full-horizon"
 BATTERY_CYCLE_SCALE_PROTOCOL = "train-split-max-cycle-id-no-clip"
+FORMAL_CACHE_TASK_BATCH_SIZE = 128
 FORMAL_RUN_PROTOCOL_FIELDS: Dict[str, Dict[str, int]] = {
-    "main": {"history_len": BATTERY_INPUT_CYCLES, "pred_len": BATTERY_PREDICTION_CYCLES},
-    "baseline": {"input_len": BATTERY_INPUT_CYCLES, "pred_len": BATTERY_PREDICTION_CYCLES},
-    "ablation": {"history_len": BATTERY_INPUT_CYCLES, "pred_len": BATTERY_PREDICTION_CYCLES},
+    "main": {"history_len": BATTERY_INPUT_CYCLES, "pred_len": BATTERY_PREDICTION_CYCLES, "batch_size": 64},
+    "baseline": {"input_len": BATTERY_INPUT_CYCLES, "pred_len": BATTERY_PREDICTION_CYCLES, "batch_size": 128},
+    "ablation": {"history_len": BATTERY_INPUT_CYCLES, "pred_len": BATTERY_PREDICTION_CYCLES, "batch_size": 64},
 }
 
 
@@ -24,14 +25,30 @@ def require_formal_battery_protocol(
     *,
     observed_cycles: int,
     prediction_cycles: int,
+    batch_size: int,
+    stage: str,
     context: str,
 ) -> None:
-    if observed_cycles == BATTERY_INPUT_CYCLES and prediction_cycles == BATTERY_PREDICTION_CYCLES:
+    if stage not in FORMAL_RUN_PROTOCOL_FIELDS:
+        raise ValueError(f"Unknown formal battery stage: {stage}")
+    if observed_cycles != BATTERY_INPUT_CYCLES or prediction_cycles != BATTERY_PREDICTION_CYCLES:
+        raise ValueError(
+            f"{context} requires exactly {BATTERY_INPUT_CYCLES} observed cycles and "
+            f"{BATTERY_PREDICTION_CYCLES} future-only targets; got "
+            f"observed_cycles={observed_cycles}, prediction_cycles={prediction_cycles}"
+        )
+    expected_batch_size = FORMAL_RUN_PROTOCOL_FIELDS[stage]["batch_size"]
+    if type(batch_size) is not int or batch_size != expected_batch_size:
+        raise ValueError(
+            f"{context} requires formal {stage} batch_size={expected_batch_size}; got batch_size={batch_size!r}"
+        )
+
+
+def require_formal_cache_task_batch_size(*, batch_size: int, context: str) -> None:
+    if type(batch_size) is int and batch_size == FORMAL_CACHE_TASK_BATCH_SIZE:
         return
     raise ValueError(
-        f"{context} requires exactly {BATTERY_INPUT_CYCLES} observed cycles and "
-        f"{BATTERY_PREDICTION_CYCLES} future-only targets; got "
-        f"observed_cycles={observed_cycles}, prediction_cycles={prediction_cycles}"
+        f"{context} requires CACHE_TASK_BATCH_SIZE={FORMAL_CACHE_TASK_BATCH_SIZE}; got batch_size={batch_size!r}"
     )
 
 
@@ -70,6 +87,9 @@ def _parse_cli_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     validate = subparsers.add_parser("validate-formal-protocol")
     validate.add_argument("--observed-cycles", type=int, required=True)
     validate.add_argument("--prediction-cycles", type=int, required=True)
+    validate.add_argument("--batch-size", type=int, required=True)
+    validate.add_argument("--stage", choices=sorted(FORMAL_RUN_PROTOCOL_FIELDS), required=True)
+    validate.add_argument("--cache-task-batch-size", type=int)
     validate.add_argument("--context", required=True)
 
     match = subparsers.add_parser("run-config-matches")
@@ -91,8 +111,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         require_formal_battery_protocol(
             observed_cycles=args.observed_cycles,
             prediction_cycles=args.prediction_cycles,
+            batch_size=args.batch_size,
+            stage=args.stage,
             context=args.context,
         )
+        if args.cache_task_batch_size is not None:
+            require_formal_cache_task_batch_size(
+                batch_size=args.cache_task_batch_size,
+                context=args.context,
+            )
     except ValueError as exc:
         print(exc, file=sys.stderr)
         return 2

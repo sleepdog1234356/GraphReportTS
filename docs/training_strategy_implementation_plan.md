@@ -96,7 +96,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-TRAINING_STRATEGY_VERSION = "v3-source-profiles-main-adaptive"
+TRAINING_STRATEGY_VERSION = "v3-source-profiles-main-adaptive-fixed-horizon-train-scale-batch64"
 
 
 @dataclass(frozen=True)
@@ -614,7 +614,7 @@ git commit -m "Apply adaptive training to main and ablations"
 - Modify: `tests/test_training_strategy.py`
 
 **Interfaces:**
-- Consumes: `TRAINING_STRATEGY_VERSION = "v3-source-profiles-main-adaptive"`
+- Consumes: `TRAINING_STRATEGY_VERSION = "v3-source-profiles-main-adaptive-fixed-horizon-train-scale-batch64"`
 - Produces: main -> baselines -> ablations orchestration under the v3 output root
 
 - [ ] **Step 1: Add failing script-contract tests**

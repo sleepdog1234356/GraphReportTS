@@ -374,7 +374,7 @@ def parse_args():
     p.add_argument("--hf_gpt2_model", type=str, default="openai-community/gpt2")
     p.add_argument("--hf_bert_model", type=str, default="google-bert/bert-base-uncased")
     p.add_argument("--epochs", type=int, default=None)
-    p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--batch_size", type=int, default=128)
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--weight_decay", type=float, default=None)
@@ -391,6 +391,8 @@ def main():
     require_formal_battery_protocol(
         observed_cycles=args.input_len,
         prediction_cycles=args.pred_len,
+        batch_size=args.batch_size,
+        stage="baseline",
         context="Official battery baseline trainer",
     )
     profile = resolve_baseline_profile(args)

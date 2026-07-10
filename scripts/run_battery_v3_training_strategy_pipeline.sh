@@ -6,6 +6,7 @@ OUT_ROOT="${OUT_ROOT:-runs/full_hf_v3_training_strategy_nosoh}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 ABLATION_BATCH_SIZE="${ABLATION_BATCH_SIZE:-64}"
 BASELINE_BATCH_SIZE="${BASELINE_BATCH_SIZE:-128}"
+CACHE_TASK_BATCH_SIZE="${CACHE_TASK_BATCH_SIZE:-128}"
 PRED_LEN="${PRED_LEN:-20}"
 HISTORY_LEN="${HISTORY_LEN:-32}"
 INPUT_LEN="${INPUT_LEN:-32}"
@@ -22,10 +23,22 @@ CONTROL_PY="${CONTROL_PY:-python}"
 $CONTROL_PY -m bstalignment.battery_protocol validate-formal-protocol \
   --observed-cycles "$HISTORY_LEN" \
   --prediction-cycles "$PRED_LEN" \
-  --context "Formal v3 pipeline main and ablation stages"
+  --batch-size "$BATCH_SIZE" \
+  --stage main \
+  --cache-task-batch-size "$CACHE_TASK_BATCH_SIZE" \
+  --context "Formal v3 pipeline main stage"
+$CONTROL_PY -m bstalignment.battery_protocol validate-formal-protocol \
+  --observed-cycles "$HISTORY_LEN" \
+  --prediction-cycles "$PRED_LEN" \
+  --batch-size "$ABLATION_BATCH_SIZE" \
+  --stage ablation \
+  --cache-task-batch-size "$CACHE_TASK_BATCH_SIZE" \
+  --context "Formal v3 pipeline ablation stage"
 $CONTROL_PY -m bstalignment.battery_protocol validate-formal-protocol \
   --observed-cycles "$INPUT_LEN" \
   --prediction-cycles "$PRED_LEN" \
+  --batch-size "$BASELINE_BATCH_SIZE" \
+  --stage baseline \
   --context "Formal v3 pipeline baseline stage"
 mkdir -p "$OUT_ROOT/logs"
 
@@ -33,6 +46,7 @@ export OUT_ROOT
 export BATCH_SIZE
 export ABLATION_BATCH_SIZE
 export BASELINE_BATCH_SIZE
+export CACHE_TASK_BATCH_SIZE
 export PRED_LEN
 export HISTORY_LEN
 export INPUT_LEN

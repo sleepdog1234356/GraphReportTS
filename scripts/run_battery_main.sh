@@ -4,14 +4,23 @@ set -euo pipefail
 ROOT="${1:-$(pwd)}"
 EPOCHS="${EPOCHS:-80}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
+CACHE_TASK_BATCH_SIZE="${CACHE_TASK_BATCH_SIZE:-128}"
 PRED_LEN="${PRED_LEN:-20}"
 HISTORY_LEN="${HISTORY_LEN:-32}"
-NUM_WORKERS="${NUM_WORKERS:-2}"
+NUM_WORKERS="${NUM_WORKERS:-16}"
 W_ALIGN="${W_ALIGN:-0.001}"
 ALIGN_WARMUP_EPOCHS="${ALIGN_WARMUP_EPOCHS:-0}"
 USE_GRAPH_CACHE="${USE_BATTERY_GRAPH_CACHE:-1}"
 GRAPH_CACHE_DIR="${BATTERY_GRAPH_CACHE_DIR:-runs/cache/battery_graph}"
 cd "$ROOT"
+CONTROL_PY="${CONTROL_PY:-python}"
+$CONTROL_PY -m bstalignment.battery_protocol validate-formal-protocol \
+  --observed-cycles "$HISTORY_LEN" \
+  --prediction-cycles "$PRED_LEN" \
+  --batch-size "$BATCH_SIZE" \
+  --stage main \
+  --cache-task-batch-size "$CACHE_TASK_BATCH_SIZE" \
+  --context "GraphReportTS main runner"
 mkdir -p runs/logs
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
@@ -32,7 +41,7 @@ for dataset in mit calce xjtu; do
       --cache_dir "$GRAPH_CACHE_DIR" \
       --pred_len "$PRED_LEN" \
       --history_len "$HISTORY_LEN" \
-      --batch_size "$BATCH_SIZE" \
+      --batch_size "$CACHE_TASK_BATCH_SIZE" \
       --num_workers "$NUM_WORKERS" \
       --splits train val test
     CACHE_ARGS=(--precomputed_cache_dir "$GRAPH_CACHE_DIR" --require_precomputed_cache)
