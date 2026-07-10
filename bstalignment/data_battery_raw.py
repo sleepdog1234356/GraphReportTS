@@ -63,6 +63,23 @@ BATTERY_HISTORY_FEATURE_SCHEMA = [
     "charge_time_delta",
 ]
 BATTERY_HISTORY_FEATURE_DIM = len(BATTERY_HISTORY_FEATURE_SCHEMA)
+SEQUENCE_CACHE_ARRAY_ATTRS = (
+    "_cache_cycle_sequences",
+    "_cache_history_indices",
+    "_cache_y",
+    "_cache_mask",
+    "_cache_horizon",
+    "_cache_target_steps",
+    "_cache_history_features",
+    "_cache_history_cycles",
+)
+
+
+def _close_memmaps(arrays: Sequence[Any]) -> None:
+    for array in arrays:
+        mapping = getattr(array, "_mmap", None)
+        if mapping is not None and not mapping.closed:
+            mapping.close()
 
 
 def battery_graph_cache_config(
@@ -416,13 +433,15 @@ class BatteryRawGraphDataset(Dataset):
             return False
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return False
-        if (
-            manifest.get("layout") != "cycle_sequence_history"
-            or manifest.get("config") != self.sequence_cache_config
-        ):
-            return False
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Invalid battery sequence cache at {cache_path}: manifest: {exc}") from exc
+        if manifest.get("layout") != "cycle_sequence_history":
+            raise ValueError(
+                f"Invalid battery sequence cache at {cache_path}: layout mismatch; "
+                f"expected cycle_sequence_history, got {manifest.get('layout')!r}"
+            )
+        if manifest.get("config") != self.sequence_cache_config:
+            raise ValueError(f"Invalid battery sequence cache at {cache_path}: config mismatch")
         files = manifest.get("files", {})
         required = [
             "cycle_sequences",
@@ -435,33 +454,134 @@ class BatteryRawGraphDataset(Dataset):
             "history_cycles",
             "meta",
         ]
-        if any(not (cache_path / str(files.get(name, ""))).exists() for name in required):
-            return False
+        missing = [name for name in required if not (cache_path / str(files.get(name, ""))).exists()]
+        if missing:
+            raise FileNotFoundError(
+                f"Invalid battery sequence cache at {cache_path}: missing required files {missing}"
+            )
+        sample_count = manifest.get("sample_count")
+        cycle_count = manifest.get("cycle_count")
+        if not isinstance(sample_count, int) or isinstance(sample_count, bool) or sample_count <= 0:
+            raise ValueError(
+                f"Invalid battery sequence cache at {cache_path}: sample_count must be a positive integer, got {sample_count!r}"
+            )
+        if not isinstance(cycle_count, int) or isinstance(cycle_count, bool) or cycle_count <= 0:
+            raise ValueError(
+                f"Invalid battery sequence cache at {cache_path}: cycle_count must be a positive integer, got {cycle_count!r}"
+            )
+        expected_cycle_shape = [self.resample_len, 6]
+        if manifest.get("cycle_sequence_shape") != expected_cycle_shape:
+            raise ValueError(
+                f"Invalid battery sequence cache at {cache_path}: cycle_sequence_shape mismatch; "
+                f"expected {expected_cycle_shape}, got {manifest.get('cycle_sequence_shape')!r}"
+            )
+        try:
+            with (cache_path / files["meta"]).open("r", encoding="utf-8") as f:
+                cache_meta = [json.loads(line) for line in f if line.strip()]
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"Invalid battery sequence cache at {cache_path}: meta parse mismatch: {exc}"
+            ) from exc
+        if len(cache_meta) != sample_count:
+            raise ValueError(
+                f"Invalid battery sequence cache at {cache_path}: sample_count mismatch; "
+                f"manifest has {sample_count}, meta has {len(cache_meta)}"
+            )
+        arrays = {}
+        for name in required:
+            if name == "meta":
+                continue
+            try:
+                arrays[name] = np.load(cache_path / files[name], mmap_mode="r")
+            except (OSError, ValueError) as exc:
+                _close_memmaps(list(arrays.values()))
+                raise ValueError(
+                    f"Invalid battery sequence cache at {cache_path}: {name} load mismatch: {exc}"
+                ) from exc
+        try:
+            if arrays["cycle_sequences"].shape[0] != cycle_count:
+                raise ValueError(
+                    f"Invalid battery sequence cache at {cache_path}: cycle_count mismatch; "
+                    f"manifest has {cycle_count}, cycle_sequences has {arrays['cycle_sequences'].shape[0]}"
+                )
+            expected_arrays = {
+                "cycle_sequences": ((cycle_count, self.resample_len, 6), np.dtype(np.float32)),
+                "history_indices": ((sample_count, self.history_len), np.dtype(np.int64)),
+                "y": ((sample_count, self.max_horizon), np.dtype(np.float32)),
+                "mask": ((sample_count, self.max_horizon), np.dtype(np.bool_)),
+                "horizon": ((sample_count,), np.dtype(np.int64)),
+                "target_steps": ((sample_count, self.max_horizon), np.dtype(np.int64)),
+                "history_features": (
+                    (sample_count, self.history_len, BATTERY_HISTORY_FEATURE_DIM),
+                    np.dtype(np.float32),
+                ),
+                "history_cycles": ((sample_count, self.history_len), np.dtype(np.int64)),
+            }
+            for name, (expected_shape, expected_dtype) in expected_arrays.items():
+                array = arrays[name]
+                if tuple(array.shape) != expected_shape:
+                    raise ValueError(
+                        f"Invalid battery sequence cache at {cache_path}: {name} shape mismatch; "
+                        f"expected {expected_shape}, got {tuple(array.shape)}"
+                    )
+                if array.dtype != expected_dtype:
+                    raise ValueError(
+                        f"Invalid battery sequence cache at {cache_path}: {name} dtype mismatch; "
+                        f"expected {expected_dtype}, got {array.dtype}"
+                    )
+            history_indices = arrays["history_indices"]
+            if np.any(history_indices < 0) or np.any(history_indices >= cycle_count):
+                raise ValueError(
+                    f"Invalid battery sequence cache at {cache_path}: history_indices bounds mismatch; "
+                    f"valid range is [0, {cycle_count})"
+                )
+            horizon = arrays["horizon"]
+            if np.any(horizon != self.max_horizon):
+                values = np.unique(horizon).tolist()
+                raise ValueError(
+                    f"Invalid battery sequence cache at {cache_path}: horizon violates formal horizon "
+                    f"{self.max_horizon}; got {values}"
+                )
+        except Exception:
+            _close_memmaps(list(arrays.values()))
+            raise
         self._cache_path = cache_path
         self._cache_layout = "cycle_sequence_history"
-        self._cache_cycle_sequences = np.load(cache_path / files["cycle_sequences"])
-        self._cache_history_indices = np.load(cache_path / files["history_indices"])
-        self._cache_y = np.load(cache_path / files["y"])
-        self._cache_mask = np.load(cache_path / files["mask"])
-        self._cache_horizon = np.load(cache_path / files["horizon"])
-        self._cache_target_steps = np.load(cache_path / files["target_steps"])
-        self._cache_history_features = np.load(cache_path / files["history_features"])
-        self._cache_history_cycles = np.load(cache_path / files["history_cycles"])
-        with (cache_path / files["meta"]).open("r", encoding="utf-8") as f:
-            self._cache_meta = [json.loads(line) for line in f if line.strip()]
-        sample_count = int(manifest.get("sample_count", -1))
-        if (
-            sample_count < 0
-            or sample_count != len(self._cache_meta)
-            or sample_count != int(self._cache_y.shape[0])
-        ):
-            return False
+        self._cache_cycle_sequences = arrays["cycle_sequences"]
+        self._cache_history_indices = history_indices
+        self._cache_y = arrays["y"]
+        self._cache_mask = arrays["mask"]
+        self._cache_horizon = horizon
+        self._cache_target_steps = arrays["target_steps"]
+        self._cache_history_features = arrays["history_features"]
+        self._cache_history_cycles = arrays["history_cycles"]
+        self._cache_meta = cache_meta
         self.cycle_scale = float(manifest.get("cycle_scale", 1.0))
         self._precomputed = True
         self.samples = []
         self.records = []
         self.processed_cells = []
         return True
+
+    def close(self) -> None:
+        if getattr(self, "_cache_layout", None) != "cycle_sequence_history":
+            return
+        arrays = [getattr(self, name, None) for name in SEQUENCE_CACHE_ARRAY_ATTRS]
+        _close_memmaps(arrays)
+        for name in SEQUENCE_CACHE_ARRAY_ATTRS:
+            setattr(self, name, None)
+
+    def __enter__(self) -> "BatteryRawGraphDataset":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _try_load_precomputed_cache(self) -> bool:
         if self.precomputed_cache_dir is None:

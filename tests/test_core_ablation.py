@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from argparse import Namespace
+import json
 from pathlib import Path
+import re
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -10,6 +12,7 @@ import numpy as np
 import torch
 
 import bstalignment.data_battery_raw as battery_data
+import bstalignment.precompute_battery_sequence_cache as sequence_cache_precompute
 from bstalignment.data_battery_raw import BatteryRawGraphDataset, collate_graph_report_batch
 from bstalignment.precompute_battery_sequence_cache import precompute_sequence_split
 from bstalignment.raw_signal import (
@@ -233,25 +236,43 @@ class SequenceDatasetTests(unittest.TestCase):
 
 
 class SequenceCacheTests(unittest.TestCase):
+    @staticmethod
+    def _args(root: Path, *, batch_size: int = 4, num_workers: int = 0) -> Namespace:
+        return Namespace(
+            dataset="calce",
+            data_root=str(root),
+            cache_dir=str(root / "sequence_cache"),
+            pred_len=20,
+            history_len=32,
+            resample_len=16,
+            seed=42,
+            max_cycles=None,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            force=True,
+        )
+
+    @staticmethod
+    def _cached_kwargs(root: Path) -> dict:
+        return {
+            "dataset_name": "calce",
+            "data_root": root,
+            "split": "train",
+            "history_len": 32,
+            "max_horizon": 20,
+            "resample_len": 16,
+            "input_representation": "sequence",
+            "precomputed_sequence_cache_dir": str(root / "sequence_cache"),
+            "require_precomputed_sequence_cache": True,
+        }
+
     def test_sequence_cache_matches_direct_dataset_without_map_calls(self):
         from tests.test_training_strategy import BatteryDataFixtureMixin
 
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             BatteryDataFixtureMixin.write_processed_data(root, [1, 1, 1, 1])
-            args = Namespace(
-                dataset="calce",
-                data_root=str(root),
-                cache_dir=str(root / "sequence_cache"),
-                pred_len=20,
-                history_len=32,
-                resample_len=16,
-                seed=42,
-                max_cycles=None,
-                batch_size=4,
-                num_workers=0,
-                force=True,
-            )
+            args = self._args(root)
             with patch(
                 "bstalignment.data_battery_raw.build_multiview_maps",
                 side_effect=AssertionError("graph path called"),
@@ -266,19 +287,173 @@ class SequenceCacheTests(unittest.TestCase):
                 resample_len=16,
                 input_representation="sequence",
             )
-            cached = BatteryRawGraphDataset(
-                dataset_name="calce",
-                data_root=root,
-                split="train",
-                history_len=32,
-                max_horizon=20,
-                resample_len=16,
-                input_representation="sequence",
-                precomputed_sequence_cache_dir=str(root / "sequence_cache"),
-                require_precomputed_sequence_cache=True,
-            )
             self.assertTrue(cache_path.exists())
-            self.assertEqual(len(cached), len(direct))
-            for key in ("raw_sequences", "y", "mask", "target_steps", "history_features", "history_cycles"):
-                torch.testing.assert_close(cached[0][key], direct[0][key], rtol=0.0, atol=0.0)
-            self.assertEqual(cached[0]["prompt"], direct[0]["prompt"])
+            with BatteryRawGraphDataset(**self._cached_kwargs(root)) as cached:
+                self.assertEqual(len(cached), len(direct))
+                cached_arrays = (
+                    cached._cache_cycle_sequences,
+                    cached._cache_history_indices,
+                    cached._cache_y,
+                    cached._cache_mask,
+                    cached._cache_horizon,
+                    cached._cache_target_steps,
+                    cached._cache_history_features,
+                    cached._cache_history_cycles,
+                )
+                self.assertTrue(all(isinstance(array, np.memmap) for array in cached_arrays))
+                for index in range(len(direct)):
+                    from_cache = cached[index]
+                    direct_item = direct[index]
+                    for key in (
+                        "raw_sequences",
+                        "y",
+                        "mask",
+                        "target_steps",
+                        "history_features",
+                        "history_cycles",
+                    ):
+                        torch.testing.assert_close(
+                            from_cache[key], direct_item[key], rtol=0.0, atol=0.0
+                        )
+                    self.assertEqual(from_cache["prompt"], direct_item["prompt"])
+            self.assertTrue(all(array._mmap.closed for array in cached_arrays))
+
+    def test_missing_required_sequence_cache_names_expected_path(self):
+        from tests.test_training_strategy import BatteryDataFixtureMixin
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            BatteryDataFixtureMixin.write_processed_data(root, [1, 1, 1, 1])
+            with self.assertRaisesRegex(
+                FileNotFoundError,
+                rf"Required battery sequence cache.*{re.escape(str(root / 'sequence_cache'))}",
+            ):
+                BatteryRawGraphDataset(**self._cached_kwargs(root))
+
+    def test_corrupted_sequence_cache_is_rejected_before_activation(self):
+        from tests.test_training_strategy import BatteryDataFixtureMixin
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            BatteryDataFixtureMixin.write_processed_data(root, [1, 1, 1, 1])
+            cache_path = precompute_sequence_split(self._args(root), "train")
+            manifest_path = cache_path / "manifest.json"
+            original_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            meta_path = cache_path / original_manifest["files"]["meta"]
+            original_meta = meta_path.read_text(encoding="utf-8")
+            array_files = {
+                name: cache_path / filename
+                for name, filename in original_manifest["files"].items()
+                if name != "meta"
+            }
+            original_arrays = {name: np.load(path).copy() for name, path in array_files.items()}
+
+            def save_wrong_shape(name):
+                array = original_arrays[name]
+                corrupted = array[:, :-1] if name == "cycle_sequences" else array[:-1]
+                np.save(array_files[name], corrupted)
+
+            cases = [
+                ("manifest sample_count", "sample_count", lambda manifest, arrays: manifest.__setitem__("sample_count", manifest["sample_count"] + 1)),
+                ("manifest cycle_count", "cycle_count", lambda manifest, arrays: manifest.__setitem__("cycle_count", manifest["cycle_count"] + 1)),
+                ("manifest cycle_sequence_shape", "cycle_sequence_shape", lambda manifest, arrays: manifest.__setitem__("cycle_sequence_shape", [15, 6])),
+            ]
+            for name in array_files:
+                cases.append(
+                    (
+                        f"{name} shape",
+                        rf"{name}.*shape",
+                        lambda manifest, arrays, key=name: save_wrong_shape(key),
+                    )
+                )
+                wrong_dtype = {
+                    np.dtype(np.float32): np.float64,
+                    np.dtype(np.int64): np.int32,
+                    np.dtype(np.bool_): np.uint8,
+                }[original_arrays[name].dtype]
+                cases.append(
+                    (
+                        f"{name} dtype",
+                        rf"{name}.*dtype",
+                        lambda manifest, arrays, key=name, dtype=wrong_dtype: np.save(
+                            array_files[key], arrays[key].astype(dtype)
+                        ),
+                    )
+                )
+            cases.extend(
+                [
+                    (
+                        "history index bounds",
+                        "history_indices.*bounds",
+                        lambda manifest, arrays: np.save(
+                            array_files["history_indices"],
+                            np.full_like(arrays["history_indices"], manifest["cycle_count"]),
+                        ),
+                    ),
+                    (
+                        "formal horizon",
+                        "horizon.*formal",
+                        lambda manifest, arrays: np.save(
+                            array_files["horizon"],
+                            np.full_like(arrays["horizon"], 19),
+                        ),
+                    ),
+                    (
+                        "unreadable array",
+                        "y.*load",
+                        lambda manifest, arrays: array_files["y"].write_bytes(b"not a numpy file"),
+                    ),
+                    (
+                        "malformed meta",
+                        "meta",
+                        lambda manifest, arrays: meta_path.write_text("{", encoding="utf-8"),
+                    ),
+                ]
+            )
+
+            for label, mismatch, corrupt in cases:
+                with self.subTest(label=label):
+                    manifest = json.loads(json.dumps(original_manifest))
+                    for name, path in array_files.items():
+                        np.save(path, original_arrays[name])
+                    meta_path.write_text(original_meta, encoding="utf-8")
+                    corrupt(manifest, original_arrays)
+                    manifest_path.write_text(
+                        json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        rf"{re.escape(str(cache_path))}.*{mismatch}",
+                    ):
+                        BatteryRawGraphDataset(**self._cached_kwargs(root))
+
+    def test_parallel_sequence_results_submit_only_batch_sized_chunks(self):
+        class FakeSequenceDataset:
+            input_representation = "sequence"
+            processed_cells = [object()]
+
+            @staticmethod
+            def _processed_cycle_input(cell, row_idx):
+                return np.full((2, 6), row_idx, dtype=np.float32), ["channel"]
+
+        submitted_sizes = []
+        real_executor = sequence_cache_precompute.ThreadPoolExecutor
+
+        class RecordingExecutor(real_executor):
+            def map(self, fn, *iterables, **kwargs):
+                items = list(iterables[0])
+                submitted_sizes.append(len(items))
+                return super().map(fn, items, **kwargs)
+
+        cycle_items = [
+            (index, ("cell", index), ("processed", 0, index))
+            for index in range(7)
+        ]
+        with patch.object(sequence_cache_precompute, "ThreadPoolExecutor", RecordingExecutor):
+            results = list(
+                sequence_cache_precompute._sequence_results(
+                    FakeSequenceDataset(), cycle_items, num_workers=2, batch_size=3
+                )
+            )
+        self.assertEqual([result[0] for result in results], list(range(7)))
+        self.assertEqual(submitted_sizes, [3, 3, 1])

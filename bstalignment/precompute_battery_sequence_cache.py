@@ -107,7 +107,12 @@ def _entry_sequence(
     return values, names
 
 
-def _sequence_results(ds, cycle_items, num_workers):
+def _cycle_item_batches(cycle_items, batch_size):
+    for start in range(0, len(cycle_items), batch_size):
+        yield cycle_items[start : start + batch_size]
+
+
+def _sequence_results(ds, cycle_items, num_workers, batch_size):
     def compute(item):
         cycle_idx, key, entry = item
         values, names = _entry_sequence(ds, entry)
@@ -118,7 +123,8 @@ def _sequence_results(ds, cycle_items, num_workers):
             yield compute(item)
         return
     with ThreadPoolExecutor(max_workers=num_workers) as pool:
-        yield from pool.map(compute, cycle_items)
+        for batch in _cycle_item_batches(cycle_items, batch_size):
+            yield from pool.map(compute, batch)
 
 
 def precompute_sequence_split(args: argparse.Namespace, split: str) -> Path:
@@ -226,7 +232,12 @@ def precompute_sequence_split(args: argparse.Namespace, split: str) -> Path:
 
     key_to_cycle_idx: Dict[tuple[str, int], int] = {}
     for cycle_idx, key, values, _ in tqdm(
-        _sequence_results(ds, cycle_items, int(args.num_workers)),
+        _sequence_results(
+            ds,
+            cycle_items,
+            int(args.num_workers),
+            int(args.batch_size),
+        ),
         total=len(cycle_items),
         desc=f"cycle sequences {args.dataset}/{split}",
     ):
