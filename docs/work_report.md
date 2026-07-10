@@ -6,7 +6,7 @@ Updated: 2026-07-10
 
 This project builds GraphReportTS for battery SOH forecasting and general time-series forecasting. The battery setting is the current focus: train the main model on MIT, CALCE, and XJTU; compare against strong time-series baselines; and run ablations that measure the contribution of each model component.
 
-As of 2026-07-10, the full-HF baseline comparison had completed on the remote server under the earlier input contract. That contract included historical SOH in the baseline sequence inputs and in the first v2 numeric-history branch, so the first `runs/full_hf_v2` attempt was stopped. The formal rerun now uses the no-historical-SOH contract under `runs/full_hf_v2_nosoh`, and official baselines must be retrained because their input features changed. The corrected formal pipeline is full retraining: official baselines, main models, and ablations all rerun from scratch, without smoke subsets, short ablation epochs, skipped completed runs, or lightweight no-HF paths.
+As of 2026-07-10, earlier full-HF comparisons and the stopped `runs/full_hf_v2` attempt are legacy references. The earlier input contract included historical SOH in baseline sequence inputs and in the first v2 numeric-history branch; later v2 no-SOH runs still used a unified fixed AdamW/SmoothL1/no scheduler baseline loop. Their metrics are not formal v3 results. The formal no-historical-SOH rerun uses `runs/full_hf_v3_training_strategy_nosoh` and the full v3 protocol: main -> baselines -> ablations, with source-native baseline profiles and adaptive GraphReportTS training.
 
 ## 2. Current Main Model
 
@@ -22,9 +22,9 @@ GraphReportTS uses a raw-signal pipeline instead of only low-dimensional cycle s
 
 The battery model is implemented in `bstalignment/graph_report_model.py`, with raw-signal mapping in `bstalignment/raw_signal.py` and training in `bstalignment/train_graph_report.py`.
 
-## 2.1 Planned Battery-GraphReportTS V2
+## 2.1 Battery-GraphReportTS Architecture Retained In V3
 
-The v2 design is intended to address the MIT/XJTU gap against PatchTST, iTransformer, TimesNet, and other sequence baselines. It should not be simplified during implementation.
+The multi-cycle design addresses the MIT/XJTU gap against PatchTST, iTransformer, TimesNet, and other sequence baselines. It is retained in the v3 protocol and should not be simplified.
 
 Implementation notes:
 
@@ -88,7 +88,17 @@ Formal training uses raw current, voltage, temperature, and capacity sequences. 
 
 To reduce repeated CPU-side map construction, `bstalignment/precompute_battery_graph_cache.py` precomputes deterministic graph caches for each split. For v2, this cache is cycle-level rather than sample-level: it stores `cycle_maps.npy` and per-sample `history_indices.npy`.
 
-## 4. Baselines
+## 4. V3 Training Strategy
+
+The formal entrypoint is `scripts/run_battery_v3_training_strategy_pipeline.sh`, which writes to `runs/full_hf_v3_training_strategy_nosoh` in the exact order `main -> baselines -> ablations`. The main stage covers MIT, CALCE, and XJTU before the official baseline and ablation stages. The pipeline defaults to `FORCE_RETRAIN=1`; a later `FORCE_RETRAIN=0` invocation resumes or skips only runs whose `test_metrics.json` and `run_config.json` match the current v3 strategy version.
+
+GraphReportTS freezes the DistilBERT backbone in evaluation mode. AdamW separates main/core (`1e-3`) and semantic (`3e-4`) learning rates, uses a 5-epoch LR warmup from 10% to target rates, then applies a validation-MSE plateau scheduler and early stopping. SmoothL1 remains the regression loss, and `best.pt` remains validation-MSE selected. The delayed/ramped alignment is zero for epochs 1-5, linearly ramps during epochs 6-15 to `w_align=0.001`, then remains constant; early stopping begins at epoch 20 with patience 20.
+
+The six official baselines use source-native profiles, not identical epoch budgets: PatchTST is Adam/MSE with batch-stepped OneCycleLR (100 epochs, patience 20); iTransformer, TimesNet, and DLinear are Adam/MSE with source-style type1 epoch decay (10 epochs, patience 3); Time-LLM is Adam/MSE with batch-stepped OneCycleLR (10 epochs, patience 10); and TimeCMA is AdamW/MSE with cosine epoch decay, gradient clipping 5.0, 100 epochs, patience 50, and early stopping only from epoch 50. All adapters select checkpoints by validation MSE, not test metrics.
+
+The old v2 results are legacy because the unified fixed AdamW/SmoothL1/no scheduler loop did not retain source-native optimizer, loss, scheduler, or early-stop semantics. The late best validation epochs `73/79/54/77/72` for PatchTST, iTransformer, TimeCMA, TimesNet, and DLinear respectively demonstrate why a single shortened or identical baseline budget is invalid.
+
+## 5. Baselines
 
 The repository supports two comparison tracks:
 
@@ -101,7 +111,7 @@ Time-LLM does not require an external API in this setup. It uses local HuggingFa
 
 For the no-historical-SOH formal comparison, baseline inputs are `capacity_summary`, `capacity_delta`, `internal_resistance`, `charge_time`, and `cycle_ratio`; targets remain future SOH. TimeCMA prompt embeddings and Time-LLM config text must describe these observable features rather than historical SOH.
 
-## 5. Ablation Design
+## 6. Ablation Design
 
 The original ablation suite toggles the main design choices:
 
@@ -116,7 +126,7 @@ The original ablation suite toggles the main design choices:
 
 The runner is `bstalignment/run_ablation_suite.py`. It writes one run directory per ablation and an `ablation_summary.csv` table.
 
-For v2, the ablation suite must be updated. Keep the original map/graph ablations, but add:
+For v3, the ablation suite retains the original map/graph ablations and adds:
 
 - `no_numeric_history`
 - `no_multi_cycle_raw`
@@ -126,9 +136,9 @@ For v2, the ablation suite must be updated. Keep the original map/graph ablation
 - `no_align_loss`
 - `absolute_step_decoder`
 
-These ablations should evaluate the new architecture under the no-historical-SOH input contract, not the stopped old pipeline. The next full run should write to `runs/full_hf_v2_nosoh` to avoid overwriting old results and to avoid reusing cache files generated with historical SOH.
+These ablations evaluate the new architecture under the no-historical-SOH input contract, not the stopped old pipeline. The formal v3 run writes to `runs/full_hf_v3_training_strategy_nosoh`, which keeps results isolated from legacy output directories.
 
-## 6. Training Workflow
+## 7. Training Workflow
 
 Typical battery workflow:
 
@@ -142,29 +152,29 @@ Typical battery workflow:
 
 `runs/` is ignored because it contains logs, checkpoints, figures, cached tensors, and metrics generated by experiments.
 
-Next v2 no-historical-SOH workflow:
+Formal v3 no-historical-SOH workflow:
 
 1. Verify the no-SOH leakage tests locally or in the remote `graphreport` environment.
 2. Sync code to the remote server after the stopped old pipeline is no longer running.
-3. Retrain official baselines because their sequence inputs no longer contain historical SOH.
-4. Train the new main model on MIT, CALCE, and XJTU.
-5. Run v2-specific ablations on the new main model.
+3. Run GraphReportTS main models on MIT, CALCE, and XJTU first.
+4. Train official baselines with their source-native profiles.
+5. Run v3 ablations with the same main-model adaptive strategy.
 6. Compare future-only metrics across the no-SOH baselines, main model, and ablations.
 
-The formal script is `scripts/run_battery_v2_full_hf_pipeline.sh`. It should run with `FORCE_RETRAIN=1` and with baseline/ablation epoch budgets matched to the main model unless there is an explicit resource-failure record explaining a later hardware-only adjustment.
+The formal script is `scripts/run_battery_v3_training_strategy_pipeline.sh`. It should run with `FORCE_RETRAIN=1` for a new formal run. Baseline profiles intentionally retain their source-native, non-identical epoch budgets.
 
 Remote status at the moment this report was updated:
 
 - The previous official baseline comparison is complete for all 18 dataset/model combinations, but those results used historical SOH inputs and are now treated as an SOH-available upper-bound/reference rather than the formal no-SOH comparison.
 - The first v2 pipeline under `runs/full_hf_v2` was stopped after discovering historical SOH in `history_features` and baseline inputs.
-- The corrected pipeline should run under `runs/full_hf_v2_nosoh` with local HF weights from `hf_models/distilbert-base-uncased`, `hf_models/openai-community__gpt2`, and `hf_models/google-bert__bert-base-uncased`.
+- The corrected v3 pipeline runs under `runs/full_hf_v3_training_strategy_nosoh` with local HF weights from `hf_models/distilbert-base-uncased`, `hf_models/openai-community__gpt2`, and `hf_models/google-bert__bert-base-uncased`.
 - If training resources allow after the no-SOH run, add an optional strict `no_capacity_or_QD` sensitivity experiment to separate raw-map/text contributions from the capacity proxy.
 
-## 7. Cleanup Status
+## 8. Cleanup Status
 
 Early local prototype code based on one-cycle MIT summary features has been removed from the active project. The remaining code is organized around GraphReportTS, official baseline adapters, data preprocessing, inference, visualization, and ablation experiments.
 
-## 8. Repository Boundary
+## 9. Repository Boundary
 
 The GitHub repository should contain:
 
@@ -181,9 +191,9 @@ The repository should not contain:
 - experiment outputs under `runs/`;
 - local Codex handoff notes or machine-specific nohup orchestration files.
 
-## 9. Memory-Safety Notes For Future Codex Sessions
+## 10. Memory-Safety Notes For Future Codex Sessions
 
-Do not collapse the v2 design into a simpler single-cycle model. The following modules are required for the next implementation:
+Do not collapse the v3 multi-cycle design into a simpler single-cycle model. The following modules are required for the formal implementation:
 
 - `multi_cycle_maps [B, 32, C_map, H, W]`
 - shared `GraphMapEncoder` applied per cycle
@@ -194,6 +204,6 @@ Do not collapse the v2 design into a simpler single-cycle model. The following m
 - learnable text gate with gate logging
 - weak or disabled alignment option
 - TimeCMA-style token-aware semantic retrieval/alignment
-- v2-specific ablation suite
+- v3 ablation suite
 
-The first `InterCycleTemporalEncoder` is deliberately modest. It is not the final ceiling. If resources allow after the first v2 run, test full patch-level cross-cycle attention over `[B, 32, N_patch, D]`, or a factorized design with intra-cycle patch graph attention followed by inter-cycle patch/channel attention.
+The first `InterCycleTemporalEncoder` is deliberately modest. It is not the final ceiling. If resources allow after the first v3 run, test full-patch cross-cycle attention over `[B, 32, N_patch, D]`, or a factorized design with intra-cycle patch graph attention followed by inter-cycle patch/channel attention.

@@ -82,36 +82,38 @@ Preprocess CALCE/XJTU:
 bash scripts/preprocess_battery_data.sh "$(pwd)"
 ```
 
-## 4. Running Experiments
+## 4. Running The Formal V3 Protocol
 
-Main GraphReportTS battery experiments:
+The formal v3 entrypoint runs `main -> baselines -> ablations` and writes to `runs/full_hf_v3_training_strategy_nosoh`:
 
 ```bash
-bash scripts/run_battery_main_full_hf.sh "$(pwd)"
+FORCE_RETRAIN=1 bash scripts/run_battery_v3_training_strategy_pipeline.sh "$(pwd)" \
+  2>&1 | tee runs/full_hf_v3_training_strategy_nosoh/logs/v3_start.log
 ```
 
-Official baselines:
+Run it on the approved server configuration: RTX4090 48GiB, 208 CPU threads, batch size 128, 16 workers for main/cache/ablations, and 8 workers for baselines. Main, cache, and ablation stages share `runs/cache/battery_graph`; all stages share the v3 output root. This protocol adds no AMP.
+
+Check the pipeline and stage logs:
 
 ```bash
-bash scripts/run_battery_official_baselines.sh "$(pwd)"
+tail -n 100 -f runs/full_hf_v3_training_strategy_nosoh/logs/v3_start.log
+tail -n 100 -f runs/full_hf_v3_training_strategy_nosoh/logs/pipeline_main.out
+tail -n 100 -f runs/full_hf_v3_training_strategy_nosoh/logs/pipeline_baselines.out
+tail -n 100 -f runs/full_hf_v3_training_strategy_nosoh/logs/pipeline_ablation.out
 ```
 
-Ablations:
+Check completed runs and live training processes:
 
 ```bash
-bash scripts/run_battery_ablations_full_hf.sh "$(pwd)"
+find runs/full_hf_v3_training_strategy_nosoh -name test_metrics.json -print
+ps -ef | grep -E 'run_battery_v3|train_graph_report|train_battery_official_baselines|run_ablation_suite' | grep -v grep
 ```
 
-You can override runtime settings through environment variables:
+To resume safely after an interrupted v3 run, retain the same output root and use `FORCE_RETRAIN=0`. The scripts skip only runs with both `test_metrics.json` and a matching v3 `run_config.json`; incomplete runs resume when their current-strategy checkpoint is available.
 
 ```bash
-PY="python -u" \
-OUT_ROOT=runs/full_hf \
-TEXT_MODEL=hf_models/distilbert-base-uncased \
-EPOCHS=80 \
-BATCH_SIZE=128 \
-NUM_WORKERS=8 \
-bash scripts/run_battery_main_full_hf.sh "$(pwd)"
+FORCE_RETRAIN=0 bash scripts/run_battery_v3_training_strategy_pipeline.sh "$(pwd)" \
+  2>&1 | tee -a runs/full_hf_v3_training_strategy_nosoh/logs/v3_resume.log
 ```
 
 ## 5. Results

@@ -1,6 +1,6 @@
 # GraphReportTS
 
-GraphReportTS is a research codebase for battery state-of-health (SOH) forecasting and general time-series forecasting. The current implementation combines raw-signal 2D graph representations, statistical report prompts, cross-modal fusion, and a unified query decoder. The battery v2 path adds baseline-aligned multi-cycle history modeling and gated semantic fusion, described below.
+GraphReportTS is a research codebase for battery state-of-health (SOH) forecasting and general time-series forecasting. The current implementation combines raw-signal 2D graph representations, statistical report prompts, cross-modal fusion, and a unified query decoder. The battery v3 protocol uses the baseline-aligned multi-cycle history model with source-native baseline training and adaptive main-model optimization.
 
 This repository contains source code, experiment scripts, and documentation only. Raw datasets, model checkpoints, downloaded HuggingFace weights, external baseline repositories, logs, and generated training artifacts are intentionally excluded.
 
@@ -28,11 +28,11 @@ flowchart TD
     M --> N["Forecast"]
 ```
 
-## Battery-GraphReportTS V2 Design Target
+## Battery-GraphReportTS Architecture Context
 
-The next battery model revision is designed to fix the gap observed on MIT and XJTU against strong sequence baselines. This section preserves the intended architecture and the implemented v2 path.
+The battery architecture is designed to fix the gap observed on MIT and XJTU against strong sequence baselines. This section preserves the implemented multi-cycle model context now trained under the v3 protocol.
 
-Implementation status: the v2 path has been added to the training code. It uses future-only battery targets, direct 32-cycle raw-map and numeric-history inputs, a first-version cycle-level `InterCycleTemporalEncoder`, relative future-step decoding, gated semantic fusion, weak optional alignment, and v2-specific ablations. The formal no-historical-SOH rerun should use `runs/full_hf_v2_nosoh` and retrain official baselines because their input feature contract changed. The v2 full-HF pipeline defaults to full retraining: official baselines, main models, and ablations all rerun instead of reusing partial outputs.
+Implementation status: the multi-cycle path is implemented with future-only battery targets, direct 32-cycle raw-map and numeric-history inputs, a first-version cycle-level `InterCycleTemporalEncoder`, relative future-step decoding, gated semantic fusion, weak optional alignment, and the corresponding ablations. The formal no-historical-SOH run uses the v3 entrypoint and output root documented below.
 
 ### Baseline-Aligned Input
 
@@ -270,15 +270,23 @@ python -m bstalignment.train_battery_official_baselines \
 
 Time-LLM and TimeCMA can use local HuggingFace models through `--hf_gpt2_model` and `--hf_bert_model`. Downloaded model weights should stay outside Git, for example under ignored `hf_models/`.
 
-For the v2 no-historical-SOH comparison, retrain these baselines under the same input contract as the main model. Older baseline results that used historical SOH as an input are not directly comparable to the no-SOH main-model run.
+For the formal no-historical-SOH comparison, retrain these baselines under the same input contract as the main model. Older baseline results that used historical SOH as an input are not directly comparable to the no-SOH main-model run.
 
-The formal v2 pipeline is:
+## Formal V3 Training Protocol
+
+The formal entrypoint is:
 
 ```bash
-bash scripts/run_battery_v2_full_hf_pipeline.sh "$(pwd)"
+bash scripts/run_battery_v3_training_strategy_pipeline.sh "$(pwd)"
 ```
 
-By default this runs full retraining with `FORCE_RETRAIN=1`: all official baselines, all main-model datasets, and all ablations are regenerated. Baseline and ablation epoch budgets inherit the main `EPOCHS` value unless explicitly overridden. This script should not be used for smoke tests.
+The pipeline writes only to `runs/full_hf_v3_training_strategy_nosoh` and executes in the exact order `main -> baselines -> ablations`: GraphReportTS on MIT, CALCE, and XJTU; the six official baselines for each dataset; then the full battery ablation suite. It is fail-fast between stages. Its default `FORCE_RETRAIN=1` regenerates the formal run; use the cloud workflow's `FORCE_RETRAIN=0` resume command only after a prior v3 run has created matching completion metadata.
+
+The main model keeps the DistilBERT backbone frozen and in evaluation mode. AdamW uses separate main/core and semantic parameter-group learning rates (`1e-3` and `3e-4`), a 5-epoch LR warmup from 10% to the target rates, followed by a validation-MSE plateau scheduler and early stopping. The delayed/ramped alignment is zero for epochs 1-5, rises linearly during epochs 6-15 to `w_align=0.001`, and then remains constant. The regression loss is SmoothL1 and checkpoints are selected by validation MSE.
+
+The six official baselines use source-native profiles rather than a shared epoch budget: PatchTST uses Adam/MSE with batch-stepped OneCycleLR (100 epochs, patience 20); iTransformer, TimesNet, and DLinear use Adam/MSE with source-style type1 epoch decay (10 epochs, patience 3); Time-LLM uses Adam/MSE with batch-stepped OneCycleLR (10 epochs, patience 10); and TimeCMA uses AdamW/MSE with epoch-stepped cosine decay, gradient clipping 5.0, and its 100-epoch, patience-50 profile with early stopping delayed until epoch 50. All select `best.pt` by validation MSE only.
+
+The v2 outputs remain legacy references. They used a unified fixed AdamW/SmoothL1/no scheduler baseline loop, rather than these source-native profiles; late validation best epochs `73/79/54/77/72` for PatchTST/iTransformer/TimeCMA/TimesNet/DLinear show why their epoch behavior must not be represented as one identical budget.
 
 ## Ablations
 

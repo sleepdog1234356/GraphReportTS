@@ -107,6 +107,29 @@ class PipelineScriptTests(unittest.TestCase):
         self.assertNotIn('--lr "$LR"', text)
         self.assertNotIn('--early_stop_patience "$EARLY_STOP_PATIENCE"', text)
 
+    def test_public_docs_describe_the_v3_training_protocol(self):
+        readme = Path("README.md").read_text(encoding="utf-8")
+        report = Path("docs/work_report.md").read_text(encoding="utf-8")
+        workflow = Path("docs/cloud_training_workflow.md").read_text(encoding="utf-8")
+
+        for text in (readme, report):
+            self.assertIn("scripts/run_battery_v3_training_strategy_pipeline.sh", text)
+            self.assertIn("runs/full_hf_v3_training_strategy_nosoh", text)
+            self.assertIn("main -> baselines -> ablations", text)
+            self.assertIn("DistilBERT", text)
+            self.assertIn("5-epoch LR warmup", text)
+            self.assertIn("delayed/ramped alignment", text)
+            self.assertIn("plateau scheduler and early stopping", text)
+            self.assertIn("source-native", text)
+
+        self.assertIn("fixed AdamW/SmoothL1/no scheduler", report)
+        self.assertIn("73/79/54/77/72", report)
+        self.assertIn("[B, 32, N_patch, D]", report)
+        self.assertIn("RTX4090 48GiB", workflow)
+        self.assertIn("208 CPU threads", workflow)
+        self.assertIn("FORCE_RETRAIN=0", workflow)
+        self.assertIn("no AMP", workflow)
+
 
 class AblationCompletionPolicyTests(unittest.TestCase):
     strategy_version = "v3-source-profiles-main-adaptive"
