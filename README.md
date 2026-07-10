@@ -202,6 +202,8 @@ Formal battery runs use a no-historical-SOH contract:
 - **Prompt input:** older history is summarized from observable capacity/QD, IR, and charge-time statistics. The prompt may state that the task is future SOH forecasting, but it must not include historical SOH statistics.
 - **Target:** `y [B, pred_len]` is future SOH only. Historical SOH, SOH deltas, and SOH-derived aging-stage labels are excluded from model and baseline inputs.
 
+The formal protocol uses exactly 32 observed cycles and exactly 20 future-only labels; terminal partial horizons are not admitted. `cycle_ratio` uses train-only dataset-global cycle scaling: fit one scale from the selected training cells only, reuse it for every split and model, and apply no clipping even when validation or test values exceed 1.0.
+
 Official baselines use the same no-SOH sequence contract. Their input features are `capacity_summary`, `capacity_delta`, `internal_resistance`, `charge_time`, and `cycle_ratio`; their target remains future SOH.
 
 General datasets follow the TimeCMA-style CSV layout:

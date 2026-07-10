@@ -62,7 +62,11 @@ def should_skip_ablation(result_dir: Path, training_strategy_version: str, force
 
 
 def remove_ablation_output_if_forced(output_dir: Path, force_retrain: bool) -> None:
-    if force_retrain and output_dir.exists():
+    remove_ablation_output_if_fresh(output_dir, force_retrain)
+
+
+def remove_ablation_output_if_fresh(output_dir: Path, start_fresh: bool) -> None:
+    if start_fresh and output_dir.exists():
         shutil.rmtree(output_dir)
 
 
@@ -104,12 +108,12 @@ def main():
             print(f"skip completed ablation {args.dataset} {name}")
             rows.append(pd.read_json(metrics_path, typ="series").to_dict() | {"ablation": name})
             continue
-        if not args.dry_run:
-            remove_ablation_output_if_forced(out_dir, args.force_retrain)
         start_fresh = args.force_retrain or not has_matching_strategy_version(
             result_dir,
             args.training_strategy_version,
         )
+        if not args.dry_run:
+            remove_ablation_output_if_fresh(out_dir, start_fresh)
         if args.variant == "battery" and args.precomputed_cache_dir:
             precompute_cmd = [
                 sys.executable,

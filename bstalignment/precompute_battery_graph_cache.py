@@ -82,6 +82,13 @@ def _write_meta(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def _flush_and_close_memmap(array: np.memmap) -> None:
+    array.flush()
+    mapping = getattr(array, "_mmap", None)
+    if mapping is not None:
+        mapping.close()
+
+
 def _collect_cycle_entries(ds: BatteryRawGraphDataset) -> Dict[Tuple[str, int], Tuple[str, int, int]]:
     entries: Dict[Tuple[str, int], Tuple[str, int, int]] = {}
     mit_dfs = {}
@@ -294,18 +301,22 @@ def precompute_split(args, split: str) -> Path:
             history_indices[sample_idx, hist_pos] = key_to_cycle_idx[key]
         meta_rows.append({"prompt": item["prompt"], "cell_id": item["cell_id"], "cycle": int(item["cycle"])})
 
-    cycle_maps.flush()
-    history_indices.flush()
-    y.flush()
-    mask.flush()
-    horizon.flush()
-    target_steps.flush()
-    history_features.flush()
-    history_cycles.flush()
+    for array in (
+        cycle_maps,
+        history_indices,
+        y,
+        mask,
+        horizon,
+        target_steps,
+        history_features,
+        history_cycles,
+    ):
+        _flush_and_close_memmap(array)
     _write_meta(tmp_path / "meta.jsonl", meta_rows)
     manifest = {
         "layout": "cycle_history",
         "config": config,
+        "cycle_scale": ds.cycle_scale,
         "sample_count": sample_count,
         "cycle_count": len(cycle_items),
         "cycle_map_shape": cycle_map_shape,

@@ -25,6 +25,8 @@ try:
         build_baseline_optimizer,
         build_baseline_scheduler,
         get_baseline_training_profile,
+        require_checkpoint_strategy_version,
+        require_nonempty_splits,
         step_baseline_batch_scheduler,
         step_baseline_epoch_scheduler,
     )
@@ -37,6 +39,8 @@ except ImportError:
         build_baseline_optimizer,
         build_baseline_scheduler,
         get_baseline_training_profile,
+        require_checkpoint_strategy_version,
+        require_nonempty_splits,
         step_baseline_batch_scheduler,
         step_baseline_epoch_scheduler,
     )
@@ -298,9 +302,6 @@ class OfficialBaseline(nn.Module):
             emb = self.timecma_prompt(x)
             return select_target(self.model(x, mark, emb))
         if self.name == "time_llm":
-            if x.is_cuda:
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    return select_target(self.model(x, None, None, None)).float()
             return select_target(self.model(x, None, None, None))
         raise ValueError(f"Unknown official baseline: {self.name}")
 
@@ -399,9 +400,7 @@ def main():
     train_ds = BatterySequenceDataset(split="train", **ds_kwargs)
     val_ds = BatterySequenceDataset(split="val", **ds_kwargs)
     test_ds = BatterySequenceDataset(split="test", **ds_kwargs)
-    if len(train_ds) == 0 or len(test_ds) == 0:
-        raise RuntimeError("Official baseline train/test split is empty. Check data and input_len/pred_len.")
-    val_eval_ds = val_ds if len(val_ds) else test_ds
+    require_nonempty_splits(train_ds, val_ds, test_ds, "Official baseline trainer")
     loader_kwargs = {
         "batch_size": args.batch_size,
         "num_workers": args.num_workers,
@@ -410,7 +409,7 @@ def main():
     if args.num_workers > 0:
         loader_kwargs.update({"prefetch_factor": 2})
     train_loader = DataLoader(train_ds, shuffle=True, persistent_workers=args.num_workers > 0, **loader_kwargs)
-    val_loader = DataLoader(val_eval_ds, shuffle=False, persistent_workers=False, **loader_kwargs)
+    val_loader = DataLoader(val_ds, shuffle=False, persistent_workers=False, **loader_kwargs)
     test_loader = DataLoader(test_ds, shuffle=False, persistent_workers=False, **loader_kwargs)
 
     model = OfficialBaseline(args.model, args, len(FEATURES)).to(device)
@@ -424,9 +423,9 @@ def main():
         resume_path = last_path if last_path.exists() else best_path
         if resume_path.exists():
             resume_checkpoint = torch.load(resume_path, map_location=device)
+            require_checkpoint_strategy_version(resume_checkpoint, "Official baseline trainer")
             if "training_profile" in resume_checkpoint:
                 profile = replace(profile, **resume_checkpoint["training_profile"])
-            training_strategy_version = resume_checkpoint.get("training_strategy_version", training_strategy_version)
 
     opt = build_baseline_optimizer(model, profile)
     scheduler = build_baseline_scheduler(opt, profile, steps_per_epoch=len(train_loader))

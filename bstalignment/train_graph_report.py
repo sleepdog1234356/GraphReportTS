@@ -24,6 +24,8 @@ try:
         build_graph_report_optimizer,
         graph_report_align_weight,
         graph_report_group_lrs,
+        require_checkpoint_strategy_version,
+        require_nonempty_splits,
         should_stop_graph_report,
         update_graph_report_stale,
     )
@@ -42,6 +44,8 @@ except ImportError:
         build_graph_report_optimizer,
         graph_report_align_weight,
         graph_report_group_lrs,
+        require_checkpoint_strategy_version,
+        require_nonempty_splits,
         should_stop_graph_report,
         update_graph_report_stale,
     )
@@ -151,6 +155,7 @@ def build_loaders(args) -> Tuple[DataLoader, DataLoader, DataLoader, int]:
         test_ds = GeneralForecastGraphDataset(split="test", scaler=scaler, fit_scaler=False, **ds_kwargs)
         collate = collate_general_graph_batch
         output_dim = len(train_ds.columns)
+    require_nonempty_splits(train_ds, val_ds, test_ds, "GraphReportTS trainer")
     loader_kwargs = {
         "batch_size": args.batch_size,
         "num_workers": args.num_workers,
@@ -326,9 +331,9 @@ def main():
         resume_path = last_path if last_path.exists() else best_path
         if resume_path.exists():
             resume_checkpoint = torch.load(resume_path, map_location=device)
+            require_checkpoint_strategy_version(resume_checkpoint, "GraphReportTS trainer")
             if "training_profile" in resume_checkpoint:
                 profile = MainTrainingProfile(**resume_checkpoint["training_profile"])
-            training_strategy_version = resume_checkpoint.get("training_strategy_version", training_strategy_version)
 
     opt = build_graph_report_optimizer(model, profile)
     scheduler = GraphReportScheduler(opt, profile)

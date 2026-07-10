@@ -6,7 +6,30 @@ import torch
 import torch.nn.functional as F
 
 
-TRAINING_STRATEGY_VERSION = "v3-source-profiles-main-adaptive"
+TRAINING_STRATEGY_VERSION = "v3-source-profiles-main-adaptive-fixed-horizon-train-scale"
+
+
+def require_nonempty_splits(train_dataset, val_dataset, test_dataset, trainer_name: str) -> None:
+    split_sizes = {
+        "training": len(train_dataset),
+        "validation": len(val_dataset),
+        "test": len(test_dataset),
+    }
+    empty = [name for name, size in split_sizes.items() if size == 0]
+    if empty:
+        raise RuntimeError(
+            f"{trainer_name} requires non-empty training, validation, and test datasets; "
+            f"empty: {', '.join(empty)}."
+        )
+
+
+def require_checkpoint_strategy_version(checkpoint: dict, trainer_name: str) -> None:
+    recorded = checkpoint.get("training_strategy_version")
+    if recorded != TRAINING_STRATEGY_VERSION:
+        raise RuntimeError(
+            f"{trainer_name} checkpoint training strategy version {recorded!r} does not match "
+            f"required version {TRAINING_STRATEGY_VERSION!r}."
+        )
 
 
 @dataclass(frozen=True)
@@ -90,7 +113,7 @@ def step_baseline_epoch_scheduler(scheduler, optimizer, profile, epoch):
     if profile.scheduler_step != "epoch":
         return
     if profile.scheduler == "type1":
-        lr = profile.lr * (0.5 ** max(epoch - 1, 0))
+        lr = profile.lr * (0.5 ** max(epoch, 0))
         for group in optimizer.param_groups:
             group["lr"] = lr
     elif scheduler is not None:
@@ -136,6 +159,12 @@ def build_graph_report_optimizer(model, profile):
         if isinstance(module, torch.nn.Embedding)
         for parameter in module.parameters(recurse=False)
     }
+    layer_norm_parameter_ids = {
+        id(parameter)
+        for module in model.modules()
+        if isinstance(module, torch.nn.LayerNorm)
+        for parameter in module.parameters(recurse=False)
+    }
     groups = {
         "core_decay": {"params": [], "lr": profile.core_lr * profile.warmup_start_factor,
                        "weight_decay": profile.weight_decay, "role": "core"},
@@ -153,6 +182,7 @@ def build_graph_report_optimizer(model, profile):
         role = "semantic" if name.startswith(("text_encoder.proj", "semantic_fusion", "fusion")) else "core"
         uses_weight_decay = not (
             id(parameter) in embedding_parameter_ids
+            or id(parameter) in layer_norm_parameter_ids
             or "norm" in lower_name
             or name.endswith(".bias")
             or "embed" in lower_name

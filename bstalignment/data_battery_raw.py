@@ -12,17 +12,31 @@ import torch
 from torch.utils.data import Dataset
 
 try:
+    from .battery_protocol import (
+        BATTERY_CYCLE_SCALE_PROTOCOL,
+        BATTERY_TARGET_PROTOCOL,
+        fit_cycle_scale,
+        fit_processed_cycle_scale,
+        split_processed_items,
+    )
     from .data_mit import CellRecord, add_cycle_features, load_mit_battery_pkls, split_cells
     from .experiment_config import BATTERY_DATASET_NOTES
     from .raw_signal import build_multiview_maps, build_report_from_array, current_to_capacity
 except ImportError:
+    from battery_protocol import (
+        BATTERY_CYCLE_SCALE_PROTOCOL,
+        BATTERY_TARGET_PROTOCOL,
+        fit_cycle_scale,
+        fit_processed_cycle_scale,
+        split_processed_items,
+    )
     from data_mit import CellRecord, add_cycle_features, load_mit_battery_pkls, split_cells
     from experiment_config import BATTERY_DATASET_NOTES
     from raw_signal import build_multiview_maps, build_report_from_array, current_to_capacity
 
 
 RAW_BATTERY_CHANNELS = ["current", "voltage", "temperature", "capacity"]
-BATTERY_GRAPH_CACHE_VERSION = 4
+BATTERY_GRAPH_CACHE_VERSION = 5
 BATTERY_HISTORY_FEATURE_SCHEMA = [
     "capacity_value",
     "capacity_zscore",
@@ -67,6 +81,8 @@ def battery_graph_cache_config(
         "max_cycles": None if max_cycles is None else int(max_cycles),
         "history_len": int(history_len),
         "history_feature_schema": list(BATTERY_HISTORY_FEATURE_SCHEMA),
+        "target_protocol": BATTERY_TARGET_PROTOCOL,
+        "cycle_scale_protocol": BATTERY_CYCLE_SCALE_PROTOCOL,
     }
 
 
@@ -259,6 +275,7 @@ class BatteryRawGraphDataset(Dataset):
         self._cycle_map_cache: OrderedDict[Tuple[str, str, int], Tuple[np.ndarray, List[str]]] = OrderedDict()
         self.precomputed_cache_dir = Path(precomputed_cache_dir) if precomputed_cache_dir else None
         self.require_precomputed_cache = bool(require_precomputed_cache)
+        self.cycle_scale = 1.0
         self.cache_config = battery_graph_cache_config(
             dataset_name=self.dataset_name,
             split=self.split,
@@ -313,6 +330,7 @@ class BatteryRawGraphDataset(Dataset):
             return False
         if manifest.get("config") != self.cache_config:
             return False
+        self.cycle_scale = float(manifest.get("cycle_scale", 1.0))
         files = manifest.get("files", {})
         self._cache_layout = str(manifest.get("layout", "sample_history"))
         if self._cache_layout == "cycle_history":
@@ -347,22 +365,23 @@ class BatteryRawGraphDataset(Dataset):
     def _load_mit(self, seed: int, max_cycles: Optional[int]) -> None:
         records = load_mit_battery_pkls(self.data_root / "mit")
         train, val, test = split_cells(records, seed=seed)
+        self.cycle_scale = fit_cycle_scale(
+            (record.summary["cycle"].to_numpy(dtype=np.float64) for record in train),
+            max_cycles,
+        )
         selected = {"train": train, "val": val, "test": test, "all": records}[self.split]
         self.records = list(selected)
         for rec_idx, rec in enumerate(self.records):
             df = add_cycle_features(rec.summary)
             if max_cycles is not None:
                 df = df.iloc[:max_cycles].copy()
-            for row_idx in range(self.history_len - 1, len(df) - 1):
-                available = min(self.max_horizon, len(df) - row_idx - 1)
-                if available <= 0:
-                    continue
+            for row_idx in range(self.history_len - 1, len(df) - self.max_horizon):
                 self.samples.append(
                     {
                         "record_idx": rec_idx,
                         "row_idx": row_idx,
                         "cycle_id": int(df.iloc[row_idx]["cycle"]),
-                        "horizon": available,
+                        "horizon": self.max_horizon,
                     }
                 )
 
@@ -378,28 +397,9 @@ class BatteryRawGraphDataset(Dataset):
                 f"No processed {self.dataset_name.upper()} files found under {processed_dir}.\n"
                 f"Place raw data under {note.get('raw_dir')} and preprocess to .npz files with:\n  - {required}"
             )
-        rng = np.random.default_rng(seed)
-        order = np.arange(len(files))
-        rng.shuffle(order)
-        if len(order) >= 3:
-            n_train = max(1, int(len(order) * 0.7))
-            n_val = max(1, int(len(order) * 0.15))
-            if n_train + n_val >= len(order):
-                n_train = max(1, len(order) - 2)
-                n_val = 1
-        elif len(order) == 2:
-            n_train = 1
-            n_val = 0
-        else:
-            n_train = len(order)
-            n_val = 0
-        split_ids = {
-            "train": order[:n_train],
-            "val": order[n_train : n_train + n_val],
-            "test": order[n_train + n_val :],
-            "all": order,
-        }[self.split]
-        selected = [files[i] for i in split_ids]
+        splits = split_processed_items(files, seed=seed)
+        self.cycle_scale = fit_processed_cycle_scale(splits["train"], max_cycles)
+        selected = splits[self.split]
         for cell_idx, path in enumerate(selected):
             data = np.load(path, allow_pickle=True)
             required = ["cycle_id", "soh", "current", "voltage", "temperature"]
@@ -416,16 +416,13 @@ class BatteryRawGraphDataset(Dataset):
             n = len(cell["cycle_id"])
             if max_cycles is not None:
                 n = min(n, int(max_cycles))
-            for row_idx in range(self.history_len - 1, n - 1):
-                available = min(self.max_horizon, n - row_idx - 1)
-                if available <= 0:
-                    continue
+            for row_idx in range(self.history_len - 1, n - self.max_horizon):
                 self.samples.append(
                     {
                         "processed_idx": cell_idx,
                         "row_idx": row_idx,
                         "cycle_id": int(cell["cycle_id"][row_idx]),
-                        "horizon": available,
+                        "horizon": self.max_horizon,
                     }
                 )
 
@@ -491,13 +488,12 @@ class BatteryRawGraphDataset(Dataset):
 
     def _mit_history_features(self, df: pd.DataFrame, start: int, stop: int) -> np.ndarray:
         hist = df.iloc[start:stop]
-        max_cycle = int(df["cycle"].iloc[-1]) if len(df) else 1
         return _history_feature_matrix(
             capacity=_safe_col(hist, "QD"),
             internal_resistance=_safe_col(hist, "IR"),
             charge_time=_safe_col(hist, "chargetime"),
             cycle_ids=_safe_col(hist, "cycle"),
-            max_cycle_id=max_cycle,
+            max_cycle_id=self.cycle_scale,
         )
 
     def _processed_history_features(self, cell: Dict[str, Any], start: int, stop: int, n: int) -> np.ndarray:
@@ -514,7 +510,7 @@ class BatteryRawGraphDataset(Dataset):
             else zeros,
             charge_time=np.asarray(cell.get("charge_time", zeros)[start:stop], dtype=np.float32) if "charge_time" in cell else zeros,
             cycle_ids=np.asarray(cell["cycle_id"][start:stop], dtype=np.float32),
-            max_cycle_id=int(cell["cycle_id"][n - 1]) if n > 0 else 1,
+            max_cycle_id=self.cycle_scale,
         )
 
     def _prompt_from_history(

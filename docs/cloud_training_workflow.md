@@ -86,6 +86,8 @@ bash scripts/preprocess_battery_data.sh "$(pwd)"
 
 The formal v3 entrypoint runs `main -> baselines -> ablations` and writes to `runs/full_hf_v3_training_strategy_nosoh`:
 
+The formal battery input protocol is exactly 32 observed cycles and 20 future-only labels, with historical SOH excluded from inputs. `cycle_ratio` uses train-only dataset-global cycle scaling from the selected training cells, is shared unchanged by all splits and models, and uses no clipping above 1.0.
+
 ```bash
 FORCE_RETRAIN=1 bash scripts/run_battery_v3_training_strategy_pipeline.sh "$(pwd)" \
   2>&1 | tee runs/full_hf_v3_training_strategy_nosoh/logs/v3_start.log

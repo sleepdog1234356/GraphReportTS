@@ -11,7 +11,7 @@ HF_GPT2_MODEL="${HF_GPT2_MODEL:-hf_models/openai-community__gpt2}"
 HF_BERT_MODEL="${HF_BERT_MODEL:-hf_models/google-bert__bert-base-uncased}"
 BASELINE_MODELS="${BASELINE_MODELS:-patchtst itransformer timecma timesnet dlinear time_llm}"
 FORCE_RETRAIN="${FORCE_RETRAIN:-0}"
-TRAINING_STRATEGY_VERSION="v3-source-profiles-main-adaptive"
+TRAINING_STRATEGY_VERSION="v3-source-profiles-main-adaptive-fixed-horizon-train-scale"
 cd "$ROOT"
 mkdir -p "$OUT_ROOT/logs"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
@@ -40,8 +40,18 @@ for dataset in mit calce xjtu; do
       echo "skip completed official baseline $dataset $model"
       continue
     fi
+    FRESH_RUN=0
+    if [ "$FORCE_RETRAIN" = "1" ]; then
+      rm -rf -- "$out"
+      FRESH_RUN=1
+    elif [ ! -e "$out" ]; then
+      FRESH_RUN=1
+    elif ! has_current_strategy_version "$out"; then
+      rm -rf -- "$out"
+      FRESH_RUN=1
+    fi
     RESUME_ARGS=()
-    if [ "$FORCE_RETRAIN" = "1" ] || ! has_current_strategy_version "$out"; then
+    if [ "$FRESH_RUN" = "1" ]; then
       RESUME_ARGS=(--no_resume)
     fi
     $PY -m bstalignment.train_battery_official_baselines \

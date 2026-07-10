@@ -12,9 +12,11 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 try:
+    from .battery_protocol import fit_cycle_scale, fit_processed_cycle_scale, split_processed_items
     from .data_mit import add_cycle_features, load_mit_battery_pkls, split_cells
     from .utils import AverageMeter, ensure_dir, save_json, seed_everything
 except ImportError:
+    from battery_protocol import fit_cycle_scale, fit_processed_cycle_scale, split_processed_items
     from data_mit import add_cycle_features, load_mit_battery_pkls, split_cells
     from utils import AverageMeter, ensure_dir, save_json, seed_everything
 
@@ -33,13 +35,12 @@ def _as_float_series(values: np.ndarray | None, n: int, fill: float = 0.0) -> np
     return arr[:n].astype(np.float32)
 
 
-def _cycle_ratio(cycle_ids: np.ndarray | None, n: int) -> np.ndarray:
+def _cycle_ratio(cycle_ids: np.ndarray | None, n: int, cycle_scale: float) -> np.ndarray:
     if cycle_ids is None:
         arr = np.arange(1, n + 1, dtype=np.float32)
     else:
         arr = _as_float_series(cycle_ids, n, fill=0.0)
-    denom = max(float(np.nanmax(arr)) if len(arr) else 1.0, 1.0)
-    return (arr / denom).astype(np.float32)
+    return (arr / max(float(cycle_scale), 1.0)).astype(np.float32)
 
 
 class BatterySequenceDataset(Dataset):
@@ -61,6 +62,7 @@ class BatterySequenceDataset(Dataset):
         self.series: Dict[str, np.ndarray] = {}
         self.targets: Dict[str, np.ndarray] = {}
         self.samples: List[Tuple[str, int]] = []
+        self.cycle_scale = 1.0
         if self.dataset_name == "mit":
             self._load_mit(seed, max_cycles)
         else:
@@ -86,7 +88,7 @@ class BatterySequenceDataset(Dataset):
                 np.diff(capacity, prepend=capacity[0]).astype(np.float32) if n else capacity,
                 internal_resistance,
                 charge_time,
-                _cycle_ratio(cycle_ids, n),
+                _cycle_ratio(cycle_ids, n, self.cycle_scale),
             ],
             axis=-1,
         )
@@ -102,6 +104,10 @@ class BatterySequenceDataset(Dataset):
     def _load_mit(self, seed: int, max_cycles: int | None) -> None:
         records = load_mit_battery_pkls(self.data_root / "mit")
         train, val, test = split_cells(records, seed=seed)
+        self.cycle_scale = fit_cycle_scale(
+            (record.summary["cycle"].to_numpy(dtype=np.float64) for record in train),
+            max_cycles,
+        )
         selected = {"train": train, "val": val, "test": test, "all": records}[self.split]
         for rec in selected:
             df = add_cycle_features(rec.summary)
@@ -121,27 +127,10 @@ class BatterySequenceDataset(Dataset):
         files = sorted(root.glob("*.npz"))
         if not files:
             raise FileNotFoundError(f"No processed {self.dataset_name} npz files under {root}")
-        rng = np.random.default_rng(seed)
-        order = np.arange(len(files))
-        rng.shuffle(order)
-        if len(order) >= 3:
-            n_train = max(1, int(len(order) * 0.7))
-            n_val = max(1, int(len(order) * 0.15))
-            if n_train + n_val >= len(order):
-                n_train = max(1, len(order) - 2)
-                n_val = 1
-        elif len(order) == 2:
-            n_train, n_val = 1, 0
-        else:
-            n_train, n_val = len(order), 0
-        split_ids = {
-            "train": order[:n_train],
-            "val": order[n_train : n_train + n_val],
-            "test": order[n_train + n_val :],
-            "all": order,
-        }[self.split]
-        for idx in split_ids:
-            data = np.load(files[int(idx)], allow_pickle=True)
+        splits = split_processed_items(files, seed=seed)
+        self.cycle_scale = fit_processed_cycle_scale(splits["train"], max_cycles)
+        for path in splits[self.split]:
+            data = np.load(path, allow_pickle=True)
             soh = np.asarray(data["soh"], dtype=np.float32)
             capacity = np.asarray(data["capacity_summary"], dtype=np.float32) if "capacity_summary" in data else None
             if capacity is None and "capacity" in data:
@@ -156,7 +145,7 @@ class BatterySequenceDataset(Dataset):
                 internal_resistance = internal_resistance[: int(max_cycles)] if internal_resistance is not None else None
                 charge_time = charge_time[: int(max_cycles)] if charge_time is not None else None
                 cycle_ids = cycle_ids[: int(max_cycles)] if cycle_ids is not None else None
-            self._add_series(files[int(idx)].stem, soh, capacity, internal_resistance, charge_time, cycle_ids)
+            self._add_series(path.stem, soh, capacity, internal_resistance, charge_time, cycle_ids)
 
     def __len__(self) -> int:
         return len(self.samples)

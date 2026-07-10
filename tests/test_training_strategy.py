@@ -1,12 +1,31 @@
 from argparse import Namespace
+import gc
 import json
 from pathlib import Path
+import pickle
+import subprocess
 from tempfile import TemporaryDirectory
 import unittest
+import warnings
 
+import numpy as np
 import torch
 
-from bstalignment.run_ablation_suite import remove_ablation_output_if_forced, should_skip_ablation
+from bstalignment.data_battery_raw import (
+    BATTERY_GRAPH_CACHE_VERSION,
+    BatteryRawGraphDataset,
+    battery_graph_cache_config,
+)
+from bstalignment.graph_report_model import GraphReportTS, GraphReportTSConfig
+from bstalignment.precompute_battery_graph_cache import precompute_split
+import bstalignment.training_strategy as training_strategy
+from bstalignment.run_ablation_suite import (
+    has_matching_strategy_version,
+    remove_ablation_output_if_forced,
+    remove_ablation_output_if_fresh,
+    should_skip_ablation,
+)
+from bstalignment.train_battery_baselines import BatterySequenceDataset
 from bstalignment.train_battery_official_baselines import resolve_baseline_profile
 from bstalignment.training_strategy import (
     BASELINE_TRAINING_PROFILES,
@@ -25,6 +44,262 @@ from bstalignment.training_strategy import (
     step_baseline_epoch_scheduler,
     update_graph_report_stale,
 )
+
+
+class BatteryDataFixtureMixin:
+    @staticmethod
+    def write_mit_data(root: Path, multipliers):
+        mit_dir = root / "mit"
+        mit_dir.mkdir(parents=True)
+        batch = {}
+        for index, multiplier in enumerate(multipliers):
+            n = 60
+            cycle = np.arange(1, n + 1, dtype=np.float32) * float(multiplier)
+            batch[f"cell{index}"] = {
+                "summary": {
+                    "cycle": cycle,
+                    "QD": np.linspace(1.1, 0.8, n, dtype=np.float32),
+                    "QC": np.linspace(1.15, 0.85, n, dtype=np.float32),
+                    "IR": np.linspace(0.01, 0.03, n, dtype=np.float32),
+                    "Tmax": np.full(n, 35.0, dtype=np.float32),
+                    "Tavg": np.full(n, 30.0, dtype=np.float32),
+                    "Tmin": np.full(n, 25.0, dtype=np.float32),
+                    "chargetime": np.linspace(10.0, 15.0, n, dtype=np.float32),
+                },
+                "cycle_life": float(cycle[-1]),
+                "charge_policy": "fixture",
+            }
+        with (mit_dir / "batch1.pkl").open("wb") as handle:
+            pickle.dump(batch, handle)
+
+    @staticmethod
+    def write_processed_data(root: Path, multipliers):
+        processed_dir = root / "processed" / "battery" / "calce"
+        processed_dir.mkdir(parents=True)
+        for index, multiplier in enumerate(multipliers):
+            n = 60
+            cycle = np.arange(1, n + 1, dtype=np.int64) * int(multiplier)
+            current = np.tile(np.array([0.0, 1.0, 0.0], dtype=np.float32), (n, 1))
+            voltage = np.tile(np.array([3.0, 3.5, 4.0], dtype=np.float32), (n, 1))
+            temperature = np.tile(np.array([25.0, 30.0, 28.0], dtype=np.float32), (n, 1))
+            capacity = np.tile(np.array([0.0, 0.5, 1.0], dtype=np.float32), (n, 1))
+            np.savez(
+                processed_dir / f"cell{index}.npz",
+                cycle_id=cycle,
+                soh=np.linspace(1.0, 0.75, n, dtype=np.float32),
+                current=current,
+                voltage=voltage,
+                temperature=temperature,
+                capacity=capacity,
+                capacity_summary=capacity[:, -1],
+                internal_resistance=np.linspace(0.01, 0.03, n, dtype=np.float32),
+                charge_time=np.linspace(10.0, 15.0, n, dtype=np.float32),
+            )
+
+
+class BatteryWindowProtocolTests(BatteryDataFixtureMixin, unittest.TestCase):
+    def test_mit_graph_and_sequence_windows_have_only_full_twenty_step_targets(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_mit_data(root, [1, 1, 1, 1])
+
+            graph = BatteryRawGraphDataset(
+                dataset_name="mit",
+                data_root=root,
+                split="train",
+                history_len=32,
+                max_horizon=20,
+            )
+            sequence = BatterySequenceDataset(
+                dataset_name="mit",
+                data_root=root,
+                split="train",
+                input_len=32,
+                pred_len=20,
+            )
+
+            self.assertGreater(len(graph), 0)
+            self.assertEqual({sample["horizon"] for sample in graph.samples}, {20})
+            self.assertTrue(all(sequence[index]["y"].shape == (20,) for index in range(len(sequence))))
+            prompt = graph._prompt_from_history(
+                np.ones((3, 1), dtype=np.float32), ["capacity"], graph.samples[-1]["horizon"], "cell", 40, []
+            )
+            self.assertIn("predict next 20 steps", prompt)
+
+    def test_processed_graph_and_sequence_windows_have_only_full_twenty_step_targets(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_processed_data(root, [1, 1, 1, 1, 1, 1])
+
+            graph = BatteryRawGraphDataset(
+                dataset_name="calce",
+                data_root=root,
+                split="train",
+                history_len=32,
+                max_horizon=20,
+            )
+            sequence = BatterySequenceDataset(
+                dataset_name="calce",
+                data_root=root,
+                split="train",
+                input_len=32,
+                pred_len=20,
+            )
+
+            self.assertGreater(len(graph), 0)
+            self.assertEqual({sample["horizon"] for sample in graph.samples}, {20})
+            self.assertTrue(all(sequence[index]["y"].shape == (20,) for index in range(len(sequence))))
+
+    def test_processed_cycle_scale_is_train_only_shared_and_not_clipped(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_processed_data(root, [10, 8, 2, 1, 4, 3])
+            graph_sets = {
+                split: BatteryRawGraphDataset(
+                    dataset_name="calce",
+                    data_root=root,
+                    split=split,
+                    history_len=32,
+                    max_horizon=20,
+                    max_cycles=55,
+                )
+                for split in ("train", "val", "test")
+            }
+            sequence_sets = {
+                split: BatterySequenceDataset(
+                    dataset_name="calce",
+                    data_root=root,
+                    split=split,
+                    input_len=32,
+                    pred_len=20,
+                    max_cycles=55,
+                )
+                for split in ("train", "val", "test")
+            }
+
+            expected_scale = 4 * 55
+            for dataset in (*graph_sets.values(), *sequence_sets.values()):
+                self.assertEqual(dataset.cycle_scale, expected_scale)
+            val_sequence = sequence_sets["val"]
+            val_values = next(iter(val_sequence.series.values()))
+            self.assertGreater(float(val_values[-1, 4]), 1.0)
+            val_graph = graph_sets["val"]
+            val_cell = val_graph.processed_cells[0]
+            val_history = val_graph._processed_history_features(val_cell, 0, 32, 55)
+            self.assertGreater(float(val_history[-1, 4]), 1.0)
+
+    def test_mit_cycle_scale_is_train_only_shared_and_respects_max_cycles(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_mit_data(root, [1, 10, 2, 3, 4, 5, 6, 7, 9, 8])
+            graph_sets = {
+                split: BatteryRawGraphDataset(
+                    dataset_name="mit",
+                    data_root=root,
+                    split=split,
+                    history_len=32,
+                    max_horizon=20,
+                    max_cycles=55,
+                )
+                for split in ("train", "val", "test")
+            }
+            sequence_sets = {
+                split: BatterySequenceDataset(
+                    dataset_name="mit",
+                    data_root=root,
+                    split=split,
+                    input_len=32,
+                    pred_len=20,
+                    max_cycles=55,
+                )
+                for split in ("train", "val", "test")
+            }
+
+            expected_scale = 7 * 55
+            for dataset in (*graph_sets.values(), *sequence_sets.values()):
+                self.assertEqual(dataset.cycle_scale, expected_scale)
+            test_values = np.concatenate(list(sequence_sets["test"].series.values()), axis=0)
+            self.assertGreater(float(test_values[:, 4].max()), 1.0)
+
+    def test_graph_cache_config_identifies_fixed_horizon_train_scale_protocol(self):
+        config = battery_graph_cache_config(
+            dataset_name="mit",
+            split="train",
+            max_horizon=20,
+            resample_len=128,
+            delay_dim=8,
+            delay_lag=1,
+            include_derivatives=True,
+            include_hankel=True,
+            include_ic_dv=True,
+            allow_summary_fallback=False,
+            seed=42,
+            max_cycles=None,
+            history_len=32,
+        )
+
+        self.assertGreater(BATTERY_GRAPH_CACHE_VERSION, 4)
+        self.assertEqual(config["target_protocol"], "32-observed-20-future-only-full-horizon")
+        self.assertEqual(config["cycle_scale_protocol"], "train-split-max-cycle-id-no-clip")
+
+    def test_precomputed_graph_cache_matches_uncached_full_horizon_samples(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_mit_data(root, [1, 1, 1, 1])
+            common = {
+                "dataset_name": "mit",
+                "data_root": root,
+                "split": "train",
+                "history_len": 32,
+                "max_horizon": 20,
+                "resample_len": 16,
+                "delay_dim": 2,
+                "include_derivatives": False,
+                "include_hankel": False,
+                "include_ic_dv": False,
+                "allow_summary_fallback": True,
+            }
+            uncached = BatteryRawGraphDataset(**common)
+            precompute_split(
+                Namespace(
+                    dataset="mit",
+                    data_root=str(root),
+                    cache_dir=str(root / "cache"),
+                    pred_len=20,
+                    history_len=32,
+                    resample_len=16,
+                    delay_dim=2,
+                    delay_lag=1,
+                    no_derivative_map=True,
+                    no_hankel_map=True,
+                    no_ic_dv=True,
+                    allow_summary_fallback=True,
+                    max_cycles=None,
+                    seed=42,
+                    batch_size=1,
+                    num_workers=0,
+                    force=True,
+                ),
+                "train",
+            )
+            cached = BatteryRawGraphDataset(
+                **common,
+                precomputed_cache_dir=str(root / "cache"),
+                require_precomputed_cache=True,
+            )
+
+            self.assertEqual(len(cached), len(uncached))
+            self.assertEqual(cached.cycle_scale, uncached.cycle_scale)
+            for index in range(len(uncached)):
+                direct = uncached[index]
+                from_cache = cached[index]
+                for key in ("maps", "y", "mask", "horizon", "target_steps", "history_features", "history_cycles"):
+                    torch.testing.assert_close(from_cache[key], direct[key], rtol=0.0, atol=0.0)
+                self.assertEqual(from_cache["prompt"], direct["prompt"])
+                self.assertEqual(from_cache["cell_id"], direct["cell_id"])
+                self.assertEqual(from_cache["cycle"], direct["cycle"])
+            del cached
+            gc.collect()
 
 
 class BaselineTrainerIntegrationTests(unittest.TestCase):
@@ -107,6 +382,77 @@ class PipelineScriptTests(unittest.TestCase):
         self.assertNotIn('--lr "$LR"', text)
         self.assertNotIn('--early_stop_patience "$EARLY_STOP_PATIENCE"', text)
 
+    def test_force_and_version_mismatch_remove_main_and_baseline_variant_outputs(self):
+        scripts_and_outputs = (
+            ("scripts/run_battery_main_full_hf.sh", Path("graph_report_ts/battery/mit")),
+            ("scripts/run_battery_official_baselines.sh", Path("baselines/mit/patchtst")),
+        )
+        with TemporaryDirectory(dir=Path.cwd()) as tmp:
+            temp_root = Path(tmp)
+            relative_root = temp_root.relative_to(Path.cwd()) / "runs"
+            for script, variant_suffix in scripts_and_outputs:
+                for force_retrain, config_version in (("1", TRAINING_STRATEGY_VERSION), ("0", "v2-stale")):
+                    variant_dir = Path(relative_root) / variant_suffix
+                    variant_dir.mkdir(parents=True, exist_ok=True)
+                    (variant_dir / "stale.pt").write_text("stale", encoding="utf-8")
+                    (variant_dir / "run_config.json").write_text(
+                        json.dumps({"training_strategy_version": config_version}),
+                        encoding="utf-8",
+                    )
+                    subprocess.run(
+                        [
+                            "bash",
+                            "-c",
+                            f"OUT_ROOT={relative_root.as_posix()} FORCE_RETRAIN={force_retrain} "
+                            f"USE_BATTERY_GRAPH_CACHE=0 BASELINE_MODELS=patchtst PY=true bash {script} .",
+                        ],
+                        cwd=Path.cwd(),
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+
+                    self.assertFalse(variant_dir.exists(), (script, force_retrain, config_version))
+
+    def test_matching_incomplete_outputs_are_preserved_for_resume(self):
+        scripts_and_outputs = (
+            ("scripts/run_battery_main_full_hf.sh", Path("graph_report_ts/battery/mit")),
+            ("scripts/run_battery_official_baselines.sh", Path("baselines/mit/patchtst")),
+        )
+        with TemporaryDirectory(dir=Path.cwd()) as tmp:
+            temp_root = Path(tmp)
+            relative_root = temp_root.relative_to(Path.cwd()) / "runs"
+            for script, variant_suffix in scripts_and_outputs:
+                variant_dir = Path(relative_root) / variant_suffix
+                variant_dir.mkdir(parents=True, exist_ok=True)
+                stale_checkpoint = variant_dir / "last.pt"
+                stale_checkpoint.write_text("resume", encoding="utf-8")
+                (variant_dir / "run_config.json").write_text(
+                    json.dumps({"training_strategy_version": TRAINING_STRATEGY_VERSION}),
+                    encoding="utf-8",
+                )
+                subprocess.run(
+                    [
+                        "bash",
+                        "-c",
+                        f"OUT_ROOT={relative_root.as_posix()} FORCE_RETRAIN=0 "
+                        f"USE_BATTERY_GRAPH_CACHE=0 BASELINE_MODELS=patchtst PY=true bash {script} .",
+                    ],
+                    cwd=Path.cwd(),
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+
+                self.assertTrue(stale_checkpoint.exists(), script)
+                text = Path(script).read_text(encoding="utf-8")
+                self.assertIn('if [ "$FRESH_RUN" = "1" ]; then', text)
+                self.assertIn("RESUME_ARGS=(--no_resume)", text)
+
     def test_public_docs_describe_the_v3_training_protocol(self):
         readme = Path("README.md").read_text(encoding="utf-8")
         report = Path("docs/work_report.md").read_text(encoding="utf-8")
@@ -121,6 +467,10 @@ class PipelineScriptTests(unittest.TestCase):
             self.assertIn("delayed/ramped alignment", text)
             self.assertIn("plateau scheduler and early stopping", text)
             self.assertIn("source-native", text)
+            self.assertIn("32 observed cycles", text)
+            self.assertIn("20 future-only", text)
+            self.assertIn("train-only dataset-global cycle scaling", text)
+            self.assertIn("no clipping", text)
 
         self.assertIn("fixed AdamW/SmoothL1/no scheduler", report)
         self.assertIn("73/79/54/77/72", report)
@@ -203,6 +553,20 @@ class AblationCompletionPolicyTests(unittest.TestCase):
             remove_ablation_output_if_forced(variant_dir, force_retrain=True)
             self.assertFalse(variant_dir.exists())
 
+    def test_version_mismatch_removes_variant_output_before_a_fresh_ablation(self):
+        with TemporaryDirectory() as tmp:
+            variant_dir = Path(tmp) / "full"
+            result_dir = variant_dir / "battery" / "mit"
+            result_dir.mkdir(parents=True)
+            self.write_json(result_dir / "run_config.json", {"training_strategy_version": "v2-legacy"})
+            (result_dir / "last.pt").write_text("stale", encoding="utf-8")
+
+            start_fresh = not has_matching_strategy_version(result_dir, self.strategy_version)
+            remove_ablation_output_if_fresh(variant_dir, start_fresh)
+
+            self.assertTrue(start_fresh)
+            self.assertFalse(variant_dir.exists())
+
 
 class TrainingProfileTests(unittest.TestCase):
     def test_all_official_baselines_have_explicit_profiles(self):
@@ -251,13 +615,18 @@ class BaselineMechanicsTests(unittest.TestCase):
         step_baseline_batch_scheduler(scheduler, profile)
         self.assertEqual(scheduler.last_epoch, before + 1)
 
-    def test_type1_halves_lr_each_epoch(self):
+    def test_type1_sets_epoch_two_to_half_lr_after_epoch_one_completes(self):
         model = torch.nn.Linear(2, 1)
         profile = get_baseline_training_profile("itransformer")
         optimizer = build_baseline_optimizer(model, profile)
         scheduler = build_baseline_scheduler(optimizer, profile, steps_per_epoch=4)
-        step_baseline_epoch_scheduler(scheduler, optimizer, profile, epoch=2)
+        step_baseline_epoch_scheduler(scheduler, optimizer, profile, epoch=1)
         self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 5e-5)
+
+    def test_formal_time_llm_path_has_no_autocast_or_amp(self):
+        text = Path("bstalignment/train_battery_official_baselines.py").read_text(encoding="utf-8").lower()
+        self.assertNotIn("autocast", text)
+        self.assertNotIn("gradscaler", text)
 
     def test_timecma_cosine_and_mse(self):
         model = torch.nn.Linear(2, 1)
@@ -307,6 +676,31 @@ class MainStrategyTests(unittest.TestCase):
             ]
             self.assertEqual(len(matching_groups), 1)
             self.assertEqual(matching_groups[0]["weight_decay"], 0.0)
+
+    def test_actual_graph_report_layernorm_parameters_are_excluded_from_weight_decay(self):
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="enable_nested_tensor is True")
+            model = GraphReportTS(
+                GraphReportTSConfig(
+                    d_model=8,
+                    patch_size=2,
+                    patch_stride=1,
+                    graph_layers=1,
+                    topk_edges=1,
+                    use_hf_text_encoder=False,
+                    temporal_heads=2,
+                )
+            )
+        optimizer = build_graph_report_optimizer(model, MAIN_TRAINING_PROFILE)
+
+        for parameter in (model.context_fuser[0].weight, model.context_fuser[0].bias):
+            groups = [
+                group
+                for group in optimizer.param_groups
+                if any(candidate is parameter for candidate in group["params"])
+            ]
+            self.assertEqual(len(groups), 1)
+            self.assertEqual(groups[0]["weight_decay"], 0.0)
 
     def test_lr_warmup_reaches_role_targets(self):
         model = TinyGraphReport()
@@ -375,6 +769,27 @@ class MainStrategyTests(unittest.TestCase):
 
 
 class MainTrainerPolicyTests(unittest.TestCase):
+    def test_empty_validation_is_rejected_without_test_fallback(self):
+        with self.assertRaisesRegex(RuntimeError, "validation"):
+            training_strategy.require_nonempty_splits([1], [], [1], "fixture trainer")
+        baseline_source = Path("bstalignment/train_battery_official_baselines.py").read_text(encoding="utf-8")
+        graph_source = Path("bstalignment/train_graph_report.py").read_text(encoding="utf-8")
+        self.assertNotIn("val_eval_ds", baseline_source)
+        self.assertIn("require_nonempty_splits", baseline_source)
+        self.assertIn("require_nonempty_splits", graph_source)
+
+    def test_checkpoint_strategy_version_mismatch_is_rejected_by_both_trainers(self):
+        with self.assertRaisesRegex(RuntimeError, "training strategy version"):
+            training_strategy.require_checkpoint_strategy_version(
+                {"training_strategy_version": "v2-stale"},
+                "fixture trainer",
+            )
+        for path in (
+            Path("bstalignment/train_battery_official_baselines.py"),
+            Path("bstalignment/train_graph_report.py"),
+        ):
+            self.assertIn("require_checkpoint_strategy_version", path.read_text(encoding="utf-8"), path)
+
     def test_stale_count_starts_at_epoch_20_and_stops_after_20_failures(self):
         stale = update_graph_report_stale(
             epoch=19,

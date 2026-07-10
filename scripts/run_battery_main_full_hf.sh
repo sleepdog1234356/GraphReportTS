@@ -11,7 +11,7 @@ FORCE_RETRAIN="${FORCE_RETRAIN:-0}"
 USE_GRAPH_CACHE="${USE_BATTERY_GRAPH_CACHE:-1}"
 GRAPH_CACHE_DIR="${BATTERY_GRAPH_CACHE_DIR:-runs/cache/battery_graph}"
 TEXT_MODEL="${TEXT_MODEL:-hf_models/distilbert-base-uncased}"
-TRAINING_STRATEGY_VERSION="v3-source-profiles-main-adaptive"
+TRAINING_STRATEGY_VERSION="v3-source-profiles-main-adaptive-fixed-horizon-train-scale"
 cd "$ROOT"
 mkdir -p "$OUT_ROOT/logs"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
@@ -39,8 +39,18 @@ for dataset in mit calce xjtu; do
     echo "skip completed full-HF GraphReportTS $dataset"
     continue
   fi
+  FRESH_RUN=0
+  if [ "$FORCE_RETRAIN" = "1" ]; then
+    rm -rf -- "$out"
+    FRESH_RUN=1
+  elif [ ! -e "$out" ]; then
+    FRESH_RUN=1
+  elif ! has_current_strategy_version "$out"; then
+    rm -rf -- "$out"
+    FRESH_RUN=1
+  fi
   RESUME_ARGS=()
-  if [ "$FORCE_RETRAIN" = "1" ] || ! has_current_strategy_version "$out"; then
+  if [ "$FRESH_RUN" = "1" ]; then
     RESUME_ARGS=(--no_resume)
   fi
   CACHE_ARGS=()

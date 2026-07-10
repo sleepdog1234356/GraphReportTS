@@ -12,8 +12,10 @@ import torch
 from torch.utils.data import Dataset
 
 try:
+    from .battery_protocol import split_mit_items
     from .prompting import build_battery_prompt, build_cycle_prompt, aging_stage_from_soh, aging_stage_name
 except ImportError:
+    from battery_protocol import split_mit_items
     from prompting import build_battery_prompt, build_cycle_prompt, aging_stage_from_soh, aging_stage_name
 
 
@@ -228,15 +230,13 @@ def _rolling_slope(series: pd.Series, window: int = 5) -> pd.Series:
 
 
 def split_cells(records: Sequence[CellRecord], train_ratio=0.7, val_ratio=0.15, seed=42):
-    rng = np.random.default_rng(seed)
-    idx = np.arange(len(records))
-    rng.shuffle(idx)
-    n_train = int(len(idx) * train_ratio)
-    n_val = int(len(idx) * val_ratio)
-    train_idx = idx[:n_train]
-    val_idx = idx[n_train : n_train + n_val]
-    test_idx = idx[n_train + n_val :]
-    return ([records[i] for i in train_idx], [records[i] for i in val_idx], [records[i] for i in test_idx])
+    splits = split_mit_items(
+        records,
+        seed=seed,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+    )
+    return splits["train"], splits["val"], splits["test"]
 
 
 class MITBatterySOHDataset(Dataset):
