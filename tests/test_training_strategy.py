@@ -1,4 +1,5 @@
 from argparse import Namespace
+from pathlib import Path
 import unittest
 
 import torch
@@ -36,6 +37,68 @@ class BaselineTrainerIntegrationTests(unittest.TestCase):
         profile = resolve_baseline_profile(args)
         self.assertEqual(profile.max_epochs, 2)
         self.assertEqual(profile.early_stop_patience, 1)
+
+
+class PipelineScriptTests(unittest.TestCase):
+    def test_formal_pipeline_is_main_first_and_uses_v3_root(self):
+        text = Path("scripts/run_battery_v3_training_strategy_pipeline.sh").read_text(encoding="utf-8")
+        self.assertIn("runs/full_hf_v3_training_strategy_nosoh", text)
+        main = text.index("run_battery_main_full_hf.sh")
+        baselines = text.index("run_battery_official_baselines.sh")
+        ablations = text.index("run_battery_ablations_full_hf.sh")
+        self.assertLess(main, baselines)
+        self.assertLess(baselines, ablations)
+
+    def test_pipeline_uses_approved_hardware_settings(self):
+        text = Path("scripts/run_battery_v3_training_strategy_pipeline.sh").read_text(encoding="utf-8")
+        self.assertIn('NUM_WORKERS="${NUM_WORKERS:-16}"', text)
+        self.assertIn('BASELINE_NUM_WORKERS="${BASELINE_NUM_WORKERS:-8}"', text)
+        self.assertIn('BATCH_SIZE="${BATCH_SIZE:-128}"', text)
+        self.assertIn('BATTERY_GRAPH_CACHE_DIR:-runs/cache/battery_graph', text)
+        for setting in (
+            "OMP_NUM_THREADS",
+            "MKL_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+            "TOKENIZERS_PARALLELISM",
+            "PYTORCH_CUDA_ALLOC_CONF",
+        ):
+            self.assertIn(setting, text)
+
+    def test_formal_scripts_use_shared_cache_and_versioned_completion(self):
+        for path in (
+            Path("scripts/run_battery_main_full_hf.sh"),
+            Path("scripts/run_battery_official_baselines.sh"),
+            Path("scripts/run_battery_ablations_full_hf.sh"),
+        ):
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("run_config.json", text, path)
+            self.assertIn("test_metrics.json", text, path)
+            self.assertIn("v3-source-profiles-main-adaptive", text, path)
+            self.assertNotIn("${OUT_ROOT}/cache/battery_graph", text, path)
+        self.assertIn("runs/cache/battery_graph", Path("scripts/run_battery_main_full_hf.sh").read_text(encoding="utf-8"))
+        self.assertIn("runs/cache/battery_graph", Path("scripts/run_battery_ablations_full_hf.sh").read_text(encoding="utf-8"))
+
+    def test_main_and_ablation_use_approved_workers_and_batch_size(self):
+        for path in (
+            Path("scripts/run_battery_main_full_hf.sh"),
+            Path("scripts/run_battery_ablations_full_hf.sh"),
+        ):
+            text = path.read_text(encoding="utf-8")
+            self.assertIn('BATCH_SIZE="${', text, path)
+            self.assertIn(':-128}"', text, path)
+            self.assertIn('NUM_WORKERS="${NUM_WORKERS:-16}"', text, path)
+        baseline = Path("scripts/run_battery_official_baselines.sh").read_text(encoding="utf-8")
+        self.assertIn('BATCH_SIZE="${BASELINE_BATCH_SIZE:-128}"', baseline)
+        self.assertIn('NUM_WORKERS="${BASELINE_NUM_WORKERS:-8}"', baseline)
+
+    def test_baseline_script_does_not_force_profile_budgets(self):
+        text = Path("scripts/run_battery_official_baselines.sh").read_text(encoding="utf-8")
+        self.assertNotIn("BASELINE_EPOCHS", text)
+        self.assertNotIn("BASELINE_LR", text)
+        self.assertNotIn("BASELINE_EARLY_STOP_PATIENCE", text)
+        self.assertNotIn('--epochs "$EPOCHS"', text)
+        self.assertNotIn('--lr "$LR"', text)
+        self.assertNotIn('--early_stop_patience "$EARLY_STOP_PATIENCE"', text)
 
 
 class TrainingProfileTests(unittest.TestCase):

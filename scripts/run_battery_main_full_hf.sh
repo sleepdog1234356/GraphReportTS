@@ -2,34 +2,46 @@
 set -euo pipefail
 
 ROOT="${1:-$(pwd)}"
-OUT_ROOT="${OUT_ROOT:-runs/full_hf}"
-EPOCHS="${EPOCHS:-80}"
+OUT_ROOT="${OUT_ROOT:-runs/full_hf_v3_training_strategy_nosoh}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
 PRED_LEN="${PRED_LEN:-20}"
 HISTORY_LEN="${HISTORY_LEN:-32}"
-NUM_WORKERS="${NUM_WORKERS:-8}"
-W_ALIGN="${W_ALIGN:-0.001}"
-ALIGN_WARMUP_EPOCHS="${ALIGN_WARMUP_EPOCHS:-0}"
+NUM_WORKERS="${NUM_WORKERS:-16}"
 FORCE_RETRAIN="${FORCE_RETRAIN:-0}"
-EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-$EPOCHS}"
 USE_GRAPH_CACHE="${USE_BATTERY_GRAPH_CACHE:-1}"
-GRAPH_CACHE_DIR="${BATTERY_GRAPH_CACHE_DIR:-${OUT_ROOT}/cache/battery_graph}"
+GRAPH_CACHE_DIR="${BATTERY_GRAPH_CACHE_DIR:-runs/cache/battery_graph}"
 TEXT_MODEL="${TEXT_MODEL:-hf_models/distilbert-base-uncased}"
+TRAINING_STRATEGY_VERSION="v3-source-profiles-main-adaptive"
 cd "$ROOT"
 mkdir -p "$OUT_ROOT/logs"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 PY="${PY:-python -u}"
 
+has_current_strategy_version() {
+  local out="$1"
+  [ -f "$out/run_config.json" ] && \
+    grep -Eq "\"training_strategy_version\"[[:space:]]*:[[:space:]]*\"${TRAINING_STRATEGY_VERSION}\"" "$out/run_config.json"
+}
+
+is_completed_current_strategy() {
+  local out="$1"
+  [ -f "$out/test_metrics.json" ] && has_current_strategy_version "$out"
+}
+
 for dataset in mit calce xjtu; do
   out="${OUT_ROOT}/graph_report_ts/battery/${dataset}"
-  if [ "$FORCE_RETRAIN" = "1" ]; then
-    rm -rf "$out"
-  elif [ -f "$out/test_metrics.json" ]; then
+  if [ "$FORCE_RETRAIN" != "1" ] && is_completed_current_strategy "$out"; then
     echo "skip completed full-HF GraphReportTS $dataset"
     continue
+  fi
+  RESUME_ARGS=()
+  if [ "$FORCE_RETRAIN" = "1" ] || ! has_current_strategy_version "$out"; then
+    RESUME_ARGS=(--no_resume)
   fi
   CACHE_ARGS=()
   if [ "$USE_GRAPH_CACHE" = "1" ]; then
@@ -51,15 +63,10 @@ for dataset in mit calce xjtu; do
     --out_dir "${OUT_ROOT}/graph_report_ts" \
     --pred_len "$PRED_LEN" \
     --history_len "$HISTORY_LEN" \
-    --epochs "$EPOCHS" \
     --batch_size "$BATCH_SIZE" \
     --num_workers "$NUM_WORKERS" \
     --device cuda \
-    --w_align "$W_ALIGN" \
-    --align_warmup_epochs "$ALIGN_WARMUP_EPOCHS" \
-    --early_stop_patience "$EARLY_STOP_PATIENCE" \
-    --early_stop_min_delta 0 \
     --text_model "$TEXT_MODEL" \
     "${CACHE_ARGS[@]}" \
-    --no_resume 2>&1 | tee "${OUT_ROOT}/logs/main_${dataset}.log"
+    "${RESUME_ARGS[@]}" 2>&1 | tee "${OUT_ROOT}/logs/main_${dataset}.log"
 done
