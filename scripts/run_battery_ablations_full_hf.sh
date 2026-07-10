@@ -16,7 +16,21 @@ OUT_ROOT="$(asset_path "${OUT_ROOT:-runs/full_hf_v3_training_strategy_nosoh}")"
 GRAPH_CACHE_DIR="$(asset_path "${BATTERY_GRAPH_CACHE_DIR:-runs/cache/battery_graph}")"
 SEQUENCE_CACHE_DIR="$(asset_path "${BATTERY_SEQUENCE_CACHE_DIR:-runs/cache/battery_sequence}")"
 TEXT_MODEL="$(asset_path "${TEXT_MODEL:-hf_models/distilbert-base-uncased}")"
-FULL_REFERENCE_COMMIT="${FULL_REFERENCE_COMMIT:-$(git -C "$ASSET_ROOT" rev-parse HEAD)}"
+DEPLOYED_FULL_REFERENCE_COMMIT="1d6a8f975fd3225cc087af90f03a00414ce84591"
+if [ "${FULL_REFERENCE_COMMIT+x}" = "x" ]; then
+  if [[ ! "$FULL_REFERENCE_COMMIT" =~ ^[[:xdigit:]]{40}$ ]]; then
+    echo "FULL_REFERENCE_COMMIT must be a non-empty 40-hex commit" >&2
+    exit 2
+  fi
+  FULL_REFERENCE_COMMIT="${FULL_REFERENCE_COMMIT,,}"
+else
+  FULL_REFERENCE_COMMIT="$DEPLOYED_FULL_REFERENCE_COMMIT"
+fi
+if [ "$FULL_REFERENCE_COMMIT" != "$DEPLOYED_FULL_REFERENCE_COMMIT" ] && \
+   [ "${ALLOW_FULL_REFERENCE_COMMIT_OVERRIDE:-0}" != "1" ]; then
+  echo "Non-default FULL_REFERENCE_COMMIT requires ALLOW_FULL_REFERENCE_COMMIT_OVERRIDE=1" >&2
+  exit 2
+fi
 
 FORCE_ARGS=()
 case "${ABLATION_FORCE_RETRAIN:-0}" in

@@ -581,6 +581,8 @@ class BaselineTrainerIntegrationTests(unittest.TestCase):
 
 
 class PipelineScriptTests(unittest.TestCase):
+    DEPLOYED_FULL_REFERENCE_COMMIT = "1d6a8f975fd3225cc087af90f03a00414ce84591"
+
     @staticmethod
     def formal_config(stage, version=TRAINING_STRATEGY_VERSION):
         args = {"pred_len": 20}
@@ -612,6 +614,58 @@ class PipelineScriptTests(unittest.TestCase):
             encoding="utf-8",
             errors="replace",
         )
+
+    @staticmethod
+    def bash_path(path):
+        resolved = Path(path).resolve().as_posix()
+        if sys.platform == "win32":
+            return f"/mnt/{resolved[0].lower()}/{resolved[3:]}"
+        return resolved
+
+    def run_ablation_launcher(self, **overrides):
+        with TemporaryDirectory(dir=Path.cwd()) as tmp:
+            root = Path(tmp)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            capture = root / "args.txt"
+            git_capture = root / "git-called.txt"
+            (fake_bin / "python").write_bytes(
+                b'#!/usr/bin/env bash\nprintf \'%s\\n\' "$@" > "$CAPTURE"\n'
+            )
+            (fake_bin / "git").write_bytes(
+                b'#!/usr/bin/env bash\nprintf \'called\\n\' > "$GIT_CAPTURE"\n'
+                b"printf '91b7649a484ef24fd837b386b8a51ba492d2ea78\\n'\n"
+            )
+            fake_bin.chmod(0o755)
+            (fake_bin / "python").chmod(0o755)
+            (fake_bin / "git").chmod(0o755)
+            settings = {
+                "CAPTURE": self.bash_path(capture),
+                "GIT_CAPTURE": self.bash_path(git_capture),
+                "OUT_ROOT": "runs/full_hf_v3_training_strategy_nosoh",
+                **overrides,
+            }
+            assignments = " ".join(
+                f"{key}={shlex.quote(str(value))}" for key, value in settings.items()
+            )
+            launcher_path = (
+                f"{self.bash_path(fake_bin)}:"
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            )
+            command = (
+                f"PATH={shlex.quote(launcher_path)} {assignments} "
+                f"bash scripts/run_battery_ablations_full_hf.sh {shlex.quote(self.bash_path(root))}"
+            )
+            result = subprocess.run(
+                ["bash", "-c", command],
+                cwd=Path.cwd(),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            arguments = capture.read_text(encoding="utf-8").splitlines() if capture.exists() else []
+            return result, arguments, git_capture.exists()
 
     def test_formal_pipeline_is_main_first_and_uses_v3_root(self):
         text = Path("scripts/run_battery_v3_training_strategy_pipeline.sh").read_text(encoding="utf-8")
@@ -665,7 +719,39 @@ class PipelineScriptTests(unittest.TestCase):
         self.assertIn("readlink -f", ablation)
         self.assertNotIn("bstalignment.run_ablation_suite", ablation)
         self.assertNotIn("FORCE_RETRAIN", ablation.replace("ABLATION_FORCE_RETRAIN", ""))
+        self.assertNotIn('git -C "$ASSET_ROOT" rev-parse HEAD', ablation)
         self.assertIn('export ABLATION_FORCE_RETRAIN="${ABLATION_FORCE_RETRAIN:-0}"', pipeline)
+
+    def test_formal_ablation_default_uses_deployed_full_snapshot_not_asset_head(self):
+        result, arguments, asset_git_called = self.run_ablation_launcher()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(asset_git_called)
+        commit_index = arguments.index("--full_reference_commit") + 1
+        self.assertEqual(arguments[commit_index], self.DEPLOYED_FULL_REFERENCE_COMMIT)
+
+    def test_formal_ablation_rejects_empty_nonhex_and_short_reference_overrides(self):
+        for value in ("", "z" * 40, "91b7649"):
+            with self.subTest(value=value):
+                result, arguments, _ = self.run_ablation_launcher(FULL_REFERENCE_COMMIT=value)
+                self.assertEqual(arguments, [])
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("FULL_REFERENCE_COMMIT must be a non-empty 40-hex commit", result.stderr)
+
+    def test_formal_ablation_nondefault_reference_requires_explicit_confirmation(self):
+        alternate = "91b7649a484ef24fd837b386b8a51ba492d2ea78"
+        rejected, arguments, _ = self.run_ablation_launcher(FULL_REFERENCE_COMMIT=alternate)
+        self.assertEqual(arguments, [])
+        self.assertEqual(rejected.returncode, 2, rejected.stdout + rejected.stderr)
+        self.assertIn("ALLOW_FULL_REFERENCE_COMMIT_OVERRIDE=1", rejected.stderr)
+
+        accepted, arguments, _ = self.run_ablation_launcher(
+            FULL_REFERENCE_COMMIT=alternate,
+            ALLOW_FULL_REFERENCE_COMMIT_OVERRIDE="1",
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+        commit_index = arguments.index("--full_reference_commit") + 1
+        self.assertEqual(arguments[commit_index], alternate)
 
     def test_formal_ablation_shell_separates_code_from_active_assets(self):
         text = Path("scripts/run_battery_ablations_full_hf.sh").read_text(encoding="utf-8")
@@ -947,6 +1033,15 @@ class PipelineScriptTests(unittest.TestCase):
                 self.assertIn("BATTERY_SEQUENCE_CACHE_DIR", text)
                 self.assertIn("ABLATION_FORCE_RETRAIN", text)
                 self.assertIn("FULL_REFERENCE_COMMIT", text)
+                self.assertIn(self.DEPLOYED_FULL_REFERENCE_COMMIT, text)
+                self.assertIn("deployed full v3 source snapshot", text)
+                self.assertIn("not the active asset-tree HEAD", text)
+                self.assertIn("`ALLOW_FULL_REFERENCE_COMMIT_OVERRIDE=1`", text)
+                self.assertIn("Dry-run does not require full artifacts", text)
+                self.assertIn(
+                    "non-dry execution still requires completed full artifacts for MIT, CALCE, and XJTU",
+                    text,
+                )
                 for row in ("full", *variants):
                     self.assertIn(f"| `{row}` |", text)
 
