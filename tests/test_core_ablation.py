@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from argparse import Namespace
 import json
+from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
+import pickle
 import re
 from tempfile import TemporaryDirectory
 import unittest
@@ -237,14 +239,20 @@ class SequenceDatasetTests(unittest.TestCase):
 
 class SequenceCacheTests(unittest.TestCase):
     @staticmethod
-    def _args(root: Path, *, batch_size: int = 4, num_workers: int = 0) -> Namespace:
+    def _args(
+        root: Path,
+        *,
+        batch_size: int = 4,
+        num_workers: int = 0,
+        resample_len: int = 16,
+    ) -> Namespace:
         return Namespace(
             dataset="calce",
             data_root=str(root),
             cache_dir=str(root / "sequence_cache"),
             pred_len=20,
             history_len=32,
-            resample_len=16,
+            resample_len=resample_len,
             seed=42,
             max_cycles=None,
             batch_size=batch_size,
@@ -253,14 +261,14 @@ class SequenceCacheTests(unittest.TestCase):
         )
 
     @staticmethod
-    def _cached_kwargs(root: Path) -> dict:
+    def _cached_kwargs(root: Path, *, resample_len: int = 16) -> dict:
         return {
             "dataset_name": "calce",
             "data_root": root,
             "split": "train",
             "history_len": 32,
             "max_horizon": 20,
-            "resample_len": 16,
+            "resample_len": resample_len,
             "input_representation": "sequence",
             "precomputed_sequence_cache_dir": str(root / "sequence_cache"),
             "require_precomputed_sequence_cache": True,
@@ -290,6 +298,7 @@ class SequenceCacheTests(unittest.TestCase):
             self.assertTrue(cache_path.exists())
             with BatteryRawGraphDataset(**self._cached_kwargs(root)) as cached:
                 self.assertEqual(len(cached), len(direct))
+                self.assertEqual(cached.cycle_scale, direct.cycle_scale)
                 cached_arrays = (
                     cached._cache_cycle_sequences,
                     cached._cache_history_indices,
@@ -317,6 +326,109 @@ class SequenceCacheTests(unittest.TestCase):
                         )
                     self.assertEqual(from_cache["prompt"], direct_item["prompt"])
             self.assertTrue(all(array._mmap.closed for array in cached_arrays))
+
+    def test_forking_pickler_reopens_memmaps_without_serializing_array_payloads(self):
+        from tests.test_training_strategy import BatteryDataFixtureMixin
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            BatteryDataFixtureMixin.write_processed_data(root, [1, 1, 1, 1])
+            payload_sizes = []
+            array_sizes = []
+            datasets = []
+            try:
+                for resample_len in (16, 128):
+                    precompute_sequence_split(
+                        self._args(root, resample_len=resample_len), "train"
+                    )
+                    original = BatteryRawGraphDataset(
+                        **self._cached_kwargs(root, resample_len=resample_len)
+                    )
+                    payload = bytes(ForkingPickler.dumps(original))
+                    restored = pickle.loads(payload)
+                    datasets.extend((original, restored))
+                    arrays = [
+                        getattr(restored, name)
+                        for name in battery_data.SEQUENCE_CACHE_ARRAY_ATTRS
+                    ]
+                    self.assertTrue(all(isinstance(array, np.memmap) for array in arrays))
+                    self.assertTrue(all(array.filename is not None for array in arrays))
+                    self.assertTrue(all(array._mmap is not None and not array._mmap.closed for array in arrays))
+                    for key in (
+                        "raw_sequences",
+                        "y",
+                        "mask",
+                        "target_steps",
+                        "history_features",
+                        "history_cycles",
+                    ):
+                        torch.testing.assert_close(
+                            restored[0][key], original[0][key], rtol=0.0, atol=0.0
+                        )
+                    payload_sizes.append(len(payload))
+                    array_sizes.append(sum(array.nbytes for array in arrays))
+            finally:
+                for dataset in datasets:
+                    dataset.close()
+            self.assertGreater(array_sizes[1], array_sizes[0] * 3)
+            self.assertLess(abs(payload_sizes[1] - payload_sizes[0]), 4096)
+
+    def test_invalid_cycle_scale_is_rejected_before_array_loading(self):
+        from tests.test_training_strategy import BatteryDataFixtureMixin
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            BatteryDataFixtureMixin.write_processed_data(root, [1, 1, 1, 1])
+            cache_path = precompute_sequence_split(self._args(root), "train")
+            manifest_path = cache_path / "manifest.json"
+            original_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            cases = {
+                "missing": None,
+                "nan": float("nan"),
+                "positive infinity": float("inf"),
+                "negative infinity": float("-inf"),
+                "zero": 0.0,
+                "negative": -1.0,
+                "non-numeric": "invalid",
+            }
+            for label, value in cases.items():
+                with self.subTest(label=label):
+                    manifest = json.loads(json.dumps(original_manifest))
+                    if value is None:
+                        manifest.pop("cycle_scale")
+                    else:
+                        manifest["cycle_scale"] = value
+                    manifest_path.write_text(
+                        json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
+                    )
+                    with patch(
+                        "bstalignment.data_battery_raw.np.load",
+                        side_effect=AssertionError("arrays loaded before cycle_scale validation"),
+                    ):
+                        with self.assertRaisesRegex(
+                            ValueError,
+                            rf"{re.escape(str(cache_path))}.*cycle_scale",
+                        ):
+                            BatteryRawGraphDataset(**self._cached_kwargs(root))
+
+    def test_manifest_missing_file_mapping_key_names_key_and_cache(self):
+        from tests.test_training_strategy import BatteryDataFixtureMixin
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            BatteryDataFixtureMixin.write_processed_data(root, [1, 1, 1, 1])
+            cache_path = precompute_sequence_split(self._args(root), "train")
+            manifest_path = cache_path / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["files"].pop("y")
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                rf"{re.escape(str(cache_path))}.*files.*y",
+            ):
+                BatteryRawGraphDataset(**self._cached_kwargs(root))
 
     def test_missing_required_sequence_cache_names_expected_path(self):
         from tests.test_training_strategy import BatteryDataFixtureMixin

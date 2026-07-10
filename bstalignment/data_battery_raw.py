@@ -442,6 +442,20 @@ class BatteryRawGraphDataset(Dataset):
             )
         if manifest.get("config") != self.sequence_cache_config:
             raise ValueError(f"Invalid battery sequence cache at {cache_path}: config mismatch")
+        raw_cycle_scale = manifest.get("cycle_scale")
+        try:
+            cycle_scale = float(raw_cycle_scale)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid battery sequence cache at {cache_path}: cycle_scale must be a finite positive number, "
+                f"got {raw_cycle_scale!r}"
+            ) from exc
+        if isinstance(raw_cycle_scale, bool) or not np.isfinite(cycle_scale) or cycle_scale <= 0.0:
+            raise ValueError(
+                f"Invalid battery sequence cache at {cache_path}: cycle_scale must be a finite positive number, "
+                f"got {raw_cycle_scale!r}"
+            )
+        self.cycle_scale = cycle_scale
         files = manifest.get("files", {})
         required = [
             "cycle_sequences",
@@ -454,6 +468,22 @@ class BatteryRawGraphDataset(Dataset):
             "history_cycles",
             "meta",
         ]
+        if not isinstance(files, dict):
+            raise ValueError(
+                f"Invalid battery sequence cache at {cache_path}: files mapping must be an object"
+            )
+        missing_keys = [name for name in required if name not in files]
+        if missing_keys:
+            raise ValueError(
+                f"Invalid battery sequence cache at {cache_path}: files mapping missing keys {missing_keys}"
+            )
+        invalid_entries = [
+            name for name in required if not isinstance(files[name], str) or not files[name]
+        ]
+        if invalid_entries:
+            raise ValueError(
+                f"Invalid battery sequence cache at {cache_path}: files mapping has invalid entries {invalid_entries}"
+            )
         missing = [name for name in required if not (cache_path / str(files.get(name, ""))).exists()]
         if missing:
             raise FileNotFoundError(
@@ -556,7 +586,6 @@ class BatteryRawGraphDataset(Dataset):
         self._cache_history_features = arrays["history_features"]
         self._cache_history_cycles = arrays["history_cycles"]
         self._cache_meta = cache_meta
-        self.cycle_scale = float(manifest.get("cycle_scale", 1.0))
         self._precomputed = True
         self.samples = []
         self.records = []
@@ -570,6 +599,34 @@ class BatteryRawGraphDataset(Dataset):
         _close_memmaps(arrays)
         for name in SEQUENCE_CACHE_ARRAY_ATTRS:
             setattr(self, name, None)
+
+    def __getstate__(self) -> Dict[str, Any]:
+        state = self.__dict__.copy()
+        reopen_sequence_cache = (
+            state.get("_cache_layout") == "cycle_sequence_history"
+            and bool(state.get("_precomputed"))
+        )
+        state["_reopen_sequence_cache_after_unpickle"] = reopen_sequence_cache
+        if reopen_sequence_cache:
+            for name in SEQUENCE_CACHE_ARRAY_ATTRS:
+                state[name] = None
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        reopen_sequence_cache = bool(state.pop("_reopen_sequence_cache_after_unpickle", False))
+        self.__dict__.update(state)
+        if not reopen_sequence_cache:
+            return
+        self._precomputed = False
+        self._cache_path = None
+        self._cache_meta = []
+        if not self._try_load_precomputed_sequence_cache():
+            expected = battery_sequence_cache_path(
+                self.precomputed_sequence_cache_dir or "", self.sequence_cache_config
+            )
+            raise FileNotFoundError(
+                f"Required battery sequence cache not found while unpickling: {expected}"
+            )
 
     def __enter__(self) -> "BatteryRawGraphDataset":
         return self
