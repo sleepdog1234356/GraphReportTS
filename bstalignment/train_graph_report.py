@@ -21,12 +21,12 @@ try:
     from .graph_report_model import GraphReportTS, GraphReportTSConfig
     from .training_strategy import (
         MAIN_TRAINING_PROFILE,
-        MainTrainingProfile,
         TRAINING_STRATEGY_VERSION,
         GraphReportScheduler,
         build_graph_report_optimizer,
         graph_report_align_weight,
         graph_report_group_lrs,
+        main_training_profile_matches,
         require_checkpoint_strategy_version,
         require_nonempty_splits,
         should_stop_graph_report,
@@ -42,12 +42,12 @@ except ImportError:
     from graph_report_model import GraphReportTS, GraphReportTSConfig
     from training_strategy import (
         MAIN_TRAINING_PROFILE,
-        MainTrainingProfile,
         TRAINING_STRATEGY_VERSION,
         GraphReportScheduler,
         build_graph_report_optimizer,
         graph_report_align_weight,
         graph_report_group_lrs,
+        main_training_profile_matches,
         require_checkpoint_strategy_version,
         require_nonempty_splits,
         should_stop_graph_report,
@@ -256,6 +256,16 @@ def _resume_checkpoint_path(out_dir: Path) -> Optional[Path]:
         return last_path
     best_path = out_dir / "best.pt"
     return best_path if best_path.exists() else None
+
+
+def _require_formal_resume_training_profile(checkpoint: Dict[str, Any]) -> None:
+    observed = checkpoint.get("training_profile") if isinstance(checkpoint, dict) else None
+    if not main_training_profile_matches(observed):
+        raise RuntimeError(
+            "GraphReportTS trainer checkpoint training profile does not match "
+            f"the required formal profile: expected={MAIN_TRAINING_PROFILE.__dict__!r} "
+            f"observed={observed!r}"
+        )
 
 
 def _epoch_duration(value: Any, context: str) -> float:
@@ -504,8 +514,7 @@ def main():
         if resume_path is not None:
             resume_checkpoint = torch.load(resume_path, map_location=device)
             require_checkpoint_strategy_version(resume_checkpoint, "GraphReportTS trainer")
-            if "training_profile" in resume_checkpoint:
-                profile = MainTrainingProfile(**resume_checkpoint["training_profile"])
+            _require_formal_resume_training_profile(resume_checkpoint)
 
     opt = build_graph_report_optimizer(model, profile)
     scheduler = GraphReportScheduler(opt, profile)

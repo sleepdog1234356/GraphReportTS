@@ -21,7 +21,10 @@ from .data_battery_raw import (
     battery_sequence_cache_config,
     battery_sequence_cache_path,
 )
-from .training_strategy import TRAINING_STRATEGY_VERSION
+from .training_strategy import (
+    TRAINING_STRATEGY_VERSION,
+    main_training_profile_matches,
+)
 
 
 CORE_ABLATION_SUITE_VERSION = "core-v1"
@@ -151,12 +154,54 @@ def _metrics_row(metrics_path: Path, dataset: str) -> dict[str, Any]:
     return metrics
 
 
-def _optional_full_timing(result_dir: Path, dataset: str) -> dict[str, Any]:
+def _optional_full_timing(
+    result_dir: Path,
+    dataset: str,
+    training_strategy_version: str,
+) -> dict[str, Any]:
     path = result_dir / "run_summary.json"
     if not path.exists():
         return {name: "" for name in _TIMING_FIELDS}
     summary = _read_json_object(path, dataset)
-    return {name: summary.get(name, "") for name in _TIMING_FIELDS}
+    _require_exact_field(
+        summary,
+        "training_strategy_version",
+        training_strategy_version,
+        dataset=dataset,
+        path=path,
+    )
+    _require_exact_field(
+        summary,
+        "ablation_suite_version",
+        None,
+        dataset=dataset,
+        path=path,
+    )
+    for name in ("best_epoch", "stopped_epoch", "trainable_parameter_count"):
+        value = summary.get(name, "<missing>")
+        minimum = 1 if name == "trainable_parameter_count" else 0
+        if type(value) is not int or value < minimum:
+            raise _mismatch(dataset, f"integer {name}>={minimum}", value, path)
+    for name in ("mean_epoch_seconds", "total_train_seconds"):
+        value = summary.get(name, "<missing>")
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+        ):
+            raise _mismatch(dataset, f"finite non-negative number {name}", value, path)
+    if summary["best_epoch"] > summary["stopped_epoch"]:
+        raise _mismatch(
+            dataset,
+            "best_epoch <= stopped_epoch",
+            {
+                "best_epoch": summary["best_epoch"],
+                "stopped_epoch": summary["stopped_epoch"],
+            },
+            path,
+        )
+    return {name: summary[name] for name in _TIMING_FIELDS}
 
 
 def require_reusable_full_reference(
@@ -205,7 +250,7 @@ def require_reusable_full_reference(
 
     return {
         **_metrics_row(metrics_path, dataset),
-        **_optional_full_timing(result_dir, dataset),
+        **_optional_full_timing(result_dir, dataset, training_strategy_version),
         "ablation": "full",
         "dataset": dataset,
         "training_strategy_version": training_strategy_version,
@@ -265,7 +310,7 @@ def core_run_config_matches(
     model_cfg = config.get("model_cfg")
     if not isinstance(args, dict) or not isinstance(model_cfg, dict):
         return False
-    return all(
+    return main_training_profile_matches(config.get("training_profile")) and all(
         type(args.get(name)) is type(expected) and args.get(name) == expected
         for name, expected in _expected_core_arguments(dataset, ablation).items()
     ) and all(
@@ -537,6 +582,54 @@ def _write_csv(path: Path, rows: Sequence[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def _is_nonempty_file(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _core_output_state(
+    result_dir: Path,
+    dataset: str,
+    ablation: str,
+    training_strategy_version: str,
+) -> str:
+    if not result_dir.exists():
+        return "fresh"
+    if not result_dir.is_dir():
+        raise _mismatch(dataset, "core ablation output directory", "non-directory path", result_dir)
+    if not core_run_config_matches(
+        result_dir,
+        dataset,
+        ablation,
+        training_strategy_version,
+    ):
+        raise _mismatch(
+            dataset,
+            f"matching {CORE_ABLATION_SUITE_VERSION} {ablation} run metadata",
+            "missing, malformed, or mismatched metadata",
+            result_dir / "run_config.json",
+        )
+    has_best = _is_nonempty_file(result_dir / "best.pt")
+    has_last = _is_nonempty_file(result_dir / "last.pt")
+    complete = (
+        has_best
+        and (result_dir / "test_metrics.json").is_file()
+        and (result_dir / "run_summary.json").is_file()
+    )
+    if complete:
+        return "complete"
+    if has_last or has_best:
+        return "resumable"
+    raise _mismatch(
+        dataset,
+        "non-empty last.pt or best.pt checkpoint for an incomplete matching output",
+        "no usable checkpoint",
+        result_dir,
+    )
+
+
 def _run_dataset(
     args: argparse.Namespace,
     dataset: str,
@@ -554,26 +647,16 @@ def _run_dataset(
     rows = [full_row]
     for ablation in args.ablations:
         result_dir = Path(args.out_root) / "battery" / dataset / ablation
-        exists = result_dir.exists()
-        matches = core_run_config_matches(
+        state = _core_output_state(
             result_dir,
             dataset,
             ablation,
             TRAINING_STRATEGY_VERSION,
         )
-        if exists and not matches:
-            raise _mismatch(
-                dataset,
-                f"matching {CORE_ABLATION_SUITE_VERSION} {ablation} run metadata",
-                "missing, malformed, or mismatched metadata",
-                result_dir / "run_config.json",
-            )
-        if args.force_retrain and exists:
+        if args.force_retrain and state != "fresh":
             shutil.rmtree(result_dir)
-            exists = False
-            matches = False
-        complete = matches and (result_dir / "test_metrics.json").is_file()
-        if complete:
+            state = "fresh"
+        if state == "complete":
             print(f"skip completed core ablation {dataset} {ablation}")
         else:
             command = _train_command(
@@ -581,21 +664,22 @@ def _run_dataset(
                 dataset,
                 ablation,
                 result_dir,
-                start_fresh=not exists,
+                start_fresh=state == "fresh",
             )
             _print_command(command)
             subprocess.run(command, check=True)
-            if not core_run_config_matches(
+            finished_state = _core_output_state(
                 result_dir,
                 dataset,
                 ablation,
                 TRAINING_STRATEGY_VERSION,
-            ):
+            )
+            if finished_state != "complete":
                 raise _mismatch(
                     dataset,
-                    f"matching {CORE_ABLATION_SUITE_VERSION} {ablation} run metadata after training",
-                    "missing, malformed, or mismatched metadata",
-                    result_dir / "run_config.json",
+                    f"complete {CORE_ABLATION_SUITE_VERSION} {ablation} output after training",
+                    finished_state,
+                    result_dir,
                 )
         row = _trained_row(result_dir, dataset, ablation)
         row.update(

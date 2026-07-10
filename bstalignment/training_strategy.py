@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+import math
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -141,6 +144,36 @@ class MainTrainingProfile:
 
 
 MAIN_TRAINING_PROFILE = MainTrainingProfile()
+
+
+def main_training_profile_matches(value: Any) -> bool:
+    expected = MAIN_TRAINING_PROFILE.__dict__
+    if not isinstance(value, Mapping) or set(value) != set(expected):
+        return False
+    normalized = {}
+    for name, expected_value in expected.items():
+        observed = value[name]
+        if type(expected_value) is int:
+            if type(observed) is not int:
+                return False
+            normalized[name] = observed
+        elif type(expected_value) is float:
+            if (
+                isinstance(observed, bool)
+                or not isinstance(observed, (int, float))
+                or not math.isfinite(float(observed))
+            ):
+                return False
+            normalized[name] = float(observed)
+        elif type(observed) is not type(expected_value):
+            return False
+        else:
+            normalized[name] = observed
+    try:
+        observed_profile = MainTrainingProfile(**normalized)
+    except (TypeError, ValueError):
+        return False
+    return observed_profile == MAIN_TRAINING_PROFILE
 
 
 def _freeze_text_backbone(model) -> None:

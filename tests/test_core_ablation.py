@@ -126,6 +126,7 @@ class CoreAblationRunnerTests(unittest.TestCase):
             "training_strategy_version": TRAINING_STRATEGY_VERSION,
             "protocol_stage": "ablation",
             "ablation_suite_version": "core-v1",
+            "training_profile": dict(MAIN_TRAINING_PROFILE.__dict__),
             "args": args,
             "model_cfg": model_cfg,
         }
@@ -145,6 +146,42 @@ class CoreAblationRunnerTests(unittest.TestCase):
             row = require_reusable_full_reference(result, "mit", TRAINING_STRATEGY_VERSION)
             self.assertEqual(row["result_source"], "reused_main")
             self.assertEqual(row["mse"], 0.1)
+
+    def test_present_full_timing_manifest_must_be_complete_typed_and_identity_matched(self):
+        valid = {
+            "best_epoch": 7,
+            "stopped_epoch": 25,
+            "mean_epoch_seconds": 1.5,
+            "total_train_seconds": 37.5,
+            "trainable_parameter_count": 100,
+            "training_strategy_version": TRAINING_STRATEGY_VERSION,
+            "ablation_suite_version": None,
+        }
+        cases = {
+            "missing timing": lambda row: row.pop("best_epoch"),
+            "wrong timing type": lambda row: row.update(best_epoch=7.5),
+            "wrong strategy": lambda row: row.update(training_strategy_version="legacy"),
+            "missing strategy": lambda row: row.pop("training_strategy_version"),
+            "wrong suite identity": lambda row: row.update(ablation_suite_version="core-v1"),
+            "missing suite identity": lambda row: row.pop("ablation_suite_version"),
+        }
+        with TemporaryDirectory() as tmp:
+            result = Path(tmp) / "valid"
+            self._write_full_result(result)
+            (result / "run_summary.json").write_text(json.dumps(valid), encoding="utf-8")
+            row = require_reusable_full_reference(result, "mit", TRAINING_STRATEGY_VERSION)
+            self.assertEqual(row["best_epoch"], 7)
+            self.assertEqual(row["total_train_seconds"], 37.5)
+        for name, mutate in cases.items():
+            with self.subTest(name=name), TemporaryDirectory() as tmp:
+                result = Path(tmp) / "invalid"
+                self._write_full_result(result)
+                manifest = dict(valid)
+                mutate(manifest)
+                (result / "run_summary.json").write_text(json.dumps(manifest), encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, r"dataset=mit.*expected=.*observed=.*run_summary.json"):
+                    require_reusable_full_reference(result, "mit", TRAINING_STRATEGY_VERSION)
+                self.assertTrue(result.is_dir())
 
     def test_full_reference_rejects_mismatches_without_modifying_reference(self):
         cases = {
@@ -228,6 +265,18 @@ class CoreAblationRunnerTests(unittest.TestCase):
             config.pop("ablation_suite_version")
             (result / "run_config.json").write_text(json.dumps(config), encoding="utf-8")
             self.assertFalse(core_run_config_matches(result, "mit", "no_text_gate", TRAINING_STRATEGY_VERSION))
+            config = self._core_config("mit", "no_text_gate")
+            config.pop("training_profile")
+            (result / "run_config.json").write_text(json.dumps(config), encoding="utf-8")
+            self.assertFalse(core_run_config_matches(result, "mit", "no_text_gate", TRAINING_STRATEGY_VERSION))
+            config = self._core_config("mit", "no_text_gate")
+            config["training_profile"]["max_epochs"] = 79
+            (result / "run_config.json").write_text(json.dumps(config), encoding="utf-8")
+            self.assertFalse(core_run_config_matches(result, "mit", "no_text_gate", TRAINING_STRATEGY_VERSION))
+            config = self._core_config("mit", "no_text_gate")
+            config["training_profile"]["gradient_clip"] = True
+            (result / "run_config.json").write_text(json.dumps(config), encoding="utf-8")
+            self.assertFalse(core_run_config_matches(result, "mit", "no_text_gate", TRAINING_STRATEGY_VERSION))
 
     def test_default_dry_run_emits_twelve_train_commands_without_artifacts(self):
         with TemporaryDirectory() as tmp, patch(
@@ -277,6 +326,8 @@ class CoreAblationRunnerTests(unittest.TestCase):
             (full / "run_summary.json").write_text(json.dumps({
                 "best_epoch": 7, "stopped_epoch": 25, "mean_epoch_seconds": 1.5,
                 "total_train_seconds": 37.5, "trainable_parameter_count": 100,
+                "training_strategy_version": TRAINING_STRATEGY_VERSION,
+                "ablation_suite_version": None,
             }), encoding="utf-8")
 
             def fake_run(command, **kwargs):
@@ -388,6 +439,84 @@ class CoreAblationRunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "mismatched metadata"):
                 run_core_ablation_main(argv)
             self.assertEqual(before, {path.name: path.read_bytes() for path in result.iterdir()})
+
+    def test_existing_matching_output_has_explicit_complete_resumable_or_invalid_state(self):
+        cases = {
+            "complete": ({"best.pt", "test_metrics.json", "run_summary.json"}, "skip"),
+            "missing best with last": ({"last.pt", "test_metrics.json", "run_summary.json"}, "resume"),
+            "missing summary with best": ({"best.pt", "test_metrics.json"}, "resume"),
+            "checkpoint only": ({"best.pt"}, "resume"),
+            "no checkpoint": (set(), "invalid"),
+            "results without checkpoint": ({"test_metrics.json", "run_summary.json"}, "invalid"),
+        }
+        summary = {
+            "best_epoch": 8,
+            "stopped_epoch": 30,
+            "mean_epoch_seconds": 2.0,
+            "total_train_seconds": 60.0,
+            "trainable_parameter_count": 90,
+            "training_strategy_version": TRAINING_STRATEGY_VERSION,
+            "ablation_suite_version": "core-v1",
+        }
+        for name, (artifacts, expected_state) in cases.items():
+            with self.subTest(name=name), TemporaryDirectory() as tmp, patch(
+                "bstalignment.run_core_ablation_suite.verify_prompt_cache_identity"
+            ), patch("bstalignment.run_core_ablation_suite.subprocess.run") as run:
+                root = Path(tmp)
+                self._write_full_result(root / "full" / "mit")
+                result = root / "out" / "battery" / "mit" / "no_text_gate"
+                result.mkdir(parents=True)
+                (result / "run_config.json").write_text(
+                    json.dumps(self._core_config("mit", "no_text_gate")), encoding="utf-8"
+                )
+                if "best.pt" in artifacts:
+                    (result / "best.pt").write_bytes(b"best")
+                if "last.pt" in artifacts:
+                    (result / "last.pt").write_bytes(b"last")
+                if "test_metrics.json" in artifacts:
+                    (result / "test_metrics.json").write_text(
+                        '{"mse": 0.2, "mae": 0.3, "rmse": 0.447}', encoding="utf-8"
+                    )
+                if "run_summary.json" in artifacts:
+                    (result / "run_summary.json").write_text(json.dumps(summary), encoding="utf-8")
+
+                def fake_run(command, **kwargs):
+                    if command[:3] == ["git", "rev-parse", "HEAD"]:
+                        return Namespace(stdout="source-commit\n", returncode=0)
+                    if "bstalignment.train_graph_report" in command:
+                        (result / "best.pt").write_bytes(b"best")
+                        (result / "test_metrics.json").write_text(
+                            '{"mse": 0.2, "mae": 0.3, "rmse": 0.447}', encoding="utf-8"
+                        )
+                        (result / "run_summary.json").write_text(json.dumps(summary), encoding="utf-8")
+                    return Namespace(stdout="", returncode=0)
+
+                run.side_effect = fake_run
+                argv = [
+                    "--datasets", "mit", "--ablations", "no_text_gate",
+                    "--full_result_root", str(root / "full"),
+                    "--graph_cache_dir", str(root / "graph"),
+                    "--sequence_cache_dir", str(root / "sequence"),
+                    "--out_root", str(root / "out"),
+                    "--text_model", str(root / "text-model"),
+                    "--full_reference_commit", "full-commit",
+                ]
+                if expected_state == "invalid":
+                    before = {path.name: path.read_bytes() for path in result.iterdir()}
+                    with self.assertRaisesRegex(RuntimeError, "checkpoint"):
+                        run_core_ablation_main(argv)
+                    self.assertEqual(before, {path.name: path.read_bytes() for path in result.iterdir()})
+                    continue
+                run_core_ablation_main(argv)
+                train_commands = [
+                    call.args[0] for call in run.call_args_list
+                    if "bstalignment.train_graph_report" in call.args[0]
+                ]
+                if expected_state == "skip":
+                    self.assertEqual(train_commands, [])
+                else:
+                    self.assertEqual(len(train_commands), 1)
+                    self.assertNotIn("--no_resume", train_commands[0])
 
 
 class CoreAblationModelTests(unittest.TestCase):
@@ -578,6 +707,29 @@ class TrainerIntegrationTests(unittest.TestCase):
             last_path = out_dir / "last.pt"
             last_path.write_bytes(b"last")
             self.assertEqual(graph_report_trainer._resume_checkpoint_path(out_dir), last_path)
+
+    def test_formal_resume_checkpoint_requires_the_exact_main_training_profile(self):
+        validator = getattr(graph_report_trainer, "_require_formal_resume_training_profile", None)
+        self.assertIsNotNone(
+            validator,
+            "formal trainer must validate checkpoint training_profile before resuming",
+        )
+        if validator is None:
+            return
+        validator({"training_profile": dict(MAIN_TRAINING_PROFILE.__dict__)})
+        cases = {
+            "missing profile": {},
+            "wrong max epochs": {
+                "training_profile": dict(MAIN_TRAINING_PROFILE.__dict__, max_epochs=79)
+            },
+            "incomplete profile": {"training_profile": {"max_epochs": 80}},
+            "boolean numeric field": {
+                "training_profile": dict(MAIN_TRAINING_PROFILE.__dict__, gradient_clip=True)
+            },
+        }
+        for name, checkpoint in cases.items():
+            with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, "training profile"):
+                validator(checkpoint)
 
     def test_raw_sequence_parser_flags_keep_formal_batch_default(self):
         with patch.object(
