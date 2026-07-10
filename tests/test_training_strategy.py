@@ -111,6 +111,7 @@ class TinyGraphReport(torch.nn.Module):
         self.decoder = torch.nn.Embedding(4, 2)
         self.text_encoder = torch.nn.Module()
         self.text_encoder.backbone = torch.nn.Linear(2, 2)
+        self.text_encoder.emb = torch.nn.Embedding(8, 2)
         self.text_encoder.proj = torch.nn.Linear(2, 2)
         self.semantic_fusion = torch.nn.Linear(2, 2)
         for parameter in self.text_encoder.backbone.parameters():
@@ -127,7 +128,19 @@ class MainStrategyTests(unittest.TestCase):
         self.assertEqual(len(optimized), len({id(parameter) for parameter in optimized}))
         self.assertFalse(any(parameter.requires_grad for parameter in model.text_encoder.backbone.parameters()))
 
-    def test_lr_warmup_plateau_and_state_restore(self):
+    def test_embedding_parameters_are_excluded_from_weight_decay(self):
+        model = TinyGraphReport()
+        optimizer = build_graph_report_optimizer(model, MAIN_TRAINING_PROFILE)
+        for embedding_parameter in (model.decoder.weight, model.text_encoder.emb.weight):
+            matching_groups = [
+                group
+                for group in optimizer.param_groups
+                if any(parameter is embedding_parameter for parameter in group["params"])
+            ]
+            self.assertEqual(len(matching_groups), 1)
+            self.assertEqual(matching_groups[0]["weight_decay"], 0.0)
+
+    def test_lr_warmup_reaches_role_targets(self):
         model = TinyGraphReport()
         optimizer = build_graph_report_optimizer(model, MAIN_TRAINING_PROFILE)
         scheduler = GraphReportScheduler(optimizer, MAIN_TRAINING_PROFILE)
@@ -136,11 +149,56 @@ class MainStrategyTests(unittest.TestCase):
         scheduler.start_epoch(5)
         full = graph_report_group_lrs(optimizer)
         self.assertAlmostEqual(first["core"], 1e-4)
+        self.assertAlmostEqual(first["semantic"], 3e-5)
         self.assertAlmostEqual(full["core"], 1e-3)
+        self.assertAlmostEqual(full["semantic"], 3e-4)
+
+    def test_plateau_reduces_both_roles_and_respects_minimum_lrs(self):
+        model = TinyGraphReport()
+        optimizer = build_graph_report_optimizer(model, MAIN_TRAINING_PROFILE)
+        scheduler = GraphReportScheduler(optimizer, MAIN_TRAINING_PROFILE)
+        scheduler.start_epoch(MAIN_TRAINING_PROFILE.lr_warmup_epochs)
+        epoch = MAIN_TRAINING_PROFILE.lr_warmup_epochs
+        reduction_interval = MAIN_TRAINING_PROFILE.plateau_patience + 1
+        for _ in range(1 + reduction_interval):
+            scheduler.step_validation(epoch, 1.0)
+            epoch += 1
+        reduced = graph_report_group_lrs(optimizer)
+        self.assertAlmostEqual(reduced["core"], MAIN_TRAINING_PROFILE.core_lr * 0.5)
+        self.assertAlmostEqual(reduced["semantic"], MAIN_TRAINING_PROFILE.semantic_lr * 0.5)
+
+        for _ in range(reduction_interval * 10):
+            scheduler.step_validation(epoch, 1.0)
+            epoch += 1
+        floored = graph_report_group_lrs(optimizer)
+        self.assertAlmostEqual(floored["core"], MAIN_TRAINING_PROFILE.core_min_lr)
+        self.assertAlmostEqual(floored["semantic"], MAIN_TRAINING_PROFILE.semantic_min_lr)
+
+    def test_advanced_plateau_state_restores_and_continues(self):
+        model = TinyGraphReport()
+        optimizer = build_graph_report_optimizer(model, MAIN_TRAINING_PROFILE)
+        scheduler = GraphReportScheduler(optimizer, MAIN_TRAINING_PROFILE)
+        scheduler.start_epoch(MAIN_TRAINING_PROFILE.lr_warmup_epochs)
+        epoch = MAIN_TRAINING_PROFILE.lr_warmup_epochs
+        reduction_interval = MAIN_TRAINING_PROFILE.plateau_patience + 1
+        for _ in range(1 + reduction_interval + 3):
+            scheduler.step_validation(epoch, 1.0)
+            epoch += 1
+
+        optimizer_state = optimizer.state_dict()
         state = scheduler.state_dict()
-        restored = GraphReportScheduler(optimizer, MAIN_TRAINING_PROFILE)
+        restored_optimizer = build_graph_report_optimizer(TinyGraphReport(), MAIN_TRAINING_PROFILE)
+        restored = GraphReportScheduler(restored_optimizer, MAIN_TRAINING_PROFILE)
+        restored_optimizer.load_state_dict(optimizer_state)
         restored.load_state_dict(state)
         self.assertEqual(restored.state_dict(), state)
+
+        for _ in range(3):
+            scheduler.step_validation(epoch, 1.0)
+            restored.step_validation(epoch, 1.0)
+            epoch += 1
+        self.assertEqual(restored.state_dict(), scheduler.state_dict())
+        self.assertEqual(graph_report_group_lrs(restored_optimizer), graph_report_group_lrs(optimizer))
 
     def test_align_weight_is_delayed_and_ramped(self):
         self.assertEqual(graph_report_align_weight(5, MAIN_TRAINING_PROFILE), 0.0)

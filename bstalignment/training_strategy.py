@@ -130,6 +130,12 @@ def _freeze_text_backbone(model) -> None:
 
 def build_graph_report_optimizer(model, profile):
     _freeze_text_backbone(model)
+    embedding_parameter_ids = {
+        id(parameter)
+        for module in model.modules()
+        if isinstance(module, torch.nn.Embedding)
+        for parameter in module.parameters(recurse=False)
+    }
     groups = {
         "core_decay": {"params": [], "lr": profile.core_lr * profile.warmup_start_factor,
                        "weight_decay": profile.weight_decay, "role": "core"},
@@ -146,7 +152,10 @@ def build_graph_report_optimizer(model, profile):
         lower_name = name.lower()
         role = "semantic" if name.startswith(("text_encoder.proj", "semantic_fusion", "fusion")) else "core"
         uses_weight_decay = not (
-            "norm" in lower_name or name.endswith(".bias") or "embed" in lower_name
+            id(parameter) in embedding_parameter_ids
+            or "norm" in lower_name
+            or name.endswith(".bias")
+            or "embed" in lower_name
         )
         group_name = f"{role}_{'decay' if uses_weight_decay else 'no_decay'}"
         groups[group_name]["params"].append(parameter)
