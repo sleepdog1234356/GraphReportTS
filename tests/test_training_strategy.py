@@ -19,6 +19,7 @@ from bstalignment.training_strategy import (
     should_stop_graph_report,
     step_baseline_batch_scheduler,
     step_baseline_epoch_scheduler,
+    update_graph_report_stale,
 )
 
 
@@ -208,6 +209,28 @@ class MainStrategyTests(unittest.TestCase):
 
 
 class MainTrainerPolicyTests(unittest.TestCase):
+    def test_stale_count_starts_at_epoch_20_and_stops_after_20_failures(self):
+        stale = update_graph_report_stale(
+            epoch=19,
+            stale=7,
+            improved=False,
+            profile=MAIN_TRAINING_PROFILE,
+        )
+        self.assertEqual(stale, 0)
+
+        stale = update_graph_report_stale(
+            epoch=20,
+            stale=stale,
+            improved=False,
+            profile=MAIN_TRAINING_PROFILE,
+        )
+        self.assertEqual(stale, 1)
+
+        for epoch in range(21, 40):
+            stale = update_graph_report_stale(epoch, stale, improved=False, profile=MAIN_TRAINING_PROFILE)
+        self.assertEqual(stale, 20)
+        self.assertTrue(should_stop_graph_report(epoch=39, stale=stale, profile=MAIN_TRAINING_PROFILE))
+
     def test_early_stop_counter_is_inactive_before_epoch_20(self):
         self.assertFalse(should_stop_graph_report(epoch=19, stale=100, profile=MAIN_TRAINING_PROFILE))
         self.assertFalse(should_stop_graph_report(epoch=38, stale=19, profile=MAIN_TRAINING_PROFILE))

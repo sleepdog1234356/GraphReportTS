@@ -234,5 +234,11 @@ def graph_report_align_weight(epoch, profile) -> float:
     return initial_weight + (profile.align_weight - initial_weight) * progress
 
 
+def update_graph_report_stale(epoch, stale, improved, profile):
+    if epoch < profile.early_stop_start_epoch:
+        return 0
+    return 0 if improved else stale + 1
+
+
 def should_stop_graph_report(epoch, stale, profile):
     return epoch >= profile.early_stop_start_epoch and stale >= profile.early_stop_patience

@@ -25,6 +25,7 @@ try:
         graph_report_align_weight,
         graph_report_group_lrs,
         should_stop_graph_report,
+        update_graph_report_stale,
     )
     from .utils import AverageMeter, ensure_dir, save_json, seed_everything, to_device
 except ImportError:
@@ -42,6 +43,7 @@ except ImportError:
         graph_report_align_weight,
         graph_report_group_lrs,
         should_stop_graph_report,
+        update_graph_report_stale,
     )
     from utils import AverageMeter, ensure_dir, save_json, seed_everything, to_device
 
@@ -391,12 +393,7 @@ def main():
         improved = score < best
         if improved:
             best = score
-        if epoch <= profile.early_stop_start_epoch:
-            stale = 0
-        elif improved:
-            stale = 0
-        else:
-            stale += 1
+        stale = update_graph_report_stale(epoch, stale, improved, profile)
         checkpoint = {
             "model": model.state_dict(),
             "model_cfg": model_cfg.__dict__,
