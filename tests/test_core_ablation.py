@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from argparse import Namespace
+from dataclasses import asdict
 import json
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
@@ -16,6 +17,7 @@ import torch
 import bstalignment.data_battery_raw as battery_data
 import bstalignment.precompute_battery_sequence_cache as sequence_cache_precompute
 from bstalignment.data_battery_raw import BatteryRawGraphDataset, collate_graph_report_batch
+from bstalignment.graph_report_model import GraphReportTS, GraphReportTSConfig
 from bstalignment.precompute_battery_sequence_cache import precompute_sequence_split
 from bstalignment.raw_signal import (
     BATTERY_SEQUENCE_CHANNELS,
@@ -23,6 +25,126 @@ from bstalignment.raw_signal import (
     build_battery_sequence,
     build_multiview_maps,
 )
+from bstalignment.training_strategy import MAIN_TRAINING_PROFILE, build_graph_report_optimizer
+
+
+class CoreAblationModelTests(unittest.TestCase):
+    def config(self, **updates):
+        values = dict(
+            variant="battery", d_model=8, output_dim=1, graph_layers=1,
+            patch_size=2, patch_stride=1, topk_edges=1,
+            use_hf_text_encoder=False, temporal_heads=2,
+            raw_sequence_len=16, raw_sequence_dim=6,
+        )
+        values.update(updates)
+        return GraphReportTSConfig(**values)
+
+    def test_raw_sequence_model_has_no_graph_encoder(self):
+        model = GraphReportTS(self.config(battery_input_mode="raw_sequence"))
+        self.assertIsNone(model.graph_encoder)
+        self.assertIsNotNone(model.raw_sequence_encoder)
+        out = model(
+            None, ["battery prompt", "battery prompt"], torch.tensor([20, 20]),
+            history_features=torch.randn(2, 32, 8),
+            raw_sequences=torch.randn(2, 32, 16, 6),
+        )
+        self.assertEqual(out["pred"].shape, (2, 20))
+
+    def test_no_gate_has_constant_one_and_no_gate_parameters(self):
+        model = GraphReportTS(self.config(use_text_gate=False))
+        self.assertIsNone(model.semantic_fusion.gate)
+        out = model(
+            torch.randn(2, 32, 3, 2, 3),
+            ["p", "p"],
+            torch.tensor([20, 20]),
+            history_features=torch.randn(2, 32, 8),
+        )
+        torch.testing.assert_close(out["gate"], torch.ones_like(out["gate"]))
+
+    def test_no_prompt_constructs_no_semantic_modules(self):
+        model = GraphReportTS(self.config(use_report_prompt=False))
+        self.assertIsNone(model.text_encoder)
+        self.assertIsNone(model.semantic_fusion)
+        self.assertFalse(
+            any(
+                name.startswith(("text_encoder", "semantic_fusion", "fusion"))
+                for name, _ in model.named_parameters()
+            )
+        )
+
+    def test_graph_model_has_no_raw_sequence_encoder(self):
+        model = GraphReportTS(self.config())
+        self.assertIsNotNone(model.graph_encoder)
+        self.assertIsNone(model.raw_sequence_encoder)
+
+    def test_raw_sequence_encoder_is_unpatched_two_layer_transformer(self):
+        model = GraphReportTS(self.config(battery_input_mode="raw_sequence"))
+        encoder = model.raw_sequence_encoder
+        self.assertEqual(encoder.input_proj.in_features, 6)
+        self.assertEqual(encoder.pos_embed.num_embeddings, 16)
+        self.assertEqual(len(encoder.encoder.layers), 2)
+        self.assertFalse(hasattr(encoder, "patch_size"))
+
+    def test_input_modes_reject_the_other_path_payload(self):
+        graph_model = GraphReportTS(self.config(use_report_prompt=False))
+        with self.assertRaisesRegex(ValueError, "hankel_graph mode requires maps and forbids raw_sequences"):
+            graph_model(
+                torch.randn(1, 32, 3, 2, 3),
+                ["p"],
+                20,
+                raw_sequences=torch.randn(1, 32, 16, 6),
+            )
+        raw_model = GraphReportTS(
+            self.config(battery_input_mode="raw_sequence", use_report_prompt=False)
+        )
+        with self.assertRaisesRegex(ValueError, "raw_sequence mode requires raw_sequences and forbids maps"):
+            raw_model(torch.randn(1, 32, 3, 2, 3), ["p"], 20)
+
+    def test_unknown_battery_input_mode_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unknown battery_input_mode: invalid"):
+            GraphReportTS(self.config(battery_input_mode="invalid"))
+
+    def test_raw_encoder_optimizer_parameters_are_all_core(self):
+        model = GraphReportTS(self.config(battery_input_mode="raw_sequence"))
+        optimizer = build_graph_report_optimizer(model, MAIN_TRAINING_PROFILE)
+        parameter_roles = {
+            id(parameter): group["role"]
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+        }
+        raw_parameters = dict(model.raw_sequence_encoder.named_parameters())
+        self.assertTrue(raw_parameters)
+        self.assertEqual(
+            {parameter_roles[id(parameter)] for parameter in raw_parameters.values()},
+            {"core"},
+        )
+
+    def test_no_prompt_forward_keeps_semantic_outputs_inactive(self):
+        model = GraphReportTS(self.config(use_report_prompt=False))
+        out = model(
+            torch.randn(2, 32, 3, 2, 3),
+            ["ignored", "ignored"],
+            torch.tensor([20, 20]),
+            history_features=torch.randn(2, 32, 8),
+        )
+        torch.testing.assert_close(out["gate"], torch.zeros_like(out["gate"]))
+        self.assertIsNone(out["cross_attn"])
+
+    def test_default_full_state_dict_survives_config_serialization(self):
+        cfg = self.config()
+        original = GraphReportTS(cfg)
+        restored = GraphReportTS(GraphReportTSConfig(**asdict(cfg)))
+        maps = torch.randn(1, 32, 3, 2, 3)
+        history = torch.randn(1, 32, 8)
+        original(maps, ["p"], 2, history_features=history)
+        restored(maps, ["p"], 2, history_features=history)
+        original_state = original.state_dict()
+        restored_state = restored.state_dict()
+        self.assertEqual(tuple(original_state), tuple(restored_state))
+        self.assertEqual(
+            {name: tuple(value.shape) for name, value in original_state.items()},
+            {name: tuple(value.shape) for name, value in restored_state.items()},
+        )
 
 
 class ResampledBatterySequenceTests(unittest.TestCase):
