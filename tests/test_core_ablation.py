@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from argparse import Namespace
 from dataclasses import asdict
+from hashlib import sha256
 import json
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
@@ -18,6 +19,7 @@ import bstalignment.data_battery_raw as battery_data
 import bstalignment.precompute_battery_sequence_cache as sequence_cache_precompute
 from bstalignment.data_battery_raw import BatteryRawGraphDataset, collate_graph_report_batch
 from bstalignment.graph_report_model import GraphReportTS, GraphReportTSConfig
+from bstalignment.graph_report_losses import masked_regression_loss
 from bstalignment.precompute_battery_sequence_cache import precompute_sequence_split
 from bstalignment.raw_signal import (
     BATTERY_SEQUENCE_CHANNELS,
@@ -48,7 +50,24 @@ class CoreAblationModelTests(unittest.TestCase):
             history_features=torch.randn(2, 32, 8),
             raw_sequences=torch.randn(2, 32, 16, 6),
         )
-        self.assertEqual(out["pred"].shape, (2, 20))
+        self.assertEqual(out["pred"].shape, (2, 20, 1))
+
+    def test_scalar_prediction_keeps_dimension_used_by_inference_consumer(self):
+        model = GraphReportTS(self.config(use_report_prompt=False))
+        out = model(torch.randn(1, 32, 3, 2, 3), ["p"], 3)
+        self.assertEqual(out["pred"].ndim, 3)
+        self.assertIsInstance(float(out["pred"][0, 0, 0]), float)
+
+    def test_scalar_prediction_accepts_two_dimensional_battery_loss_targets(self):
+        model = GraphReportTS(self.config(use_report_prompt=False))
+        out = model(torch.randn(2, 32, 3, 2, 3), ["p", "p"], 3)
+        self.assertEqual(out["pred"].shape, (2, 3, 1))
+        loss = masked_regression_loss(
+            out["pred"],
+            torch.zeros(2, 3),
+            torch.ones(2, 3, dtype=torch.bool),
+        )
+        self.assertTrue(torch.isfinite(loss))
 
     def test_no_gate_has_constant_one_and_no_gate_parameters(self):
         model = GraphReportTS(self.config(use_text_gate=False))
@@ -130,7 +149,7 @@ class CoreAblationModelTests(unittest.TestCase):
         torch.testing.assert_close(out["gate"], torch.zeros_like(out["gate"]))
         self.assertIsNone(out["cross_attn"])
 
-    def test_default_full_state_dict_survives_config_serialization(self):
+    def test_default_full_state_dict_matches_c2ba958_golden_after_serialization(self):
         cfg = self.config()
         original = GraphReportTS(cfg)
         restored = GraphReportTS(GraphReportTSConfig(**asdict(cfg)))
@@ -140,11 +159,13 @@ class CoreAblationModelTests(unittest.TestCase):
         restored(maps, ["p"], 2, history_features=history)
         original_state = original.state_dict()
         restored_state = restored.state_dict()
-        self.assertEqual(tuple(original_state), tuple(restored_state))
-        self.assertEqual(
-            {name: tuple(value.shape) for name, value in original_state.items()},
-            {name: tuple(value.shape) for name, value in restored_state.items()},
-        )
+        expected_signature = "22fd1d49bb51d837eecc1155a3d14ae1c82bde464464f929de73f72213e4ba9f"
+        for state in (original_state, restored_state):
+            contract = "\n".join(
+                f"{name}:{tuple(value.shape)}" for name, value in state.items()
+            )
+            self.assertEqual(len(state), 105)
+            self.assertEqual(sha256(contract.encode()).hexdigest(), expected_signature)
 
 
 class ResampledBatterySequenceTests(unittest.TestCase):

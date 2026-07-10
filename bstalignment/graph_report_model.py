@@ -585,8 +585,6 @@ class GraphReportTS(nn.Module):
             start = 1 if (self.cfg.variant == "battery" and self.cfg.use_relative_steps) else 1
             steps = torch.arange(start, max_h + start, device=graph_context.device)
         pred = self.decoder(context, steps)
-        if pred.size(-1) == 1:
-            pred = pred.squeeze(-1)
         return {
             "pred": pred,
             "context": context,
