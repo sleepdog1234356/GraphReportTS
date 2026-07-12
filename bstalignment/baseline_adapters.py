@@ -1,10 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+from datetime import datetime
+import hashlib
+import importlib
+import json
 from pathlib import Path
 import argparse
 import subprocess
-from typing import Dict, List
+import sys
+from types import SimpleNamespace
+from typing import Any, Dict, Iterator, List, Mapping, Sequence
 
 try:
     from .experiment_config import BaselineConfig
@@ -72,6 +79,481 @@ def clone_baselines(root: str = "external", names: List[str] | None = None, dry_
         print(" ".join(cmd))
         if not dry_run:
             subprocess.run(cmd, check=True)
+
+
+@dataclass(frozen=True)
+class TimeCMACacheProvenance:
+    dataset: str
+    split: str
+    input_len: int
+    source_commit: str
+    scaler_checksum: str
+    model_id: str
+    model_revision: str
+    tokenizer_id: str
+    tokenizer_revision: str
+    precision: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @property
+    def digest(self) -> str:
+        payload = json.dumps(self.as_dict(), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _datetime_value(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    try:
+        import pandas as pd
+
+        return pd.Timestamp(value).to_pydatetime()
+    except Exception as exc:
+        raise TypeError(f"unsupported TimeCMA timestamp value: {value!r}") from exc
+
+
+def build_timecma_prompt(dataset: str, history: Any, timestamps: Sequence[Any]) -> str:
+    """Reproduce TimeCMA ``storage/gen_prompt_emb.py`` lines 28-51 and 63-71."""
+
+    import torch
+
+    if dataset not in {"ETTm1", "ETTm2", "ETTh1", "ETTh2", "ECL", "Weather"}:
+        raise ValueError(f"unsupported TimeCMA dataset: {dataset}")
+    values = torch.as_tensor(history).flatten()
+    if values.numel() != len(timestamps) or values.numel() == 0:
+        raise ValueError("TimeCMA history values and timestamps must have the same non-zero length")
+    start = _datetime_value(timestamps[0])
+    end = _datetime_value(timestamps[-1])
+    if dataset in {"ETTh1", "ETTh2", "ECL"}:
+        start_text, end_text = start.strftime("%d/%m/%Y %H:00"), end.strftime("%d/%m/%Y %H:00")
+        cadence = "hour"
+    else:
+        start_text, end_text = start.strftime("%d/%m/%Y %H:%M"), end.strftime("%d/%m/%Y %H:%M")
+        cadence = "15 minutes" if dataset in {"ETTm1", "ETTm2"} else "10 minutes"
+    values_text = ", ".join(str(int(value)) for value in values.tolist())
+    trend = torch.sum(torch.diff(values)).item()
+    return (
+        f"From {start_text} to {end_text}, the values were {values_text} every {cadence}. "
+        f"The total trend value was {trend:.0f}"
+    )
+
+
+class FrozenGPT2PromptEncoder:
+    """Lazy/local GPT-2 wrapper matching TimeCMA's final-token extraction."""
+
+    def __init__(
+        self,
+        *,
+        tokenizer: Any,
+        model: Any,
+        model_id: str,
+        model_revision: str,
+        tokenizer_id: str,
+        tokenizer_revision: str,
+        precision: str = "float32",
+    ):
+        self.tokenizer = tokenizer
+        self.model = model
+        self.model_id = model_id
+        self.model_revision = model_revision
+        self.tokenizer_id = tokenizer_id
+        self.tokenizer_revision = tokenizer_revision
+        self.precision = precision
+        for parameter in self.model.parameters():
+            parameter.requires_grad = False
+        self.model.eval()
+
+    @classmethod
+    def from_local(
+        cls,
+        *,
+        model_path: str,
+        tokenizer_path: str | None = None,
+        model_id: str = "gpt2",
+        model_revision: str,
+        tokenizer_revision: str,
+        precision: str = "float32",
+    ) -> "FrozenGPT2PromptEncoder":
+        from transformers import GPT2Model, GPT2Tokenizer
+
+        tokenizer_path = tokenizer_path or model_path
+        tokenizer = GPT2Tokenizer.from_pretrained(
+            tokenizer_path,
+            revision=tokenizer_revision,
+            local_files_only=True,
+        )
+        model = GPT2Model.from_pretrained(
+            model_path,
+            revision=model_revision,
+            local_files_only=True,
+        )
+        return cls(
+            tokenizer=tokenizer,
+            model=model,
+            model_id=model_id,
+            model_revision=model_revision,
+            tokenizer_id=model_id,
+            tokenizer_revision=tokenizer_revision,
+            precision=precision,
+        )
+
+    def parameters(self):
+        return self.model.parameters()
+
+    def encode_last_token(self, prompt: str):
+        import torch
+
+        token_ids = self.tokenizer.encode(prompt, return_tensors="pt")
+        try:
+            device = next(self.model.parameters()).device
+        except StopIteration:
+            device = torch.device("cpu")
+        with torch.no_grad():
+            hidden = self.model(token_ids.to(device)).last_hidden_state
+        return hidden[:, -1, :].squeeze(0).detach().cpu()
+
+
+class TimeCMAPromptCache:
+    """Disk cache for frozen GPT-2 final-token embeddings with leakage evidence."""
+
+    def __init__(self, root: Path, provenance: TimeCMACacheProvenance):
+        self.root = Path(root)
+        self.provenance = provenance
+        self.cache_dir = self.root / provenance.digest
+
+    def entry_paths(self, absolute_sample_index: int, variable_index: int) -> tuple[Path, Path]:
+        stem = f"sample-{int(absolute_sample_index)}-variable-{int(variable_index)}"
+        return self.cache_dir / f"{stem}.pt", self.cache_dir / f"{stem}.json"
+
+    def _validate_request(
+        self,
+        history: Any,
+        timestamps: Sequence[Any],
+        absolute_sample_index: int,
+        forecast_origin: int,
+    ) -> tuple[int, int]:
+        import torch
+
+        observed_start = int(absolute_sample_index)
+        values = torch.as_tensor(history).flatten()
+        if values.numel() != self.provenance.input_len:
+            raise ValueError(f"TimeCMA cache requires exactly {self.provenance.input_len} observed values")
+        if len(timestamps) != self.provenance.input_len:
+            raise ValueError(f"TimeCMA cache requires exactly {self.provenance.input_len} observed timestamps")
+        observed_end = observed_start + self.provenance.input_len - 1
+        if observed_end >= int(forecast_origin):
+            raise ValueError("TimeCMA prompt would contain future values at or beyond the forecast origin")
+        return observed_start, observed_end
+
+    def get_or_create(
+        self,
+        history: Any,
+        timestamps: Sequence[Any],
+        absolute_sample_index: int,
+        variable_index: int,
+        forecast_origin: int,
+        encoder: Any,
+    ) -> Any:
+        import torch
+
+        observed_start, observed_end = self._validate_request(
+            history, timestamps, absolute_sample_index, forecast_origin
+        )
+        tensor_path, metadata_path = self.entry_paths(absolute_sample_index, variable_index)
+        expected_provenance = self.provenance.as_dict()
+        if tensor_path.exists() or metadata_path.exists():
+            if not tensor_path.exists() or not metadata_path.exists():
+                raise ValueError("incomplete TimeCMA cache entry")
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if metadata.get("provenance") != expected_provenance:
+                raise ValueError("TimeCMA cache provenance mismatch")
+            expected_boundary = (observed_start, observed_end, int(forecast_origin))
+            recorded_boundary = (
+                metadata.get("observed_start"), metadata.get("observed_end"), metadata.get("forecast_origin")
+            )
+            if recorded_boundary != expected_boundary:
+                raise ValueError("TimeCMA cache history boundary mismatch")
+            return torch.load(tensor_path, map_location="cpu", weights_only=True)
+
+        parameters = getattr(encoder, "parameters", None)
+        if callable(parameters) and any(parameter.requires_grad for parameter in parameters()):
+            raise ValueError("TimeCMA prompt encoder must be frozen")
+        prompt = build_timecma_prompt(self.provenance.dataset, history, timestamps)
+        with torch.no_grad():
+            embedding = torch.as_tensor(encoder.encode_last_token(prompt)).detach().cpu().flatten()
+        if embedding.numel() == 0:
+            raise ValueError("TimeCMA prompt encoder returned an empty final-token embedding")
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(embedding, tensor_path)
+        metadata = {
+            "provenance": expected_provenance,
+            "absolute_sample_index": int(absolute_sample_index),
+            "variable_index": int(variable_index),
+            "observed_start": observed_start,
+            "observed_end": observed_end,
+            "forecast_origin": int(forecast_origin),
+            "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        }
+        metadata_path.write_text(json.dumps(metadata, sort_keys=True, indent=2), encoding="utf-8")
+        return embedding
+
+
+def build_time_llm_prompts(history: Any, description: str, pred_len: int) -> tuple[str, ...]:
+    """Reproduce Time-LLM normalization and its per-variable source prompt."""
+
+    import torch
+
+    values = torch.as_tensor(history)
+    if values.ndim != 3:
+        raise ValueError("Time-LLM history must have shape [batch, time, variables]")
+    batch, seq_len, variables = values.shape
+    if seq_len < 5:
+        raise ValueError("Time-LLM top-five lag prompt requires at least five observed steps")
+    means = values.mean(dim=1, keepdim=True).detach()
+    stdev = torch.sqrt(torch.var(values, dim=1, keepdim=True, unbiased=False) + 1e-5).detach()
+    values = (values - means) / stdev
+    flattened = values.permute(0, 2, 1).contiguous().reshape(batch * variables, seq_len, 1)
+    min_values = torch.min(flattened, dim=1)[0]
+    max_values = torch.max(flattened, dim=1)[0]
+    medians = torch.median(flattened, dim=1).values
+    trends = flattened.diff(dim=1).sum(dim=1)
+    fft_values = torch.fft.rfft(flattened.permute(0, 2, 1).contiguous(), dim=-1)
+    correlation = torch.fft.irfft(fft_values * torch.conj(fft_values), dim=-1)
+    lags = torch.topk(torch.mean(correlation, dim=1), 5, dim=-1).indices
+    prompts = []
+    for index in range(flattened.shape[0]):
+        prompts.append(
+            f"<|start_prompt|>Dataset description: {description}"
+            f"Task description: forecast the next {pred_len} steps given the previous {seq_len} steps information; "
+            "Input statistics: "
+            f"min value {str(min_values[index].tolist()[0])}, "
+            f"max value {str(max_values[index].tolist()[0])}, "
+            f"median value {str(medians[index].tolist()[0])}, "
+            f"the trend of input is {'upward' if trends[index] > 0 else 'downward'}, "
+            f"top 5 lags are : {str(lags[index].tolist())}<|<end_prompt>|>"
+        )
+    return tuple(prompts)
+
+
+_EXTERNAL_MODULE_PREFIXES = ("models", "model", "layers", "data_provider", "utils")
+
+
+def _is_external_module_name(name: str) -> bool:
+    return any(name == prefix or name.startswith(prefix + ".") for prefix in _EXTERNAL_MODULE_PREFIXES)
+
+
+@contextmanager
+def _isolated_external_import(source_root: Path) -> Iterator[None]:
+    source_root = source_root.resolve()
+    original_path = list(sys.path)
+    saved_modules = {name: module for name, module in sys.modules.items() if _is_external_module_name(name)}
+    for name in tuple(saved_modules):
+        sys.modules.pop(name, None)
+    sys.path.insert(0, str(source_root))
+    try:
+        yield
+    finally:
+        sys.path[:] = original_path
+        for name in tuple(sys.modules):
+            if _is_external_module_name(name):
+                sys.modules.pop(name, None)
+        sys.modules.update(saved_modules)
+
+
+def _metadata_value(dataset_meta: Any, name: str) -> Any:
+    if isinstance(dataset_meta, Mapping):
+        return dataset_meta.get(name)
+    return getattr(dataset_meta, name, None)
+
+
+def _source_root(external_root: Path, source: Any) -> Path:
+    root = external_root / source.repo_dir
+    if source.source_subdir:
+        root = root / source.source_subdir
+    return root
+
+
+def _verify_checkout(external_root: Path, source: Any) -> None:
+    repo = external_root / source.repo_dir
+    if not repo.exists():
+        raise FileNotFoundError(f"official source checkout not found: {repo}")
+    try:
+        actual = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
+            text=True,
+            stderr=subprocess.STDOUT,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(f"cannot validate official git checkout at {repo}") from exc
+    if actual != source.commit:
+        raise RuntimeError(f"official source commit mismatch for {source.name}: expected {source.commit}, got {actual}")
+
+
+def _source_config(profile: Any, num_features: int) -> SimpleNamespace:
+    values = {
+        "task_name": "long_term_forecast",
+        "seq_len": profile.seq_len,
+        "label_len": 0,
+        "pred_len": profile.pred_len,
+        "enc_in": num_features,
+        "dec_in": num_features,
+        "c_out": num_features,
+        "features": "M",
+        "output_attention": False,
+        "activation": "gelu",
+        "embed": "timeF",
+        "freq": "h",
+        "factor": 1,
+        "moving_avg": 25,
+        "individual": False,
+        "use_norm": True,
+        "class_strategy": "projection",
+        "prompt_domain": 1,
+    }
+    values.update(profile.architecture)
+    if profile.name == "Time-LLM":
+        try:
+            from .general_baseline_profiles import time_llm_description
+        except ImportError:
+            from general_baseline_profiles import time_llm_description
+        values["content"] = time_llm_description(profile.dataset)
+    return SimpleNamespace(**values)
+
+
+def _patch_timellm_local_sources(module: Any, args: Any, verify_source: bool) -> None:
+    if not hasattr(module, "LlamaModel"):
+        return
+    local_model = getattr(args, "local_llm_path", None)
+    local_tokenizer = getattr(args, "local_tokenizer_path", local_model)
+    model_revision = getattr(args, "llm_model_revision", None)
+    tokenizer_revision = getattr(args, "tokenizer_revision", None)
+    if verify_source and not all((local_model, local_tokenizer, model_revision, tokenizer_revision)):
+        raise ValueError("formal Time-LLM requires local model/tokenizer paths and recorded revisions")
+    if not local_model:
+        return
+
+    for attr in ("LlamaConfig", "LlamaModel", "GPT2Config", "GPT2Model", "BertConfig", "BertModel"):
+        cls = getattr(module, attr, None)
+        if cls is None:
+            continue
+        original = cls.from_pretrained
+
+        def model_loader(_name: str, *loader_args: Any, _original=original, **kwargs: Any):
+            kwargs["local_files_only"] = True
+            kwargs["revision"] = model_revision
+            return _original(str(local_model), *loader_args, **kwargs)
+
+        cls.from_pretrained = staticmethod(model_loader)
+    for attr in ("LlamaTokenizer", "GPT2Tokenizer", "BertTokenizer"):
+        cls = getattr(module, attr, None)
+        if cls is None:
+            continue
+        original = cls.from_pretrained
+
+        def tokenizer_loader(_name: str, *loader_args: Any, _original=original, **kwargs: Any):
+            kwargs["local_files_only"] = True
+            kwargs["revision"] = tokenizer_revision
+            return _original(str(local_tokenizer), *loader_args, **kwargs)
+
+        cls.from_pretrained = staticmethod(tokenizer_loader)
+
+
+def _general_adapter_type():
+    import torch
+
+    class GeneralBaselineAdapter(torch.nn.Module):
+        def __init__(self, model: torch.nn.Module, profile: Any, num_features: int):
+            super().__init__()
+            self.model = model
+            self.profile = profile
+            self.source_identity = profile.source
+            self.prompt_policy = profile.source.prompt_policy
+            self.num_features = num_features
+
+        def forward(self, x: torch.Tensor, *, prompt_embeddings: torch.Tensor | None = None,
+                    time_mark: torch.Tensor | None = None) -> torch.Tensor:
+            if x.ndim != 3 or x.shape[1] != self.profile.seq_len or x.shape[2] != self.num_features:
+                raise ValueError(
+                    f"{self.profile.name} requires input [B,{self.profile.seq_len},{self.num_features}]"
+                )
+            if self.profile.name == "PatchTST":
+                output = self.model(x)
+            elif self.profile.name in {"iTransformer", "TimesNet"}:
+                output = self.model(x, None, None, None)
+            elif self.profile.name == "DLinear":
+                output = self.model(x)
+            elif self.profile.name == "TimeCMA":
+                if prompt_embeddings is None:
+                    raise ValueError("TimeCMA requires cached official prompt_embeddings")
+                if time_mark is None:
+                    time_mark = x.new_zeros((x.shape[0], x.shape[1], 1))
+                output = self.model(x, time_mark, prompt_embeddings)
+            else:
+                output = self.model(x, None, None, None)
+            if isinstance(output, tuple):
+                output = output[0]
+            expected = (x.shape[0], self.profile.pred_len, self.num_features)
+            if tuple(output.shape) != expected:
+                raise ValueError(f"{self.profile.name} returned {tuple(output.shape)}, expected {expected}")
+            return output
+
+    return GeneralBaselineAdapter
+
+
+def build_general_baseline(name: str, dataset_meta: Any, args: Any):
+    """Build one pinned official class without importing source packages eagerly."""
+
+    try:
+        from .general_baseline_profiles import resolve_general_profile
+    except ImportError:
+        from general_baseline_profiles import resolve_general_profile
+
+    dataset = _metadata_value(dataset_meta, "name") or _metadata_value(dataset_meta, "dataset")
+    num_features = _metadata_value(dataset_meta, "num_features") or _metadata_value(dataset_meta, "channels")
+    if not dataset or type(num_features) is not int or num_features <= 0:
+        raise ValueError("dataset_meta requires name and positive integer num_features")
+    pred_len = getattr(args, "pred_len", None)
+    profile = resolve_general_profile(name, dataset, pred_len)
+    external_root = Path(getattr(args, "external_root", "external"))
+    verify_source = bool(getattr(args, "verify_source_commit", True))
+    if verify_source:
+        _verify_checkout(external_root, profile.source)
+    root = _source_root(external_root, profile.source)
+    if not root.exists():
+        raise FileNotFoundError(f"official source module root not found: {root}")
+    config = _source_config(profile, num_features)
+    with _isolated_external_import(root):
+        module = importlib.import_module(profile.source.module)
+        if profile.name == "Time-LLM":
+            _patch_timellm_local_sources(module, args, verify_source)
+        official_class = getattr(module, profile.source.class_name)
+        if profile.name == "TimeCMA":
+            architecture = profile.architecture
+            model = official_class(
+                device=getattr(args, "device", "cpu"),
+                channel=architecture["channel"],
+                num_nodes=num_features,
+                seq_len=profile.seq_len,
+                pred_len=profile.pred_len,
+                dropout_n=architecture["dropout"],
+                d_llm=architecture["d_llm"],
+                e_layer=architecture["e_layers"],
+                d_layer=architecture["d_layers"],
+                d_ff=architecture["d_ff"],
+                head=architecture["n_heads"],
+            )
+        else:
+            model = official_class(config)
+    if profile.name == "Time-LLM":
+        backbone = getattr(model, "llm_model", None)
+        if backbone is None:
+            raise ValueError("official Time-LLM model does not expose llm_model for freeze verification")
+        for parameter in backbone.parameters():
+            parameter.requires_grad = False
+    adapter_class = _general_adapter_type()
+    return adapter_class(model, profile, num_features)
 
 
 def parse_args():
