@@ -30,7 +30,7 @@ def _require_variable_interfaces():
 
 
 def _sample(variable_count: int, horizon: int = 96) -> dict[str, object]:
-    maps = torch.arange(variable_count * 3 * 4 * 8, dtype=torch.float32).reshape(variable_count, 3, 4, 8)
+    maps = torch.arange(3 * 4 * 8, dtype=torch.float32).reshape(3, 4, 8)
     return {
         "maps": maps,
         "y": torch.zeros(horizon, variable_count),
@@ -40,6 +40,7 @@ def _sample(variable_count: int, horizon: int = 96) -> dict[str, object]:
         "series_id": "synthetic",
         "start_index": 0,
         "target_steps": torch.arange(36, 36 + horizon),
+        "history_scaled": torch.arange(36 * variable_count, dtype=torch.float32).reshape(36, variable_count),
     }
 
 
@@ -68,6 +69,33 @@ def _general_model(
 
 
 class GeneralVariableMapTests(unittest.TestCase):
+    def test_variable_axis_aggregation_is_fixed_and_exact(self):
+        maps = np.arange(3 * 2 * 2 * 2, dtype=np.float32).reshape(3, 2, 2, 2)
+
+        actual = raw_signal.aggregate_variable_maps(maps)
+
+        expected = np.concatenate(
+            (
+                maps.mean(axis=0),
+                maps.std(axis=0),
+                maps.min(axis=0),
+                maps.max(axis=0),
+                np.quantile(maps, 0.25, axis=0),
+                np.quantile(maps, 0.75, axis=0),
+            ),
+            axis=0,
+        ).astype(np.float32)
+        self.assertEqual(actual.shape, (12, 2, 2))
+        np.testing.assert_allclose(actual, expected)
+
+    def test_fixed_graph_shape_is_independent_of_variable_count(self):
+        shapes = [
+            raw_signal.aggregate_variable_maps(np.zeros((count, 4, 8, 29), dtype=np.float32)).shape
+            for count in (1, 7, 21, 321)
+        ]
+
+        self.assertEqual(shapes, [(24, 8, 29)] * 4)
+
     def test_variable_maps_preserve_all_321_variables_and_existing_map_values(self):
         build_variable_maps, _ = _require_variable_interfaces()
         history = np.arange(36 * 321, dtype=np.float32).reshape(36, 321)
@@ -86,7 +114,8 @@ class GeneralVariableMapTests(unittest.TestCase):
     def test_general_collator_pads_variables_and_marks_padding_invalid(self):
         batch = collate_general_graph_batch([_sample(3), _sample(5)])
 
-        self.assertEqual(tuple(batch["maps"].shape), (2, 5, 3, 4, 8))
+        self.assertEqual(tuple(batch["maps"].shape), (2, 3, 4, 8))
+        self.assertEqual(tuple(batch["history_scaled"].shape), (2, 36, 5))
         self.assertEqual(tuple(batch["y"].shape), (2, 96, 5))
         self.assertEqual(tuple(batch["mask"].shape), (2, 96, 5))
         self.assertEqual(
@@ -94,6 +123,8 @@ class GeneralVariableMapTests(unittest.TestCase):
             [[True, True, True, False, False], [True, True, True, True, True]],
         )
         self.assertFalse(batch["mask"][0, :, 3:].any())
+        torch.testing.assert_close(batch["history_scaled"][0, :, :3], _sample(3)["history_scaled"])
+        self.assertEqual(torch.count_nonzero(batch["history_scaled"][0, :, 3:]).item(), 0)
 
 
 class VariableGraphEncoderTests(unittest.TestCase):

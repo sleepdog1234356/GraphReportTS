@@ -159,6 +159,33 @@ def build_variable_maps(
     return np.stack(variable_maps, axis=0).astype(np.float32)
 
 
+VARIABLE_GRAPH_STATISTICS = ("mean", "std", "min", "max", "q25", "q75")
+
+
+def aggregate_variable_maps(variable_maps: np.ndarray) -> np.ndarray:
+    """Aggregate variable-wise maps to fixed graph channels.
+
+    The input variable axis is reduced independently for every map view and
+    pixel.  The resulting channel count is therefore independent of the raw
+    feature count while the unaggregated history remains available to the
+    variable-specific numeric encoder.
+    """
+    values = np.asarray(variable_maps, dtype=np.float32)
+    if values.ndim != 4 or values.shape[0] < 1:
+        raise ValueError(
+            "Expected variable maps [variables,views,height,width] with at least one variable"
+        )
+    statistics = (
+        values.mean(axis=0),
+        values.std(axis=0),
+        values.min(axis=0),
+        values.max(axis=0),
+        np.quantile(values, 0.25, axis=0),
+        np.quantile(values, 0.75, axis=0),
+    )
+    return np.concatenate(statistics, axis=0).astype(np.float32, copy=False)
+
+
 def maps_to_patch_nodes(
     maps: torch.Tensor,
     patch_size: int = 8,

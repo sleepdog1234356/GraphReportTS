@@ -13,13 +13,13 @@ try:
     from .general_data_schema import dataset_schema
     from .general_prompting import build_general_prompt_result
     from .general_protocol import FORMAL_HISTORY, GeneralForecastProtocol, StandardScalerNP, fit_train_scaler
-    from .raw_signal import build_variable_maps
+    from .raw_signal import aggregate_variable_maps, build_variable_maps
 except ImportError:
     from experiment_config import GENERAL_DATASET_NOTES
     from general_data_schema import dataset_schema
     from general_prompting import build_general_prompt_result
     from general_protocol import FORMAL_HISTORY, GeneralForecastProtocol, StandardScalerNP, fit_train_scaler
-    from raw_signal import build_variable_maps
+    from raw_signal import aggregate_variable_maps, build_variable_maps
 
 
 TIMECMA_DATASETS = ["ETTm1", "ETTm2", "ETTh1", "ETTh2", "ECL", "Weather"]
@@ -112,13 +112,15 @@ class GeneralForecastGraphDataset(Dataset):
         target_end = history_end + self.pred_len
         x = self.values[start:history_end]
         y = self.values[history_end:target_end]
-        maps = build_variable_maps(
-            x,
-            resample_len=self.resample_len,
-            delay_dim=self.delay_dim,
-            delay_lag=self.delay_lag,
-            include_derivatives=self.include_derivatives,
-            include_hankel=self.include_hankel,
+        maps = aggregate_variable_maps(
+            build_variable_maps(
+                x,
+                resample_len=self.resample_len,
+                delay_dim=self.delay_dim,
+                delay_lag=self.delay_lag,
+                include_derivatives=self.include_derivatives,
+                include_hankel=self.include_hankel,
+            )
         )
         prompt_result = build_general_prompt_result(x, self.columns, self.frequency, self.pred_len)
         return {
@@ -150,24 +152,34 @@ class GeneralForecastGraphDataset(Dataset):
 
 
 def collate_general_graph_batch(batch: List[Dict[str, object]]) -> Dict[str, object]:
-    max_variables = max(b["maps"].shape[0] for b in batch)
-    max_views = max(b["maps"].shape[1] for b in batch)
-    max_hmap = max(b["maps"].shape[2] for b in batch)
-    max_wmap = max(b["maps"].shape[3] for b in batch)
+    max_variables = max(b["y"].shape[-1] for b in batch)
+    max_channels = max(b["maps"].shape[0] for b in batch)
+    max_hmap = max(b["maps"].shape[1] for b in batch)
+    max_wmap = max(b["maps"].shape[2] for b in batch)
     max_horizon = max(b["y"].shape[0] for b in batch)
-    maps = torch.zeros(len(batch), max_variables, max_views, max_hmap, max_wmap, dtype=torch.float32)
+    history_len = max(
+        int(b.get("history_scaled", torch.empty(0, 0)).shape[0])
+        for b in batch
+    )
+    maps = torch.zeros(len(batch), max_channels, max_hmap, max_wmap, dtype=torch.float32)
+    histories = torch.zeros(len(batch), history_len, max_variables, dtype=torch.float32)
     targets = torch.zeros(len(batch), max_horizon, max_variables, dtype=torch.float32)
     target_mask = torch.zeros(len(batch), max_horizon, max_variables, dtype=torch.bool)
     variable_mask = torch.zeros(len(batch), max_variables, dtype=torch.bool)
     for i, b in enumerate(batch):
-        variables, views, hm, wm = b["maps"].shape
+        channels, hm, wm = b["maps"].shape
+        variables = b["y"].shape[-1]
         horizon = b["y"].shape[0]
-        maps[i, :variables, :views, :hm, :wm] = b["maps"]
+        maps[i, :channels, :hm, :wm] = b["maps"]
         targets[i, :horizon, :variables] = b["y"]
         target_mask[i, :horizon, :variables] = b["mask"]
+        if "history_scaled" in b:
+            history = b["history_scaled"]
+            histories[i, : history.shape[0], :variables] = history
         variable_mask[i, :variables] = True
     return {
         "maps": maps,
+        "history_scaled": histories,
         "variable_mask": variable_mask,
         "y": targets,
         "mask": target_mask,
