@@ -80,6 +80,7 @@ class GeneralForecastGraphDataset(Dataset):
         self.include_hankel = bool(include_hankel)
         self.frequency = dataset_schema(dataset_name).frequency
         path = _find_csv(self.data_root, dataset_name)
+        self.source_path = path.resolve()
         df = pd.read_csv(path)
         timestamp_column = next((column for column in ("date", "timestamp") if column in df.columns), None)
         numeric = df.drop(columns=[timestamp_column], errors="ignore").select_dtypes(include=[np.number]).copy()

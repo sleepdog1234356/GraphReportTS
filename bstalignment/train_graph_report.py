@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 from pathlib import Path
+import subprocess
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -17,6 +20,7 @@ try:
     from .experiment_config import ExperimentConfig, ensure_research_dirs
     from .graph_report_losses import graph_report_loss, regression_metrics
     from .graph_report_model import GraphReportTS, GraphReportTSConfig
+    from .general_results import GeneralRunWriter
     from .training_strategy import (
         MAIN_TRAINING_PROFILE,
         MainTrainingProfile,
@@ -38,6 +42,7 @@ except ImportError:
     from experiment_config import ExperimentConfig, ensure_research_dirs
     from graph_report_losses import graph_report_loss, regression_metrics
     from graph_report_model import GraphReportTS, GraphReportTSConfig
+    from general_results import GeneralRunWriter
     from training_strategy import (
         MAIN_TRAINING_PROFILE,
         MainTrainingProfile,
@@ -52,6 +57,58 @@ except ImportError:
         update_graph_report_stale,
     )
     from utils import AverageMeter, ensure_dir, save_json, seed_everything, to_device
+
+
+def _git_source_commit() -> str:
+    """Resolve the exact checked-out main-model source revision for provenance."""
+
+    root = Path(__file__).resolve().parents[1]
+    return subprocess.check_output(["git", "rev-parse", "--short=7", "HEAD"], cwd=root, text=True).strip()
+
+
+def build_general_result_spec(dataset: str, dataset_checksum: str) -> Dict[str, Any]:
+    """Build the immutable formal protocol identity for one main-model run."""
+
+    if dataset not in {"ETTm1", "ETTm2", "ETTh1", "ETTh2", "ECL", "Weather"}:
+        raise ValueError(f"unknown formal general dataset: {dataset}")
+    if len(dataset_checksum) != 64:
+        raise ValueError("general dataset checksum must be a SHA-256 digest")
+    return {
+        "dataset": dataset,
+        "dataset_checksum": dataset_checksum,
+        "source_commit": _git_source_commit(),
+        "protocol": {"input_len": 36, "features": "M", "horizons": [96, 192, 336, 720]},
+    }
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def prepare_result_output_dir(path: Path, variant: str) -> Path:
+    """Preserve legacy battery creation while reserving the general final path for atomic rename."""
+
+    return path if variant == "general" else ensure_dir(path)
+
+
+def _general_dataset_checksum(dataset: str, data_path: Path) -> str:
+    """Fail closed unless the exact trainer input matches the frozen catalog."""
+
+    try:
+        from .general_experiment_config import load_general_experiment_spec
+    except ImportError:
+        from general_experiment_config import load_general_experiment_spec
+    config_path = Path(__file__).resolve().parents[1] / "configs" / "general_forecasting" / "experiment_matrix.yaml"
+    spec = load_general_experiment_spec(config_path)
+    expected = next(item.raw_sha256 for item in spec.datasets if item.name == dataset)
+    observed = _sha256_file(data_path)
+    if observed != expected:
+        raise ValueError(f"formal general data checksum mismatch for {dataset}: {data_path}")
+    return observed
 
 
 def parse_args():
@@ -281,12 +338,17 @@ def evaluate(
     weights: Dict[str, float],
     loss_type: str,
     gate_path: Optional[Path] = None,
+    collect_standardized_predictions: bool = False,
 ) -> Dict[str, float]:
     model.eval()
     meters = {k: AverageMeter() for k in ["total", "reg", "align"]}
     gate_stats = _empty_gate_stats()
     prompt_audit_stats = _empty_prompt_audit_stats()
     gate_rows: List[Dict[str, Any]] = []
+    predictions: List[torch.Tensor] = []
+    targets: List[torch.Tensor] = []
+    sample_indices: List[torch.Tensor] = []
+    step_indices: List[torch.Tensor] = []
     mse_sum = mae_sum = count = 0.0
     for batch in loader:
         batch = to_device(batch, device)
@@ -307,6 +369,11 @@ def evaluate(
         mse_sum += metrics["mse"] * elems
         mae_sum += metrics["mae"] * elems
         count += elems
+        if collect_standardized_predictions:
+            predictions.append(out["pred"].detach().cpu())
+            targets.append(batch["y"].detach().cpu())
+            sample_indices.append(batch["start_index"].detach().cpu())
+            step_indices.append(batch["target_steps"].detach().cpu())
     mse = mse_sum / max(count, 1.0)
     mae = mae_sum / max(count, 1.0)
     out = {k: m.avg for k, m in meters.items()}
@@ -315,6 +382,13 @@ def evaluate(
     out.update(_finalize_prompt_audit_stats(prompt_audit_stats))
     if gate_path is not None:
         _write_gate_rows(gate_path, gate_rows)
+    if collect_standardized_predictions:
+        if not predictions:
+            raise ValueError("cannot collect predictions from an empty loader")
+        out["standardized_predictions"] = torch.cat(predictions, dim=0).numpy()
+        out["standardized_targets"] = torch.cat(targets, dim=0).numpy()
+        out["sample_indices"] = torch.cat(sample_indices, dim=0).numpy()
+        out["step_indices"] = torch.cat(step_indices, dim=0).numpy()
     return out
 
 
@@ -331,10 +405,20 @@ def main():
     seed_everything(args.seed)
     cfg = ExperimentConfig()
     ensure_research_dirs(cfg)
-    out_dir = ensure_dir(Path(args.out_dir) / args.variant / args.dataset)
+    out_dir = prepare_result_output_dir(Path(args.out_dir) / args.variant / args.dataset, args.variant)
     device = torch.device(args.device)
+    started_at = time.monotonic()
 
     train_loader, val_loader, test_loader, output_dim = build_loaders(args)
+    general_writer: Optional[GeneralRunWriter] = None
+    general_data_path: Optional[Path] = None
+    if args.variant == "general":
+        general_data_path = Path(train_loader.dataset.source_path)
+        general_writer = GeneralRunWriter(
+            out_dir,
+            build_general_result_spec(args.dataset, _general_dataset_checksum(args.dataset, general_data_path)),
+        )
+        out_dir = general_writer.path
     model_cfg = GraphReportTSConfig(
         variant=args.variant,
         output_dim=output_dim,
@@ -379,6 +463,9 @@ def main():
     training_strategy_version = TRAINING_STRATEGY_VERSION
     resume_path = None
     resume_checkpoint = None
+    if args.variant == "general":
+        # A final general result bundle is immutable; an interrupted .partial run is deliberately rejected.
+        args.no_resume = True
     if not args.no_resume:
         last_path = out_dir / "last.pt"
         best_path = out_dir / "best.pt"
@@ -393,16 +480,17 @@ def main():
     scheduler = GraphReportScheduler(opt, profile)
     eval_weights = _loss_weights(args, profile, profile.max_epochs)
 
-    save_json(
-        {
-            "args": vars(args),
-            "model_cfg": model_cfg.__dict__,
-            "output_dim": output_dim,
-            "training_strategy_version": training_strategy_version,
-            "training_profile": profile.__dict__,
-        },
-        out_dir / "run_config.json",
-    )
+    run_config = {
+        "args": vars(args),
+        "model_cfg": model_cfg.__dict__,
+        "output_dim": output_dim,
+        "training_strategy_version": training_strategy_version,
+        "training_profile": profile.__dict__,
+    }
+    if general_writer is None:
+        save_json(run_config, out_dir / "run_config.json")
+    else:
+        general_writer.write_run_config({"model": "GraphReportTS", "dataset": args.dataset, "seed": args.seed, "metrics_space": "standardized", **run_config})
     best = float("inf")
     stale = 0
     start_epoch = 1
@@ -422,6 +510,7 @@ def main():
         start_epoch = int(resume_checkpoint.get("epoch", 0)) + 1 if "epoch" in resume_checkpoint else 1
         print(f"resumed from {resume_path} at epoch {start_epoch}; best val_mse={best:.6f}")
 
+    stopped_early = False
     for epoch in range(start_epoch, profile.max_epochs + 1):
         model.train()
         if model_cfg.freeze_text and text_backbone is not None:
@@ -481,6 +570,8 @@ def main():
         }
         with (out_dir / "epoch_history.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(epoch_row, ensure_ascii=False, sort_keys=True) + "\n")
+        if general_writer is not None:
+            general_writer.append_history(epoch_row)
         print(
             f"epoch={epoch} val_mse={val['mse']:.6f} val_mae={val['mae']:.6f} "
             f"val_loss={val['total']:.6f} gate_mean={val['gate_mean']:.4f} align_w={weights['align']:.5f} "
@@ -488,16 +579,60 @@ def main():
             f"training_strategy_version={training_strategy_version}"
         )
         if improved:
-            torch.save(checkpoint, out_dir / "best.pt")
-            save_json(val, out_dir / "val_metrics.json")
-        torch.save(checkpoint, out_dir / "last.pt")
+            if general_writer is None:
+                torch.save(checkpoint, out_dir / "best.pt")
+                save_json(val, out_dir / "val_metrics.json")
+            else:
+                general_writer.record_validation(epoch=epoch, mse=val["mse"], checkpoint=checkpoint)
+        if general_writer is None:
+            torch.save(checkpoint, out_dir / "last.pt")
         if should_stop_graph_report(epoch, stale, profile):
             print(f"early stopping at epoch {epoch}; best val_mse={best:.6f}")
+            stopped_early = True
             break
     ckpt = torch.load(out_dir / "best.pt", map_location=device)
     model.load_state_dict(ckpt["model"])
-    test = evaluate(model, test_loader, device, eval_weights, args.loss, gate_path=out_dir / "test_gates.csv")
-    save_json(test, out_dir / "test_metrics.json")
+    test = evaluate(
+        model,
+        test_loader,
+        device,
+        eval_weights,
+        args.loss,
+        gate_path=out_dir / "test_gates.csv",
+        collect_standardized_predictions=general_writer is not None,
+    )
+    if general_writer is None:
+        save_json(test, out_dir / "test_metrics.json")
+    else:
+        general_writer.record_test(
+            test.pop("standardized_predictions"),
+            test.pop("standardized_targets"),
+            sample_indices=test.pop("sample_indices"),
+            step_indices=test.pop("step_indices"),
+            variable_indices=range(output_dim),
+        )
+        peak_memory = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0
+        general_writer.write_environment({"device": str(device), "cuda_initialized": torch.cuda.is_initialized()})
+        general_writer.complete(
+            {
+                "dataset_checksum": _general_dataset_checksum(args.dataset, general_data_path),
+                "source_commit": _git_source_commit(),
+                "protocol": {"input_len": 36, "features": "M", "horizons": [96, 192, 336, 720]},
+                "source": {"url": "local:GraphReportTS", "commit": _git_source_commit()},
+                "runtime": {
+                    "wall_time_seconds": time.monotonic() - started_at,
+                    "peak_gpu_memory_bytes": int(peak_memory),
+                    "trainable_parameters": sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad),
+                    "epochs": epoch,
+                    "early_stop_reason": "patience" if stopped_early else "max_epochs",
+                    "data_path": str(general_data_path),
+                },
+                "prompt_audit": {
+                    "validation": {key: value for key, value in val.items() if key.startswith("encoder_")},
+                    "test": {key: value for key, value in test.items() if key.startswith("encoder_")},
+                },
+            }
+        )
     print("test metrics:", test)
 
 

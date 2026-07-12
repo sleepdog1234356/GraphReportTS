@@ -14,6 +14,11 @@ from typing import Any, Mapping
 import numpy as np
 import torch
 
+try:
+    from .general_results import GeneralRunWriter, standardized_metrics
+except ImportError:
+    from general_results import GeneralRunWriter, standardized_metrics
+
 
 def source_time_markers(dataset: str, timestamps: Any) -> torch.Tensor:
     """Build the pinned iTransformer/TimesNet hourly ``timeF`` columns."""
@@ -234,11 +239,14 @@ def validation_checkpoint_decision(
 def general_metrics(prediction: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
     if prediction.shape != target.shape or prediction.ndim != 3:
         raise ValueError("general metrics require matching [batch, horizon, variables] tensors")
-    difference = prediction.detach().float() - target.detach().float()
-    return {
-        "mse": float(torch.mean(difference.square()).cpu()),
-        "mae": float(torch.mean(torch.abs(difference)).cpu()),
-    }
+    metrics = standardized_metrics(prediction.detach().cpu().numpy(), target.detach().cpu().numpy())
+    return {"mse": float(metrics["mse"]), "mae": float(metrics["mae"])}
+
+
+def begin_general_result_run(run_dir: str | Path, expected_spec: Mapping[str, Any]) -> GeneralRunWriter:
+    """Create the shared atomic result bundle used by formal baseline runners."""
+
+    return GeneralRunWriter(run_dir, expected_spec)
 
 
 def _mapping(value: Mapping[str, Any]) -> dict[str, Any]:
