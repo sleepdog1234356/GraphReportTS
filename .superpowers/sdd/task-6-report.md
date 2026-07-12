@@ -155,9 +155,9 @@ The second skip is the existing opt-in CUDA ECL smoke test. `compileall` and
 
 ## 2026-07-13 review-fix pass
 
-Design amendment: `e99a82b` (`Document Task 6 review fixes`). No training, CUDA,
-weights, real embedding generation, or network model access occurred during the
-fix pass.
+Design amendment: `e99a82b` (`Document Task 6 review fixes`). Fix implementation:
+`55c2687` (`Fix Task 6 source adapter contracts`). No training, CUDA, weights,
+real embedding generation, or network model access occurred during the fix pass.
 
 ### Full source identities and checkout state
 
