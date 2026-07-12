@@ -114,6 +114,11 @@ def parse_args():
     args = p.parse_args()
     if args.input_len is None:
         args.input_len = 36 if args.variant == "general" else 96
+    if args.variant == "general":
+        if args.input_len != 36:
+            p.error("general forecasting requires --input_len 36")
+        if args.pred_len not in (96, 192, 336, 720):
+            p.error("general forecasting requires --pred_len one of 96, 192, 336, 720")
     if args.batch_size is None:
         args.batch_size = 64 if args.variant == "battery" else 32
     return args

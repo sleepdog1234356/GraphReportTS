@@ -6,6 +6,7 @@ import numpy as np
 
 
 FORMAL_HISTORY = 36
+FORMAL_HORIZONS = (96, 192, 336, 720)
 _ETTH_BOUNDS = (8_640, 11_520, 14_400)
 _ETTM_BOUNDS = (34_560, 46_080, 57_600)
 _ETTH_DATASETS = frozenset({"ETTh1", "ETTh2"})
@@ -80,8 +81,8 @@ class GeneralForecastProtocol:
 
         if split not in self.bounds:
             raise ValueError(f"unknown split: {split}")
-        if pred_len <= 0:
-            raise ValueError("pred_len must be positive")
+        if pred_len not in FORMAL_HORIZONS:
+            raise ValueError(f"unsupported formal prediction length: {pred_len}; expected one of {FORMAL_HORIZONS}")
         split_start, split_end = self.bounds[split]
         first_target_start = max(split_start, self.input_len)
         first_history_start = first_target_start - self.input_len

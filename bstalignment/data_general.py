@@ -76,7 +76,7 @@ class GeneralForecastGraphDataset(Dataset):
         self.include_hankel = bool(include_hankel)
         path = _find_csv(self.data_root, dataset_name)
         df = pd.read_csv(path)
-        timestamp_column = "date" if "date" in df.columns else None
+        timestamp_column = next((column for column in ("date", "timestamp") if column in df.columns), None)
         numeric = df.drop(columns=[timestamp_column], errors="ignore").select_dtypes(include=[np.number]).copy()
         if numeric.empty:
             raise ValueError(f"{path} has no numeric columns.")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -104,9 +105,62 @@ class GeneralProtocolTests(unittest.TestCase):
     def test_general_trainer_defaults_to_the_formal_history_length(self):
         from bstalignment.train_graph_report import parse_args
 
-        with patch("sys.argv", ["train_graph_report", "--variant", "general"]):
+        with patch("sys.argv", ["train_graph_report", "--variant", "general", "--pred_len", "96"]):
             args = parse_args()
         self.assertEqual(args.input_len, 36)
+
+    def test_general_trainer_rejects_the_shared_battery_horizon_default(self):
+        from bstalignment.train_graph_report import parse_args
+
+        stderr = io.StringIO()
+        with patch("sys.argv", ["train_graph_report", "--variant", "general"]), patch("sys.stderr", stderr):
+            with self.assertRaises(SystemExit):
+                parse_args()
+        self.assertIn("general forecasting requires --pred_len", stderr.getvalue())
+
+    def test_general_trainer_rejects_a_nonformal_history_length_before_loading_data(self):
+        from bstalignment.train_graph_report import parse_args
+
+        stderr = io.StringIO()
+        with patch(
+            "sys.argv",
+            ["train_graph_report", "--variant", "general", "--input_len", "35", "--pred_len", "96"],
+        ), patch("sys.stderr", stderr):
+            with self.assertRaises(SystemExit):
+                parse_args()
+        self.assertIn("general forecasting requires --input_len 36", stderr.getvalue())
+
+    def test_battery_parser_retains_its_shared_twenty_step_default(self):
+        from bstalignment.train_graph_report import parse_args
+
+        with patch("sys.argv", ["train_graph_report", "--variant", "battery"]):
+            args = parse_args()
+        self.assertEqual(args.pred_len, 20)
+        self.assertEqual(args.input_len, 96)
+
+    def test_window_index_rejects_unsupported_formal_horizons(self):
+        protocol = GeneralForecastProtocol("ECL", n_rows=10_000, input_len=36)
+
+        with self.assertRaisesRegex(ValueError, "unsupported formal prediction length"):
+            protocol.window_index("train", pred_len=95)
+
+    def test_timestamp_column_is_preserved_as_timestamp_metadata(self):
+        from bstalignment.data_general import GeneralForecastGraphDataset
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_dir = root / "processed" / "general" / "ECL"
+            data_dir.mkdir(parents=True)
+            timestamps = pd.date_range("2020-01-01", periods=1_000, freq="h")
+            pd.DataFrame(
+                {
+                    "timestamp": timestamps,
+                    "load": np.arange(1_000, dtype=float),
+                    "temperature": np.arange(1_000, dtype=float) * 2,
+                }
+            ).to_csv(data_dir / "ECL.csv", index=False)
+            sample = GeneralForecastGraphDataset("ECL", data_root=str(root), split="val", pred_len=96)[0]
+        self.assertEqual(sample["timestamp_markers"]["history"][0], timestamps[664].to_datetime64())
 
 
 if __name__ == "__main__":

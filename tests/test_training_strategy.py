@@ -455,8 +455,8 @@ class VariantBatchDefaultTests(unittest.TestCase):
     def test_graph_report_parser_resolves_batch_default_by_variant(self):
         cases = (
             (["--variant", "battery"], 64),
-            (["--variant", "general"], 32),
-            (["--variant", "general", "--batch_size", "7"], 7),
+            (["--variant", "general", "--pred_len", "96"], 32),
+            (["--variant", "general", "--pred_len", "96", "--batch_size", "7"], 7),
         )
         for arguments, expected in cases:
             with self.subTest(arguments=arguments), patch.object(
