@@ -11,7 +11,7 @@ from .general_protocol import FORMAL_HISTORY, FORMAL_HORIZONS
 
 
 MAX_VARIABLE_SUMMARIES = 12
-PROMPT_TOKEN_BUDGET = 256
+PRETOKEN_WORD_BUDGET = 192
 _TREND_TOLERANCE = 1e-6
 
 
@@ -49,7 +49,11 @@ def _selected_variable_indices(trends: np.ndarray) -> tuple[int, ...]:
         return tuple(range(count))
     indices = range(count)
     smallest = sorted(indices, key=lambda index: (abs(float(trends[index])), index))[:6]
-    largest = sorted(indices, key=lambda index: (-abs(float(trends[index])), index))[:6]
+    smallest_set = set(smallest)
+    largest = sorted(
+        (index for index in indices if index not in smallest_set),
+        key=lambda index: (-abs(float(trends[index])), index),
+    )[:6]
     return tuple(sorted((*smallest, *largest)))
 
 
@@ -109,7 +113,7 @@ def build_general_prompt_result(
         )
         candidate_summaries = (*summaries, summary)
         candidate = prefix + "Variable summaries: " + "; ".join(candidate_summaries) + "." + suffix
-        if _token_count(candidate) > PROMPT_TOKEN_BUDGET:
+        if _token_count(candidate) > PRETOKEN_WORD_BUDGET:
             truncated = True
             break
         summaries.append(summary)
@@ -118,9 +122,9 @@ def build_general_prompt_result(
     summary_text = "; ".join(summaries) if summaries else "none"
     prompt = prefix + f"Variable summaries: {summary_text}." + suffix
     metadata = {
-        "token_count": _token_count(prompt),
-        "token_budget": PROMPT_TOKEN_BUDGET,
-        "truncated": truncated,
+        "pretoken_word_count": _token_count(prompt),
+        "pretoken_word_budget": PRETOKEN_WORD_BUDGET,
+        "pretoken_word_truncated": truncated,
         "frequency": frequency_text,
         "variable_count": variable_count,
         "summary_count": len(summaries),

@@ -649,11 +649,14 @@ class GraphReportTS(nn.Module):
         query_tokens = torch.cat([graph_cycle_tokens, numeric_tokens], dim=1)
         text_repr = None
         cross_attn = None
+        prompt_audit = None
         gate = torch.zeros(context.size(0), 1, dtype=context.dtype, device=context.device)
         align_graph = context
         align_text = context.detach()
         if self.text_encoder is not None and self.cfg.use_report_prompt and self.cfg.use_cross_modal_fusion:
-            text_tokens, text_repr, text_mask = self.text_encoder(prompts)
+            text_tokens, text_repr, text_mask = self.text_encoder(prompts, audit=scalable_general)
+            if scalable_general:
+                prompt_audit = self.text_encoder.last_prompt_audit
             if self.cfg.variant == "battery":
                 fused = self.semantic_fusion(context, query_tokens, text_tokens, text_mask)
             elif scalable_general:
@@ -684,7 +687,7 @@ class GraphReportTS(nn.Module):
             pred = self.variable_decoder(context, variable_tokens, steps, variable_mask)
         else:
             pred = self.decoder(context, steps)
-        return {
+        output = {
             "pred": pred,
             "context": context,
             "graph_tokens": graph_cycle_tokens,
@@ -695,6 +698,9 @@ class GraphReportTS(nn.Module):
             "align_graph": align_graph,
             "align_text": align_text,
         }
+        if scalable_general and prompt_audit is not None:
+            output["prompt_audit"] = prompt_audit
+        return output
 
 
 def build_graph_report_model(

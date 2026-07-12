@@ -215,6 +215,32 @@ def _finalize_gate_stats(stats: Dict[str, float]) -> Dict[str, float]:
     return {"gate_mean": mean, "gate_std": var**0.5, "gate_min": stats["min"], "gate_max": stats["max"]}
 
 
+def _empty_prompt_audit_stats() -> Dict[str, float]:
+    return {"token_sum": 0.0, "limit_sum": 0.0, "count": 0.0, "truncated_count": 0.0}
+
+
+def _update_prompt_audit_stats(stats: Dict[str, float], audit: Optional[List[Dict[str, Any]]]) -> None:
+    if audit is None:
+        return
+    for row in audit:
+        stats["token_sum"] += float(row["token_count"])
+        stats["limit_sum"] += float(row["token_limit"])
+        stats["count"] += 1.0
+        stats["truncated_count"] += float(bool(row["truncated"]))
+
+
+def _finalize_prompt_audit_stats(stats: Dict[str, float]) -> Dict[str, float]:
+    count = stats["count"]
+    if count <= 0:
+        return {}
+    return {
+        "encoder_token_count_mean": stats["token_sum"] / count,
+        "encoder_truncated_count": stats["truncated_count"],
+        "encoder_truncated_rate": stats["truncated_count"] / count,
+        "encoder_token_limit": stats["limit_sum"] / count,
+    }
+
+
 def _model_forward(model: GraphReportTS, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
     steps = None
     if model.cfg.variant == "battery" and not model.cfg.use_relative_steps:
@@ -259,6 +285,7 @@ def evaluate(
     model.eval()
     meters = {k: AverageMeter() for k in ["total", "reg", "align"]}
     gate_stats = _empty_gate_stats()
+    prompt_audit_stats = _empty_prompt_audit_stats()
     gate_rows: List[Dict[str, Any]] = []
     mse_sum = mae_sum = count = 0.0
     for batch in loader:
@@ -269,6 +296,7 @@ def evaluate(
         for k, v in loss.items():
             meters[k].update(float(v.detach()), n)
         _update_gate_stats(gate_stats, out.get("gate"))
+        _update_prompt_audit_stats(prompt_audit_stats, out.get("prompt_audit"))
         if gate_path is not None and "gate" in out:
             gate_vals = out["gate"].detach().reshape(n, -1).mean(dim=1).cpu().tolist()
             cycles = batch["cycle"].detach().cpu().tolist() if torch.is_tensor(batch.get("cycle")) else [0] * n
@@ -284,6 +312,7 @@ def evaluate(
     out = {k: m.avg for k, m in meters.items()}
     out.update({"mse": mse, "mae": mae, "rmse": mse**0.5})
     out.update(_finalize_gate_stats(gate_stats))
+    out.update(_finalize_prompt_audit_stats(prompt_audit_stats))
     if gate_path is not None:
         _write_gate_rows(gate_path, gate_rows)
     return out
