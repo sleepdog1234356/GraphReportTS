@@ -137,6 +137,76 @@ class GraphMapEncoder(nn.Module):
         }
 
 
+class VariableGraphEncoder(nn.Module):
+    """Apply one shared graph encoder to fixed-size chunks of variables."""
+
+    def __init__(
+        self,
+        d_model: int = 128,
+        patch_size: int = 8,
+        patch_stride: int = 4,
+        graph_layers: int = 2,
+        topk_edges: int = 4,
+        dropout: float = 0.1,
+        max_map_channels: int = 128,
+        use_domain_edges: bool = True,
+        use_dynamic_graph: bool = True,
+        variable_chunk_size: int = 32,
+    ):
+        super().__init__()
+        self.variable_chunk_size = max(int(variable_chunk_size), 1)
+        self.d_model = int(d_model)
+        self.map_encoder = GraphMapEncoder(
+            d_model=d_model,
+            patch_size=patch_size,
+            patch_stride=patch_stride,
+            graph_layers=graph_layers,
+            topk_edges=topk_edges,
+            dropout=dropout,
+            max_map_channels=max_map_channels,
+            use_domain_edges=use_domain_edges,
+            use_dynamic_graph=use_dynamic_graph,
+        )
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(
+        self,
+        maps: torch.Tensor,
+        variable_mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if maps.ndim != 5:
+            raise ValueError(f"Expected variable maps [B,C,V,H,W], got {tuple(maps.shape)}")
+        batch_size, variables, views, height, width = maps.shape
+        if variable_mask is None:
+            variable_mask = torch.ones(batch_size, variables, dtype=torch.bool, device=maps.device)
+        if tuple(variable_mask.shape) != (batch_size, variables):
+            raise ValueError(
+                f"Expected variable mask {(batch_size, variables)}, got {tuple(variable_mask.shape)}"
+            )
+        variable_mask = variable_mask.to(device=maps.device, dtype=torch.bool)
+        flat_maps = maps.reshape(batch_size * variables, views, height, width)
+        valid_indices = torch.nonzero(variable_mask.reshape(-1), as_tuple=False).squeeze(-1)
+        encoded_chunks = []
+        graph_attn = None
+        for indices in valid_indices.split(self.variable_chunk_size):
+            encoded = self.map_encoder(flat_maps.index_select(0, indices))
+            encoded_chunks.append(encoded["repr"])
+            graph_attn = encoded["graph_attn"]
+        flat_tokens = maps.new_zeros(batch_size * variables, self.d_model)
+        if encoded_chunks:
+            flat_tokens = flat_tokens.index_copy(0, valid_indices, torch.cat(encoded_chunks, dim=0))
+        tokens = flat_tokens.reshape(batch_size, variables, self.d_model)
+        weights = variable_mask.to(tokens.dtype)
+        pooled = torch.sum(tokens * weights.unsqueeze(-1), dim=1)
+        pooled = pooled / weights.sum(dim=1, keepdim=True).clamp_min(1.0)
+        return {
+            "tokens": tokens,
+            "repr": self.norm(pooled),
+            "graph_attn": graph_attn,
+            "pool_weight": weights / weights.sum(dim=1, keepdim=True).clamp_min(1.0),
+        }
+
+
 class CrossModalFusion(nn.Module):
     """Fuse graph tokens with report prompt tokens."""
 
@@ -387,6 +457,8 @@ class GraphReportTSConfig:
     use_relative_steps: bool = True
     temporal_layers: int = 1
     temporal_heads: int = 4
+    variable_chunk_size: int = 32
+    legacy_general_graph: bool = False
 
 
 class GraphReportTS(nn.Module):
@@ -395,7 +467,10 @@ class GraphReportTS(nn.Module):
     def __init__(self, cfg: GraphReportTSConfig):
         super().__init__()
         self.cfg = cfg
-        self.graph_encoder = GraphMapEncoder(
+        graph_encoder_cls = (
+            VariableGraphEncoder if cfg.variant == "general" and not cfg.legacy_general_graph else GraphMapEncoder
+        )
+        graph_encoder_kwargs = dict(
             d_model=cfg.d_model,
             patch_size=cfg.patch_size,
             patch_stride=cfg.patch_stride,
@@ -405,6 +480,9 @@ class GraphReportTS(nn.Module):
             use_domain_edges=cfg.use_domain_edges,
             use_dynamic_graph=cfg.use_dynamic_graph,
         )
+        if graph_encoder_cls is VariableGraphEncoder:
+            graph_encoder_kwargs["variable_chunk_size"] = cfg.variable_chunk_size
+        self.graph_encoder = graph_encoder_cls(**graph_encoder_kwargs)
         if cfg.use_report_prompt and cfg.use_cross_modal_fusion and cfg.use_hf_text_encoder:
             self.text_encoder = HFTextEncoder(cfg.text_model, cfg.d_model, cfg.freeze_text, cfg.text_max_length)
         elif cfg.use_report_prompt and cfg.use_cross_modal_fusion:
@@ -439,7 +517,17 @@ class GraphReportTS(nn.Module):
         decoder_cls = UnifiedQueryDecoder if cfg.unified_decoder else SeparateNowFutureDecoder
         self.decoder = decoder_cls(cfg.d_model, cfg.output_dim, cfg.max_steps, cfg.dropout)
 
-    def _encode_graph_history(self, maps: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+    def _encode_graph_history(
+        self,
+        maps: torch.Tensor,
+        variable_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        if self.cfg.variant == "general" and not self.cfg.legacy_general_graph:
+            graph = self.graph_encoder(maps, variable_mask)
+            return graph["repr"], graph["tokens"], graph
+        if self.cfg.variant == "general" and self.cfg.legacy_general_graph and maps.ndim == 5:
+            b, variables, views, h, w = maps.shape
+            maps = maps.reshape(b, variables * views, h, w)
         if maps.ndim == 5:
             b, t, c, h, w = maps.shape
             if not self.cfg.use_multi_cycle_raw:
@@ -468,8 +556,9 @@ class GraphReportTS(nn.Module):
         horizon: torch.Tensor | int,
         steps: Optional[torch.Tensor] = None,
         history_features: Optional[torch.Tensor] = None,
+        variable_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        graph_context, graph_cycle_tokens, graph = self._encode_graph_history(maps)
+        graph_context, graph_cycle_tokens, graph = self._encode_graph_history(maps, variable_mask)
         if history_features is not None and self.cfg.use_numeric_history:
             numeric_context, numeric_tokens = self.numeric_history_encoder(history_features)
         else:
@@ -485,7 +574,7 @@ class GraphReportTS(nn.Module):
         align_text = context.detach()
         if self.text_encoder is not None and self.cfg.use_report_prompt and self.cfg.use_cross_modal_fusion:
             text_tokens, text_repr, text_mask = self.text_encoder(prompts)
-            if maps.ndim == 5 or self.cfg.variant == "battery":
+            if self.cfg.variant == "battery":
                 fused = self.semantic_fusion(context, query_tokens, text_tokens, text_mask)
             else:
                 fused = self.fusion(graph["tokens"], graph["repr"], text_tokens, text_mask)

@@ -71,6 +71,8 @@ def parse_args():
     p.add_argument("--patch_size", type=int, default=8)
     p.add_argument("--patch_stride", type=int, default=4)
     p.add_argument("--topk_edges", type=int, default=4)
+    p.add_argument("--variable_chunk_size", type=int, default=32)
+    p.add_argument("--legacy_general_graph", action="store_true", help="Diagnostic only: use the unbounded legacy global graph for general datasets")
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--text_model", type=str, default="distilbert-base-uncased")
     p.add_argument("--no_hf_text", action="store_true")
@@ -223,6 +225,7 @@ def _model_forward(model: GraphReportTS, batch: Dict[str, Any]) -> Dict[str, tor
         batch["horizon"],
         steps=steps,
         history_features=batch.get("history_features"),
+        variable_mask=batch.get("variable_mask"),
     )
 
 
@@ -330,6 +333,8 @@ def main():
         use_relative_steps=not args.absolute_step_decoder,
         temporal_layers=args.temporal_layers,
         temporal_heads=args.temporal_heads,
+        variable_chunk_size=args.variable_chunk_size,
+        legacy_general_graph=args.legacy_general_graph,
     )
     model = GraphReportTS(model_cfg).to(device)
     with torch.no_grad():

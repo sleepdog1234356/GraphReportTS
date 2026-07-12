@@ -11,11 +11,11 @@ from torch.utils.data import Dataset
 try:
     from .experiment_config import GENERAL_DATASET_NOTES
     from .general_protocol import FORMAL_HISTORY, GeneralForecastProtocol, StandardScalerNP, fit_train_scaler
-    from .raw_signal import build_multiview_maps, build_report_from_array
+    from .raw_signal import build_report_from_array, build_variable_maps
 except ImportError:
     from experiment_config import GENERAL_DATASET_NOTES
     from general_protocol import FORMAL_HISTORY, GeneralForecastProtocol, StandardScalerNP, fit_train_scaler
-    from raw_signal import build_multiview_maps, build_report_from_array
+    from raw_signal import build_report_from_array, build_variable_maps
 
 
 TIMECMA_DATASETS = ["ETTm1", "ETTm2", "ETTh1", "ETTh2", "ECL", "Weather"]
@@ -106,15 +106,13 @@ class GeneralForecastGraphDataset(Dataset):
         target_end = history_end + self.pred_len
         x = self.values[start:history_end]
         y = self.values[history_end:target_end]
-        channels = {name: x[:, i] for i, name in enumerate(self.columns)}
-        maps, _ = build_multiview_maps(
-            channels,
+        maps = build_variable_maps(
+            x,
             resample_len=self.resample_len,
             delay_dim=self.delay_dim,
             delay_lag=self.delay_lag,
             include_derivatives=self.include_derivatives,
             include_hankel=self.include_hankel,
-            include_ic_dv=False,
         )
         prompt = build_report_from_array(x, domain=self.dataset_name, horizon=self.pred_len, variables=self.columns)
         return {
@@ -145,17 +143,27 @@ class GeneralForecastGraphDataset(Dataset):
 
 
 def collate_general_graph_batch(batch: List[Dict[str, object]]) -> Dict[str, object]:
-    max_c = max(b["maps"].shape[0] for b in batch)
-    max_hmap = max(b["maps"].shape[1] for b in batch)
-    max_wmap = max(b["maps"].shape[2] for b in batch)
-    maps = torch.zeros(len(batch), max_c, max_hmap, max_wmap, dtype=torch.float32)
+    max_variables = max(b["maps"].shape[0] for b in batch)
+    max_views = max(b["maps"].shape[1] for b in batch)
+    max_hmap = max(b["maps"].shape[2] for b in batch)
+    max_wmap = max(b["maps"].shape[3] for b in batch)
+    max_horizon = max(b["y"].shape[0] for b in batch)
+    maps = torch.zeros(len(batch), max_variables, max_views, max_hmap, max_wmap, dtype=torch.float32)
+    targets = torch.zeros(len(batch), max_horizon, max_variables, dtype=torch.float32)
+    target_mask = torch.zeros(len(batch), max_horizon, max_variables, dtype=torch.bool)
+    variable_mask = torch.zeros(len(batch), max_variables, dtype=torch.bool)
     for i, b in enumerate(batch):
-        c, hm, wm = b["maps"].shape
-        maps[i, :c, :hm, :wm] = b["maps"]
+        variables, views, hm, wm = b["maps"].shape
+        horizon = b["y"].shape[0]
+        maps[i, :variables, :views, :hm, :wm] = b["maps"]
+        targets[i, :horizon, :variables] = b["y"]
+        target_mask[i, :horizon, :variables] = b["mask"]
+        variable_mask[i, :variables] = True
     return {
         "maps": maps,
-        "y": torch.stack([b["y"] for b in batch], dim=0),
-        "mask": torch.stack([b["mask"] for b in batch], dim=0),
+        "variable_mask": variable_mask,
+        "y": targets,
+        "mask": target_mask,
         "horizon": torch.stack([b["horizon"] for b in batch], dim=0),
         "prompt": [b["prompt"] for b in batch],
         "series_id": [b["series_id"] for b in batch],

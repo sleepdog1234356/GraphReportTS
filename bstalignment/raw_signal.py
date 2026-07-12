@@ -130,6 +130,35 @@ def build_multiview_maps(
     return np.stack(maps, axis=0).astype(np.float32), names
 
 
+def build_variable_maps(
+    x: np.ndarray,
+    resample_len: int = 128,
+    delay_dim: int = 8,
+    delay_lag: int = 1,
+    include_derivatives: bool = True,
+    include_hankel: bool = True,
+) -> np.ndarray:
+    """Build independent multi-view maps shaped [variables, views, height, width]."""
+    values = np.asarray(x, dtype=np.float32)
+    if values.ndim != 2:
+        raise ValueError(f"Expected history [time,variables], got {values.shape}")
+    variable_maps = []
+    for variable_index in range(values.shape[1]):
+        maps, _ = build_multiview_maps(
+            {f"x{variable_index}": values[:, variable_index]},
+            resample_len=resample_len,
+            delay_dim=delay_dim,
+            delay_lag=delay_lag,
+            include_derivatives=include_derivatives,
+            include_hankel=include_hankel,
+            include_ic_dv=False,
+        )
+        variable_maps.append(maps)
+    if not variable_maps:
+        raise ValueError("Variable maps require at least one input variable")
+    return np.stack(variable_maps, axis=0).astype(np.float32)
+
+
 def maps_to_patch_nodes(
     maps: torch.Tensor,
     patch_size: int = 8,
