@@ -52,7 +52,7 @@ class GeneralExperimentConfigTests(unittest.TestCase):
                 "features": "M",
                 "datasets": [dataset["name"] for dataset in datasets["datasets"]],
                 "models": [model["name"] for model in models["models"]],
-                "horizons": [96, 192, 336, 720],
+                "horizons": [24, 36, 48, 60],
                 "smoke_seed": 42,
                 "formal_seeds": [2021, 2022, 2023],
                 "paths": {"datasets": "datasets.yaml", "models": "models.yaml", "output_root": "runs/general_forecasting"},
@@ -76,7 +76,7 @@ class GeneralExperimentConfigTests(unittest.TestCase):
         )
         self.assertEqual(spec.input_len, 36)
         self.assertEqual(getattr(spec, "features", None), "M")
-        self.assertEqual(spec.horizons, (96, 192, 336, 720))
+        self.assertEqual(spec.horizons, (24, 36, 48, 60))
         self.assertEqual(getattr(spec, "smoke_seed", None), 42)
         self.assertEqual(spec.formal_seeds, (2021, 2022, 2023))
         self.assertEqual(len(spec.run_ids), 504)
@@ -145,7 +145,7 @@ class GeneralExperimentConfigTests(unittest.TestCase):
     def test_loader_rejects_non_integer_numeric_fields(self):
         mutations = {
             "input_len": lambda manifest, _: manifest.update(input_len=36.0),
-            "horizons": lambda manifest, _: manifest.update(horizons=[96.0, 192, 336, 720]),
+            "horizons": lambda manifest, _: manifest.update(horizons=[24.0, 36, 48, 60]),
             "smoke_seed": lambda manifest, _: manifest.update(smoke_seed=True),
             "formal_seeds": lambda manifest, _: manifest.update(formal_seeds=[2021.0, 2022, 2023]),
         }
@@ -163,7 +163,7 @@ class GeneralExperimentConfigTests(unittest.TestCase):
 
     def test_loader_rejects_an_unsupported_horizon(self):
         with self.assertRaisesRegex(ValueError, "horizons"):
-            self.write_mutated_manifest(lambda manifest, _: manifest.update(horizons=[96, 48]))
+            self.write_mutated_manifest(lambda manifest, _: manifest.update(horizons=[24, 48]))
 
     def test_loader_rejects_duplicate_run_ids(self):
         with self.assertRaisesRegex(ValueError, "duplicate run ID"):

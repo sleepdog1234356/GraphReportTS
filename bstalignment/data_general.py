@@ -58,7 +58,7 @@ class GeneralForecastGraphDataset(Dataset):
         data_root: str = "bstalignment/data",
         split: str = "train",
         input_len: int = FORMAL_HISTORY,
-        pred_len: int = 96,
+        pred_len: int = 24,
         resample_len: int = 128,
         delay_dim: int = 8,
         delay_lag: int = 1,

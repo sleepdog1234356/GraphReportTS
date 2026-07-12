@@ -567,8 +567,6 @@ class GraphReportTSConfig:
     use_relative_steps: bool = True
     temporal_layers: int = 1
     temporal_heads: int = 4
-    variable_chunk_size: int = 32
-    legacy_general_graph: bool = False
 
 
 class GraphReportTS(nn.Module):

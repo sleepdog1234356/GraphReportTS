@@ -105,7 +105,7 @@ class GeneralBaselineProfileTests(unittest.TestCase):
     def test_all_formal_model_dataset_horizon_profiles_are_source_identified(self):
         self.require_profiles()
         self.assertEqual(tuple(FORMAL_DATASETS), ("ETTm1", "ETTm2", "ETTh1", "ETTh2", "ECL", "Weather"))
-        self.assertEqual(tuple(FORMAL_HORIZONS), (96, 192, 336, 720))
+        self.assertEqual(tuple(FORMAL_HORIZONS), (24, 36, 48, 60))
         count = 0
         for model, expected_source in SOURCES.items():
             for dataset in FORMAL_DATASETS:
@@ -122,15 +122,16 @@ class GeneralBaselineProfileTests(unittest.TestCase):
                         self.assertEqual(profile.features, "M")
                         self.assertIsNone(profile.label_len)
                         self.assertIn("seq_len", profile.protocol_overrides)
+                        self.assertEqual(profile.protocol_overrides["source_horizon_profile"], 96)
                         self.assertTrue(profile.source_evidence)
                         count += 1
         self.assertEqual(count, 144)
 
     def test_patchtst_profiles_preserve_dataset_specific_source_schedulers(self):
         self.require_profiles()
-        etth = resolve_general_profile("PatchTST", "ETTh1", 96)
-        ettm = resolve_general_profile("PatchTST", "ETTm1", 96)
-        ecl = resolve_general_profile("PatchTST", "ECL", 96)
+        etth = resolve_general_profile("PatchTST", "ETTh1", 24)
+        ettm = resolve_general_profile("PatchTST", "ETTm1", 24)
+        ecl = resolve_general_profile("PatchTST", "ECL", 24)
 
         self.assertEqual((etth.training.scheduler, etth.training.max_epochs, etth.training.early_stop_patience), ("type3", 100, 100))
         self.assertEqual((ettm.training.scheduler, ettm.training.scheduler_step, ettm.training.pct_start), ("one_cycle", "batch", 0.4))
@@ -141,9 +142,9 @@ class GeneralBaselineProfileTests(unittest.TestCase):
 
     def test_itransformer_profiles_preserve_horizon_and_dataset_architecture(self):
         self.require_profiles()
-        self.assertEqual(resolve_general_profile("iTransformer", "ETTh1", 192).architecture["d_model"], 256)
-        self.assertEqual(resolve_general_profile("iTransformer", "ETTh1", 336).architecture["d_model"], 512)
-        ecl = resolve_general_profile("iTransformer", "ECL", 720)
+        self.assertEqual(resolve_general_profile("iTransformer", "ETTh1", 36).architecture["d_model"], 256)
+        self.assertEqual(resolve_general_profile("iTransformer", "ETTh1", 48).architecture["d_model"], 256)
+        ecl = resolve_general_profile("iTransformer", "ECL", 60)
         self.assertEqual((ecl.architecture["e_layers"], ecl.training.lr, ecl.training.batch_size), (3, 5e-4, 16))
 
     def test_itransformer_and_timesnet_preserve_pinned_hourly_timef_default_for_all_datasets(self):
@@ -161,53 +162,53 @@ class GeneralBaselineProfileTests(unittest.TestCase):
         for model in expected_evidence:
             for dataset in FORMAL_DATASETS:
                 with self.subTest(model=model, dataset=dataset):
-                    profile = resolve_general_profile(model, dataset, 96)
+                    profile = resolve_general_profile(model, dataset, 24)
                     self.assertEqual(profile.architecture["freq"], "h")
                     self.assertNotIn("freq", profile.protocol_overrides)
                     self.assertIn(expected_evidence[model], profile.source_evidence)
 
     def test_timesnet_profiles_preserve_source_epoch_exceptions(self):
         self.require_profiles()
-        self.assertEqual(resolve_general_profile("TimesNet", "ETTm1", 336).training.max_epochs, 3)
-        self.assertEqual(resolve_general_profile("TimesNet", "ETTm2", 192).training.max_epochs, 1)
-        self.assertEqual(resolve_general_profile("TimesNet", "Weather", 720).training.max_epochs, 1)
-        self.assertEqual(resolve_general_profile("TimesNet", "ETTm1", 96).architecture["d_model"], 64)
+        self.assertEqual(resolve_general_profile("TimesNet", "ETTm1", 48).training.max_epochs, 10)
+        self.assertEqual(resolve_general_profile("TimesNet", "ETTm2", 36).training.max_epochs, 10)
+        self.assertEqual(resolve_general_profile("TimesNet", "Weather", 60).training.max_epochs, 10)
+        self.assertEqual(resolve_general_profile("TimesNet", "ETTm1", 24).architecture["d_model"], 64)
 
     def test_dlinear_profiles_preserve_source_learning_rates(self):
         self.require_profiles()
-        self.assertEqual(resolve_general_profile("DLinear", "ETTh2", 96).training.lr, 0.05)
-        self.assertEqual(resolve_general_profile("DLinear", "ETTm2", 192).training.lr, 0.001)
-        self.assertEqual(resolve_general_profile("DLinear", "ETTm2", 336).training.lr, 0.01)
-        self.assertFalse(resolve_general_profile("DLinear", "ECL", 720).architecture["individual"])
+        self.assertEqual(resolve_general_profile("DLinear", "ETTh2", 24).training.lr, 0.05)
+        self.assertEqual(resolve_general_profile("DLinear", "ETTm2", 36).training.lr, 0.001)
+        self.assertEqual(resolve_general_profile("DLinear", "ETTm2", 48).training.lr, 0.001)
+        self.assertFalse(resolve_general_profile("DLinear", "ECL", 60).architecture["individual"])
 
     def test_timecma_profiles_preserve_script_epoch_budgets_and_delayed_stopping(self):
         self.require_profiles()
-        ett = resolve_general_profile("TimeCMA", "ETTm1", 96)
-        weather96 = resolve_general_profile("TimeCMA", "Weather", 96)
-        weather192 = resolve_general_profile("TimeCMA", "Weather", 192)
+        ett = resolve_general_profile("TimeCMA", "ETTm1", 24)
+        weather24 = resolve_general_profile("TimeCMA", "Weather", 24)
+        weather36 = resolve_general_profile("TimeCMA", "Weather", 36)
 
         self.assertEqual((ett.training.max_epochs, ett.training.early_stop_start_epoch), (999, 499))
-        self.assertEqual((weather96.training.max_epochs, weather96.training.early_stop_start_epoch), (20, 10))
-        self.assertEqual((weather192.training.max_epochs, weather192.training.early_stop_start_epoch), (100, 50))
+        self.assertEqual((weather24.training.max_epochs, weather24.training.early_stop_start_epoch), (20, 10))
+        self.assertEqual((weather36.training.max_epochs, weather36.training.early_stop_start_epoch), (20, 10))
         self.assertEqual((ett.training.optimizer, ett.training.weight_decay, ett.training.gradient_clip), ("adamw", 1e-3, 5.0))
 
     def test_time_llm_profiles_preserve_horizon_scheduler_exceptions(self):
         self.require_profiles()
-        ettm = resolve_general_profile("Time-LLM", "ETTm1", 96)
-        etth_cos = resolve_general_profile("Time-LLM", "ETTh1", 336)
-        etth2 = resolve_general_profile("Time-LLM", "ETTh2", 720)
-        weather = resolve_general_profile("Time-LLM", "Weather", 720)
+        ettm = resolve_general_profile("Time-LLM", "ETTm1", 24)
+        etth_cos = resolve_general_profile("Time-LLM", "ETTh1", 48)
+        etth2 = resolve_general_profile("Time-LLM", "ETTh2", 60)
+        weather = resolve_general_profile("Time-LLM", "Weather", 60)
 
         self.assertEqual((ettm.training.lr, ettm.training.scheduler, ettm.training.pct_start), (0.001, "one_cycle", 0.2))
-        self.assertEqual((etth_cos.training.scheduler, etth_cos.training.cosine_t_max, etth_cos.training.eta_min), ("cosine", 20, 1e-8))
-        self.assertEqual((etth2.training.max_epochs, etth2.architecture["d_model"]), (20, 16))
-        self.assertEqual((weather.training.max_epochs, weather.architecture["d_ff"]), (15, 128))
+        self.assertEqual((etth_cos.training.scheduler, etth_cos.training.cosine_t_max, etth_cos.training.eta_min), ("type1", None, 0.0))
+        self.assertEqual((etth2.training.max_epochs, etth2.architecture["d_model"]), (10, 32))
+        self.assertEqual((weather.training.max_epochs, weather.architecture["d_ff"]), (10, 32))
         self.assertEqual(ettm.architecture["llm_model_id"], "huggyllama/llama-7b")
         self.assertEqual(ettm.precision, "bf16")
 
     def test_profile_resolver_rejects_nonformal_inputs(self):
         self.require_profiles()
-        for args in (("GraphReportTS", "ETTm1", 96), ("DLinear", "Traffic", 96), ("DLinear", "ETTm1", 48)):
+        for args in (("GraphReportTS", "ETTm1", 24), ("DLinear", "Traffic", 24), ("DLinear", "ETTm1", 61)):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 resolve_general_profile(*args)
 
@@ -391,7 +392,7 @@ class GeneralBaselineAdapterTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             _fake_source_tree(root)
-            args = SimpleNamespace(external_root=root, pred_len=96, verify_source_commit=False)
+            args = SimpleNamespace(external_root=root, pred_len=24, verify_source_commit=False)
             first = build_general_baseline("PatchTST", {"name": "ETTm1", "num_features": 2}, args)
             second = build_general_baseline("DLinear", {"name": "ETTm1", "num_features": 2}, args)
         self.assertEqual(first.model.marker, "patchtst")
@@ -402,7 +403,7 @@ class GeneralBaselineAdapterTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             _fake_source_tree(root)
-            args = SimpleNamespace(external_root=root, pred_len=96, verify_source_commit=False)
+            args = SimpleNamespace(external_root=root, pred_len=24, verify_source_commit=False)
             adapter = build_general_baseline("Time-LLM", {"name": "Weather", "num_features": 2}, args)
         self.assertTrue(all(not parameter.requires_grad for parameter in adapter.model.llm_model.parameters()))
         self.assertTrue(adapter.model.head.requires_grad)
@@ -438,7 +439,7 @@ class GeneralBaselineAdapterTests(unittest.TestCase):
                     {"name": "Weather", "num_features": 2},
                     SimpleNamespace(
                         external_root=root,
-                        pred_len=96,
+                        pred_len=24,
                         verify_source_commit=False,
                         local_llm_path=model_path,
                         local_tokenizer_path=tokenizer_path,
@@ -491,7 +492,7 @@ class GeneralBaselineAdapterTests(unittest.TestCase):
             subprocess.run(["git", "add", "tracked.py"], cwd=repo, check=True)
             subprocess.run(["git", "commit", "-q", "-m", "fixture"], cwd=repo, check=True)
             full_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
-            source = replace(resolve_general_profile("DLinear", "ETTm1", 96).source, commit=full_sha[:7])
+            source = replace(resolve_general_profile("DLinear", "ETTm1", 24).source, commit=full_sha[:7])
 
             provenance = validate_source_checkout(root, source)
             self.assertEqual(provenance.full_sha, full_sha)
@@ -513,7 +514,7 @@ class GeneralBaselineAdapterTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             _fake_source_tree(root)
-            args = SimpleNamespace(external_root=root, pred_len=96, verify_source_commit=True)
+            args = SimpleNamespace(external_root=root, pred_len=24, verify_source_commit=True)
             with self.assertRaisesRegex((RuntimeError, FileNotFoundError), "commit|checkout|git"):
                 build_general_baseline("DLinear", {"name": "ETTm1", "num_features": 2}, args)
 
@@ -525,7 +526,7 @@ class GeneralBaselineAdapterTests(unittest.TestCase):
             self.skipTest("real official repositories unavailable locally")
         for model in SOURCES:
             with self.subTest(model=model):
-                profile = resolve_general_profile(model, "ETTm1", 96)
+                profile = resolve_general_profile(model, "ETTm1", 24)
                 provenance = validate_source_checkout(root, profile.source)
                 self.assertTrue(provenance.full_sha.startswith(profile.source.commit))
                 self.assertFalse(provenance.tracked_dirty)
@@ -655,7 +656,7 @@ class GeneralPromptContractTests(unittest.TestCase):
             dim=1,
         ).unsqueeze(0)
         description = "A factual dataset."
-        prompts = build_time_llm_prompts(history, description, 192)
+        prompts = build_time_llm_prompts(history, description, 36)
         means = history.mean(dim=1, keepdim=True).detach()
         stdev = torch.sqrt(torch.var(history, dim=1, keepdim=True, unbiased=False) + 1e-5).detach()
         normalized = (history - means) / stdev
@@ -666,7 +667,7 @@ class GeneralPromptContractTests(unittest.TestCase):
             values = flattened[variable, :, 0]
             expected = (
                 f"<|start_prompt|>Dataset description: {description}"
-                "Task description: forecast the next 192 steps given the previous 36 steps information; "
+                "Task description: forecast the next 36 steps given the previous 36 steps information; "
                 "Input statistics: "
                 f"min value {str(torch.min(values).item())}, "
                 f"max value {str(torch.max(values).item())}, "
@@ -691,7 +692,7 @@ class GeneralTrainingContractTests(unittest.TestCase):
     def test_optimizer_and_scheduler_follow_resolved_profile(self):
         self.require_training_contracts()
         model = torch.nn.Linear(2, 2)
-        timecma = resolve_general_profile("TimeCMA", "Weather", 96)
+        timecma = resolve_general_profile("TimeCMA", "Weather", 24)
         optimizer = build_general_optimizer(model, timecma)
         scheduler = build_general_scheduler(optimizer, timecma, steps_per_epoch=2)
         self.assertIsInstance(optimizer, torch.optim.AdamW)
@@ -700,7 +701,7 @@ class GeneralTrainingContractTests(unittest.TestCase):
         self.assertIsInstance(scheduler, torch.optim.lr_scheduler.CosineAnnealingLR)
         self.assertEqual(scheduler.T_max, 20)
 
-        patch = resolve_general_profile("PatchTST", "ETTm1", 96)
+        patch = resolve_general_profile("PatchTST", "ETTm1", 24)
         patch_optimizer = build_general_optimizer(model, patch)
         patch_scheduler = build_general_scheduler(patch_optimizer, patch, steps_per_epoch=2)
         self.assertIsInstance(patch_scheduler, torch.optim.lr_scheduler.OneCycleLR)
@@ -731,30 +732,30 @@ class GeneralTrainingContractTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             _fake_source_tree(root)
-            args = SimpleNamespace(external_root=root, pred_len=96, verify_source_commit=False)
+            args = SimpleNamespace(external_root=root, pred_len=24, verify_source_commit=False)
             for dataset, cadence in cadence_minutes.items():
                 history = tuple(
                     datetime(2020, 1, 1) + timedelta(minutes=cadence * index) for index in range(36)
                 )
                 target = tuple(
-                    datetime(2020, 1, 1) + timedelta(minutes=cadence * (36 + index)) for index in range(96)
+                    datetime(2020, 1, 1) + timedelta(minutes=cadence * (36 + index)) for index in range(24)
                 )
                 sample = {
                     "series_id": dataset,
                     "history_scaled": torch.randn(36, 2),
-                    "target_scaled": torch.randn(96, 2),
+                    "target_scaled": torch.randn(24, 2),
                     "timestamp_markers": {"history": history, "target": target},
                     "start_index": 0,
                     "columns": ("a", "b"),
                 }
                 batch = collate_general_baseline_batch([sample])
                 self.assertEqual(tuple(batch["x_mark"].shape), (1, 36, 4))
-                self.assertEqual(tuple(batch["y_mark"].shape), (1, 96, 4))
+                self.assertEqual(tuple(batch["y_mark"].shape), (1, 24, 4))
                 for model in ("iTransformer", "TimesNet"):
                     with self.subTest(model=model, dataset=dataset):
                         adapter = build_general_baseline(model, {"name": dataset, "num_features": 2}, args)
                         output = forward_general_baseline_batch(adapter, batch)
-                        self.assertEqual(tuple(output.shape), (1, 96, 2))
+                        self.assertEqual(tuple(output.shape), (1, 24, 2))
                         self.assertEqual(adapter.model.configs.freq, "h")
                         torch.testing.assert_close(adapter.model.last_encoder_mark, batch["x_mark"])
                         torch.testing.assert_close(adapter.model.last_decoder_mark, batch["y_mark"])
@@ -763,27 +764,27 @@ class GeneralTrainingContractTests(unittest.TestCase):
         self.assertIsNotNone(collate_general_baseline_batch, "baseline timestamp collator must exist")
         self.assertIsNotNone(forward_general_baseline_batch, "baseline batch forward helper must exist")
         history_timestamps = tuple(datetime(2020, 1, 1) + timedelta(minutes=15 * index) for index in range(36))
-        target_timestamps = tuple(datetime(2020, 1, 1, 9) + timedelta(minutes=15 * index) for index in range(96))
+        target_timestamps = tuple(datetime(2020, 1, 1, 9) + timedelta(minutes=15 * index) for index in range(24))
         sample = {
             "series_id": "ETTm1",
             "history_scaled": torch.randn(36, 2),
-            "target_scaled": torch.randn(96, 2),
+            "target_scaled": torch.randn(24, 2),
             "timestamp_markers": {"history": history_timestamps, "target": target_timestamps},
             "start_index": 100,
             "columns": ("a", "b"),
         }
         batch = collate_general_baseline_batch([sample])
         self.assertEqual(tuple(batch["x_mark"].shape), (1, 36, 4))
-        self.assertEqual(tuple(batch["y_mark"].shape), (1, 96, 4))
+        self.assertEqual(tuple(batch["y_mark"].shape), (1, 24, 4))
         with TemporaryDirectory() as directory:
             root = Path(directory)
             _fake_source_tree(root)
-            args = SimpleNamespace(external_root=root, pred_len=96, verify_source_commit=False)
+            args = SimpleNamespace(external_root=root, pred_len=24, verify_source_commit=False)
             for name in ("iTransformer", "TimesNet"):
                 with self.subTest(name=name):
                     adapter = build_general_baseline(name, {"name": "ETTm1", "num_features": 2}, args)
                     output = forward_general_baseline_batch(adapter, batch)
-                    self.assertEqual(tuple(output.shape), (1, 96, 2))
+                    self.assertEqual(tuple(output.shape), (1, 24, 2))
                     torch.testing.assert_close(adapter.model.last_encoder_mark, batch["x_mark"])
                     torch.testing.assert_close(adapter.model.last_decoder_mark, batch["y_mark"])
 
@@ -797,10 +798,10 @@ class GeneralTrainingContractTests(unittest.TestCase):
                 calls.append((dataset_name, data_root, split, input_len, pred_len, scaler, fit_scaler, self.scaler))
 
         with patch("bstalignment.data_general.GeneralForecastGraphDataset", FakeDataset):
-            train, val, test = build_shared_general_datasets("ECL", "data-root", 192)
+            train, val, test = build_shared_general_datasets("ECL", "data-root", 36)
         self.assertEqual([call[2] for call in calls], ["train", "val", "test"])
         self.assertEqual([call[3] for call in calls], [36, 36, 36])
-        self.assertEqual([call[4] for call in calls], [192, 192, 192])
+        self.assertEqual([call[4] for call in calls], [36, 36, 36])
         self.assertTrue(calls[0][6])
         self.assertFalse(calls[1][6])
         self.assertFalse(calls[2][6])
@@ -818,12 +819,12 @@ class GeneralTrainingContractTests(unittest.TestCase):
     def test_source_epoch_schedulers_apply_type1_and_type3_formulas(self):
         self.require_training_contracts()
         model = torch.nn.Linear(2, 2)
-        type1 = resolve_general_profile("DLinear", "ETTh1", 96)
+        type1 = resolve_general_profile("DLinear", "ETTh1", 24)
         optimizer = build_general_optimizer(model, type1)
         step_general_epoch_scheduler(None, optimizer, type1, epoch=3)
         self.assertEqual(optimizer.param_groups[0]["lr"], type1.training.lr * 0.5 ** 2)
 
-        type3 = resolve_general_profile("PatchTST", "ETTh1", 96)
+        type3 = resolve_general_profile("PatchTST", "ETTh1", 24)
         optimizer = build_general_optimizer(model, type3)
         step_general_epoch_scheduler(None, optimizer, type3, epoch=4)
         self.assertAlmostEqual(optimizer.param_groups[0]["lr"], type3.training.lr * 0.9)
@@ -835,13 +836,13 @@ class GeneralTrainingContractTests(unittest.TestCase):
             def step(self):
                 self.calls += 1
         counter = Counter()
-        step_general_batch_scheduler(counter, resolve_general_profile("PatchTST", "ETTm1", 96))
-        step_general_batch_scheduler(counter, resolve_general_profile("DLinear", "ETTm1", 96))
+        step_general_batch_scheduler(counter, resolve_general_profile("PatchTST", "ETTm1", 24))
+        step_general_batch_scheduler(counter, resolve_general_profile("DLinear", "ETTm1", 24))
         self.assertEqual(counter.calls, 1)
 
     def test_checkpoint_decisions_accumulate_stale_before_delayed_stop_gate(self):
         self.require_training_contracts()
-        profile = resolve_general_profile("TimeCMA", "Weather", 96)
+        profile = resolve_general_profile("TimeCMA", "Weather", 24)
         best_mse, stale = 0.5, 0
         for epoch in range(1, 50):
             decision = validation_checkpoint_decision(
@@ -863,7 +864,7 @@ class GeneralTrainingContractTests(unittest.TestCase):
     def test_optimizer_step_applies_gradient_clip_then_optimizer_then_batch_scheduler(self):
         self.assertIsNotNone(clip_general_gradients, "general gradient clipping helper must exist")
         self.assertIsNotNone(step_general_optimizer, "general optimizer step helper must exist")
-        base = resolve_general_profile("PatchTST", "ETTm1", 96)
+        base = resolve_general_profile("PatchTST", "ETTm1", 24)
         profile = replace(base, training=replace(base.training, gradient_clip=0.5))
         model = torch.nn.Linear(2, 1, bias=False)
         model(torch.tensor([[100.0, -100.0]])).sum().backward()
@@ -896,7 +897,7 @@ class GeneralTrainingContractTests(unittest.TestCase):
         target = torch.tensor([[[0.0, 1.0], [2.0, 1.0]]])
         metrics = general_metrics(pred, target)
         self.assertEqual(metrics, {"mse": 5.25, "mae": 1.75})
-        profile = resolve_general_profile("DLinear", "ETTm1", 96)
+        profile = resolve_general_profile("DLinear", "ETTm1", 24)
         record = general_result_record(
             profile=profile,
             seed=2021,
@@ -917,7 +918,7 @@ class GeneralTrainingContractTests(unittest.TestCase):
         )
         self.assertEqual(record["model"], "DLinear")
         self.assertEqual(record["dataset"], "ETTm1")
-        self.assertEqual(record["horizon"], 96)
+        self.assertEqual(record["horizon"], 24)
         self.assertEqual(record["metrics_space"], "standardized")
         self.assertEqual(record["source"]["commit"], "0c11366")
         self.assertEqual(record["training"]["optimizer"], "adam")
@@ -926,7 +927,7 @@ class GeneralTrainingContractTests(unittest.TestCase):
 
     def test_time_llm_result_requires_actual_runtime_paths_revisions_and_precision(self):
         self.require_training_contracts()
-        profile = resolve_general_profile("Time-LLM", "ETTm1", 96)
+        profile = resolve_general_profile("Time-LLM", "ETTm1", 24)
         base_kwargs = dict(
             profile=profile,
             seed=2021,

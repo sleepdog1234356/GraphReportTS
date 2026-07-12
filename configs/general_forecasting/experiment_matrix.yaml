@@ -3,7 +3,7 @@
   "features": "M",
   "datasets": ["ETTm1", "ETTm2", "ETTh1", "ETTh2", "ECL", "Weather"],
   "models": ["GraphReportTS", "PatchTST", "iTransformer", "TimeCMA", "TimesNet", "DLinear", "Time-LLM"],
-  "horizons": [96, 192, 336, 720],
+  "horizons": [24, 36, 48, 60],
   "smoke_seed": 42,
   "formal_seeds": [2021, 2022, 2023],
   "paths": {

@@ -29,7 +29,7 @@ REQUIRED_ARTIFACTS = (
     "environment.json",
 )
 FORMAL_DATASETS = ("ETTm1", "ETTm2", "ETTh1", "ETTh2", "ECL", "Weather")
-FORMAL_HORIZONS = (96, 192, 336, 720)
+FORMAL_HORIZONS = (24, 36, 48, 60)
 
 
 @dataclass(frozen=True)

@@ -249,7 +249,7 @@ python -m bstalignment.train_graph_report \
   --dataset ETTm1 \
   --data_root bstalignment/data \
   --input_len 96 \
-  --pred_len 96
+  --pred_len 24
 ```
 
 ## Baselines

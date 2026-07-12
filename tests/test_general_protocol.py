@@ -48,7 +48,7 @@ class GeneralProtocolTests(unittest.TestCase):
     def test_validation_and_test_targets_start_at_their_boundaries_and_end_inside_them(self):
         self.assertIsNotNone(GeneralForecastProtocol, "general protocol module must define GeneralForecastProtocol")
         protocol = GeneralForecastProtocol("ECL", n_rows=10_000, input_len=36)
-        for pred_len in (96, 192, 336, 720):
+        for pred_len in (24, 36, 48, 60):
             for split in ("val", "test"):
                 starts = protocol.window_index(split, pred_len=pred_len)
                 target_start = starts + 36
@@ -67,12 +67,12 @@ class GeneralProtocolTests(unittest.TestCase):
     def test_training_targets_never_cross_the_validation_boundary(self):
         self.assertIsNotNone(GeneralForecastProtocol, "general protocol module must define GeneralForecastProtocol")
         protocol = GeneralForecastProtocol("ECL", n_rows=2_000, input_len=36)
-        starts = protocol.window_index("train", pred_len=96)
+        starts = protocol.window_index("train", pred_len=24)
         train_end = protocol.bounds["train"][1]
         values = np.zeros((2_000, 1), dtype=np.float32)
         values[train_end, 0] = 999_999.0
-        training_targets = np.concatenate([values[start + 36 : start + 36 + 96, 0] for start in starts])
-        self.assertLessEqual((starts[-1] + 36 + 96), train_end)
+        training_targets = np.concatenate([values[start + 36 : start + 36 + 24, 0] for start in starts])
+        self.assertLessEqual((starts[-1] + 36 + 24), train_end)
         self.assertNotIn(999_999.0, training_targets)
 
     def test_dataset_shares_history_but_keeps_validation_target_at_boundary(self):
@@ -92,12 +92,12 @@ class GeneralProtocolTests(unittest.TestCase):
                 }
             )
             frame.to_csv(data_dir / "ECL.csv", index=False)
-            dataset = GeneralForecastGraphDataset("ECL", data_root=str(root), split="val", pred_len=96, fit_scaler=True)
+            dataset = GeneralForecastGraphDataset("ECL", data_root=str(root), split="val", pred_len=24, fit_scaler=True)
             sample = dataset[0]
         self.assertEqual(dataset.input_len, 36)
         self.assertEqual(sample["start_index"], 700 - 36)
         self.assertEqual(sample["target_steps"][0].item(), 700)
-        self.assertEqual(sample["target_steps"][-1].item(), 795)
+        self.assertEqual(sample["target_steps"][-1].item(), 723)
         np.testing.assert_allclose(sample["history_raw"].numpy()[0], [664.0, 1_328.0])
         self.assertEqual(sample["columns"], ("load", "temperature"))
         self.assertEqual(sample["scaler_metadata"]["train_end"], 700)
@@ -105,7 +105,7 @@ class GeneralProtocolTests(unittest.TestCase):
     def test_general_trainer_defaults_to_the_formal_history_length(self):
         from bstalignment.train_graph_report import parse_args
 
-        with patch("sys.argv", ["train_graph_report", "--variant", "general", "--pred_len", "96"]):
+        with patch("sys.argv", ["train_graph_report", "--variant", "general", "--pred_len", "24"]):
             args = parse_args()
         self.assertEqual(args.input_len, 36)
 
@@ -124,7 +124,7 @@ class GeneralProtocolTests(unittest.TestCase):
         stderr = io.StringIO()
         with patch(
             "sys.argv",
-            ["train_graph_report", "--variant", "general", "--input_len", "35", "--pred_len", "96"],
+            ["train_graph_report", "--variant", "general", "--input_len", "35", "--pred_len", "24"],
         ), patch("sys.stderr", stderr):
             with self.assertRaises(SystemExit):
                 parse_args()
@@ -142,7 +142,7 @@ class GeneralProtocolTests(unittest.TestCase):
         protocol = GeneralForecastProtocol("ECL", n_rows=10_000, input_len=36)
 
         with self.assertRaisesRegex(ValueError, "unsupported formal prediction length"):
-            protocol.window_index("train", pred_len=95)
+            protocol.window_index("train", pred_len=23)
 
     def test_timestamp_column_is_preserved_as_timestamp_metadata(self):
         from bstalignment.data_general import GeneralForecastGraphDataset
@@ -159,7 +159,7 @@ class GeneralProtocolTests(unittest.TestCase):
                     "temperature": np.arange(1_000, dtype=float) * 2,
                 }
             ).to_csv(data_dir / "ECL.csv", index=False)
-            sample = GeneralForecastGraphDataset("ECL", data_root=str(root), split="val", pred_len=96)[0]
+            sample = GeneralForecastGraphDataset("ECL", data_root=str(root), split="val", pred_len=24)[0]
         self.assertEqual(sample["timestamp_markers"]["history"][0], timestamps[664].to_datetime64())
 
 

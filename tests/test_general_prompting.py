@@ -32,7 +32,7 @@ class GeneralPromptingTests(unittest.TestCase):
         history = np.tile(np.arange(7, dtype=np.float32), (36, 1))
         columns = tuple(f"x{index}" for index in range(7))
 
-        prompt = build_general_prompt(history, columns, "15 minutes", 96)
+        prompt = build_general_prompt(history, columns, "15 minutes", 24)
 
         self.assertEqual(
             prompt,
@@ -47,7 +47,7 @@ class GeneralPromptingTests(unittest.TestCase):
             "x4(last=4.0000, trend=0.0000, volatility=0.0000); "
             "x5(last=5.0000, trend=0.0000, volatility=0.0000); "
             "x6(last=6.0000, trend=0.0000, volatility=0.0000).\n"
-            "Instruction: predict all 7 variables for the next 96 steps.\n"
+            "Instruction: predict all 7 variables for the next 24 steps.\n"
             "Use only the observed window.",
         )
 
@@ -56,12 +56,12 @@ class GeneralPromptingTests(unittest.TestCase):
         history = np.arange(36, dtype=np.float32)[:, None] * np.arange(21, dtype=np.float32)[None, :]
         columns = tuple(f"weather_{index}" for index in range(21))
 
-        prompt = build_general_prompt(history, columns, "10 minutes", 192)
+        prompt = build_general_prompt(history, columns, "10 minutes", 36)
         names = re.findall(r"([\w-]+)\(last=", prompt)
 
         self.assertEqual(names, [*columns[:6], *columns[-6:]])
         self.assertIn("21 variables are observed.", prompt)
-        self.assertIn("next 192 steps", prompt)
+        self.assertIn("next 36 steps", prompt)
 
     def test_high_dimensional_selection_uses_absolute_trend_then_canonical_index(self):
         self.require_prompting()
@@ -69,19 +69,19 @@ class GeneralPromptingTests(unittest.TestCase):
         trends = np.arange(321, dtype=np.float32)
         history = np.arange(36, dtype=np.float32)[:, None] * trends[None, :]
 
-        prompt = build_general_prompt(history, columns, "1 hour", 720)
+        prompt = build_general_prompt(history, columns, "1 hour", 60)
         names = re.findall(r"([\w-]+)\(last=", prompt)
 
         self.assertEqual(names, [*(f"load_{index}" for index in range(6)), *(f"load_{index}" for index in range(315, 321))])
         self.assertEqual(len(names), 12)
         self.assertIn("321 variables are observed.", prompt)
-        self.assertIn("next 720 steps", prompt)
+        self.assertIn("next 60 steps", prompt)
 
     def test_all_tied_high_dimensional_trends_select_twelve_distinct_canonical_variables(self):
         self.require_prompting()
         columns = tuple(f"tie_{index}" for index in range(21))
 
-        prompt = build_general_prompt(np.zeros((36, 21), dtype=np.float32), columns, "1 hour", 96)
+        prompt = build_general_prompt(np.zeros((36, 21), dtype=np.float32), columns, "1 hour", 24)
         names = re.findall(r"([\w-]+)\(last=", prompt)
 
         self.assertEqual(names, list(columns[:12]))
@@ -91,7 +91,7 @@ class GeneralPromptingTests(unittest.TestCase):
         self.require_prompting()
         history = np.zeros((36, 7), dtype=np.float32)
 
-        result = build_general_prompt_result(history, tuple(f"x{index}" for index in range(7)), "1 hour", 336)
+        result = build_general_prompt_result(history, tuple(f"x{index}" for index in range(7)), "1 hour", 48)
 
         self.assertIn("pretoken_word_count", result.metadata)
         self.assertIn("pretoken_word_budget", result.metadata)
@@ -107,7 +107,7 @@ class GeneralPromptingTests(unittest.TestCase):
         self.require_prompting()
         columns = tuple(f"signal_{index} {'word ' * 200}".strip() for index in range(7))
 
-        result = build_general_prompt_result(np.zeros((36, 7), dtype=np.float32), columns, "1 hour", 96)
+        result = build_general_prompt_result(np.zeros((36, 7), dtype=np.float32), columns, "1 hour", 24)
 
         self.assertIn("pretoken_word_count", result.metadata)
         self.assertIn("pretoken_word_truncated", result.metadata)
@@ -121,7 +121,7 @@ class GeneralPromptingTests(unittest.TestCase):
         columns = tuple(f"x{index}" for index in range(7))
 
         with self.assertRaisesRegex(ValueError, "36"):
-            build_general_prompt(history, columns, "1 hour", 96)
+            build_general_prompt(history, columns, "1 hour", 24)
         with self.assertRaisesRegex(ValueError, "formal"):
             build_general_prompt(np.zeros((36, 7), dtype=np.float32), columns, "1 hour", 95)
 
@@ -131,7 +131,7 @@ class GeneralPromptingTests(unittest.TestCase):
             np.zeros((36, 7), dtype=np.float32),
             tuple(f"signal_{index}" for index in range(7)),
             "1 hour",
-            96,
+            24,
         ).lower()
 
         for prohibited in ("soh", "capacity", "cycle", "chemistry", "degradation", "future", "train", "validation", "test"):
@@ -143,14 +143,14 @@ class GeneralPromptDatasetIntegrationTests(unittest.TestCase):
         from bstalignment.data_general import collate_general_graph_batch
 
         sample = {
-            "maps": torch.zeros(1, 3, 4, 8),
-            "y": torch.zeros(96, 1),
-            "mask": torch.ones(96, 1, dtype=torch.bool),
-            "horizon": torch.tensor(96),
+            "maps": torch.zeros(3, 4, 8),
+            "y": torch.zeros(24, 1),
+            "mask": torch.ones(24, 1, dtype=torch.bool),
+            "horizon": torch.tensor(24),
             "prompt": "legacy general prompt",
             "series_id": "synthetic",
             "start_index": 0,
-            "target_steps": torch.arange(36, 132),
+            "target_steps": torch.arange(36, 60),
         }
 
         try:
@@ -177,11 +177,11 @@ class GeneralPromptDatasetIntegrationTests(unittest.TestCase):
             )
             path = data_dir / "ECL.csv"
             frame.to_csv(path, index=False)
-            original = GeneralForecastGraphDataset("ECL", data_root=str(root), split="val", pred_len=96, fit_scaler=True)[0]
+            original = GeneralForecastGraphDataset("ECL", data_root=str(root), split="val", pred_len=24, fit_scaler=True)[0]
 
             frame.loc[700:, ["load", "temperature"]] += 1_000_000
             frame.to_csv(path, index=False)
-            changed_future = GeneralForecastGraphDataset("ECL", data_root=str(root), split="val", pred_len=96, fit_scaler=True)[0]
+            changed_future = GeneralForecastGraphDataset("ECL", data_root=str(root), split="val", pred_len=24, fit_scaler=True)[0]
 
         self.assertEqual(original["prompt"], changed_future["prompt"])
         self.assertIn("prompt_metadata", original)
@@ -248,9 +248,10 @@ class EncoderPromptAuditTests(unittest.TestCase):
         ).eval()
 
         general_output = general(
-            torch.zeros(1, 2, 3, 4, 8),
+            torch.zeros(1, 18, 4, 8),
             ["token " * 193],
-            torch.tensor([2]),
+            torch.tensor([24]),
+            history_features=torch.zeros(1, 36, 2),
             variable_mask=torch.ones(1, 2, dtype=torch.bool),
         )
         battery_output = battery(torch.zeros(1, 3, 4, 8), ["token " * 193], torch.tensor([2]))

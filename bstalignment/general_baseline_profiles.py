@@ -8,7 +8,9 @@ from typing import Any, Mapping
 
 
 FORMAL_DATASETS = ("ETTm1", "ETTm2", "ETTh1", "ETTh2", "ECL", "Weather")
-FORMAL_HORIZONS = (96, 192, 336, 720)
+FORMAL_HORIZONS = (24, 36, 48, 60)
+SOURCE_HORIZONS = (96, 192, 336, 720)
+SHORT_HORIZON_SOURCE_PROFILE = 96
 
 
 @dataclass(frozen=True)
@@ -131,6 +133,12 @@ def _items(**values: Any) -> tuple[tuple[str, Any], ...]:
     return tuple(values.items())
 
 
+def _source_profile_horizon(pred_len: int) -> int:
+    if pred_len not in FORMAL_HORIZONS:
+        raise ValueError(f"unsupported formal prediction length: {pred_len}")
+    return SHORT_HORIZON_SOURCE_PROFILE
+
+
 def _patchtst_architecture(dataset: str) -> tuple[tuple[str, Any], ...]:
     if dataset in {"ETTh1", "ETTh2"}:
         return _items(e_layers=3, n_heads=4, d_model=16, d_ff=128, dropout=0.3,
@@ -171,12 +179,12 @@ def _itransformer_training(dataset: str) -> TrainingMechanics:
 
 
 _TIMESNET_DIMS = {
-    "ETTh1": {horizon: (16, 32) for horizon in FORMAL_HORIZONS},
-    "ETTh2": {horizon: (32, 32) for horizon in FORMAL_HORIZONS},
+    "ETTh1": {horizon: (16, 32) for horizon in SOURCE_HORIZONS},
+    "ETTh2": {horizon: (32, 32) for horizon in SOURCE_HORIZONS},
     "ETTm1": {96: (64, 64), 192: (64, 64), 336: (16, 32), 720: (16, 32)},
     "ETTm2": {96: (32, 32), 192: (32, 32), 336: (32, 32), 720: (16, 32)},
-    "ECL": {horizon: (256, 512) for horizon in FORMAL_HORIZONS},
-    "Weather": {horizon: (32, 32) for horizon in FORMAL_HORIZONS},
+    "ECL": {horizon: (256, 512) for horizon in SOURCE_HORIZONS},
+    "Weather": {horizon: (32, 32) for horizon in SOURCE_HORIZONS},
 }
 _TIMESNET_EPOCHS = {
     ("ETTm1", 336): 3,
@@ -202,12 +210,12 @@ def _timesnet_training(dataset: str, pred_len: int) -> TrainingMechanics:
 
 
 _DLINEAR_LR = {
-    "ETTh1": {horizon: 0.005 for horizon in FORMAL_HORIZONS},
-    "ETTh2": {horizon: 0.05 for horizon in FORMAL_HORIZONS},
-    "ETTm1": {horizon: 0.0001 for horizon in FORMAL_HORIZONS},
+    "ETTh1": {horizon: 0.005 for horizon in SOURCE_HORIZONS},
+    "ETTh2": {horizon: 0.05 for horizon in SOURCE_HORIZONS},
+    "ETTm1": {horizon: 0.0001 for horizon in SOURCE_HORIZONS},
     "ETTm2": {96: 0.001, 192: 0.001, 336: 0.01, 720: 0.01},
-    "ECL": {horizon: 0.001 for horizon in FORMAL_HORIZONS},
-    "Weather": {horizon: 0.0001 for horizon in FORMAL_HORIZONS},
+    "ECL": {horizon: 0.001 for horizon in SOURCE_HORIZONS},
+    "Weather": {horizon: 0.0001 for horizon in SOURCE_HORIZONS},
 }
 _DLINEAR_BATCH = {"ETTh1": 32, "ETTh2": 32, "ETTm1": 8, "ETTm2": 32, "ECL": 16, "Weather": 16}
 
@@ -219,9 +227,9 @@ def _dlinear_training(dataset: str, pred_len: int) -> TrainingMechanics:
 
 _TIMECMA_ARCH = {
     "ETTm1": {96: (64, 2, 2, 0.5), 192: (64, 2, 2, 0.5), 336: (64, 2, 2, 0.5), 720: (64, 2, 2, 0.7)},
-    "ETTm2": {horizon: (64, 2, 2, 0.3) for horizon in FORMAL_HORIZONS},
+    "ETTm2": {horizon: (64, 2, 2, 0.3) for horizon in SOURCE_HORIZONS},
     "ETTh1": {96: (64, 1, 2, 0.7), 192: (64, 1, 2, 0.7), 336: (64, 1, 2, 0.7), 720: (32, 2, 2, 0.8)},
-    "ETTh2": {horizon: (64, 2, 2, 0.3) for horizon in FORMAL_HORIZONS},
+    "ETTh2": {horizon: (64, 2, 2, 0.3) for horizon in SOURCE_HORIZONS},
     "ECL": {96: (128, 3, 6, 0.3), 192: (128, 3, 6, 0.3), 336: (128, 3, 6, 0.1), 720: (128, 3, 6, 0.1)},
     "Weather": {96: (64, 6, 2, 0.1), 192: (32, 1, 2, 0.1), 336: (32, 1, 2, 0.1), 720: (32, 1, 1, 0.1)},
 }
@@ -249,7 +257,7 @@ def _timecma_training(dataset: str, pred_len: int) -> TrainingMechanics:
 
 
 _TIMELLM_SETTINGS = {
-    "ETTm1": {h: (32, 128, 0.001, 100, "one_cycle", 24) for h in FORMAL_HORIZONS},
+    "ETTm1": {h: (32, 128, 0.001, 100, "one_cycle", 24) for h in SOURCE_HORIZONS},
     "ETTm2": {
         96: (32, 128, 0.01, 10, "type1", 16),
         192: (32, 128, 0.002, 10, "one_cycle", 24),
@@ -268,7 +276,7 @@ _TIMELLM_SETTINGS = {
         336: (32, 128, 0.005, 10, "one_cycle", 24),
         720: (16, 128, 0.005, 20, "one_cycle", 24),
     },
-    "ECL": {h: (16, 32, 0.01, 10, "type1", 24) for h in FORMAL_HORIZONS},
+    "ECL": {h: (16, 32, 0.01, 10, "type1", 24) for h in SOURCE_HORIZONS},
     "Weather": {
         96: (32, 32, 0.01, 10, "type1", 24),
         192: (32, 32, 0.01, 10, "type1", 24),
@@ -330,6 +338,7 @@ def resolve_general_profile(name: str, dataset: str, pred_len: int) -> GeneralBa
         raise ValueError(f"unknown formal general dataset: {dataset}")
     if pred_len not in FORMAL_HORIZONS:
         raise ValueError(f"unsupported formal prediction length: {pred_len}")
+    source_pred_len = _source_profile_horizon(pred_len)
 
     if canonical == "PatchTST":
         architecture, training = _patchtst_architecture(dataset), _patchtst_training(dataset)
@@ -337,7 +346,7 @@ def resolve_general_profile(name: str, dataset: str, pred_len: int) -> GeneralBa
                     "PatchTST_supervised/exp/exp_main.py:47-52,112-124,193-212",
                     "PatchTST_supervised/run_longExp.py:78-85")
     elif canonical == "iTransformer":
-        architecture, training = _itransformer_architecture(dataset, pred_len), _itransformer_training(dataset)
+        architecture, training = _itransformer_architecture(dataset, source_pred_len), _itransformer_training(dataset)
         evidence = (
             "scripts/multivariate_forecasting: audited dataset script",
             "run.py:29-30 default freq='h'; formal ETT/ECL/Weather scripts omit --freq; data_provider/data_loader.py:73-75",
@@ -345,7 +354,7 @@ def resolve_general_profile(name: str, dataset: str, pred_len: int) -> GeneralBa
             "run.py:62-68",
         )
     elif canonical == "TimesNet":
-        architecture, training = _timesnet_architecture(dataset, pred_len), _timesnet_training(dataset, pred_len)
+        architecture, training = _timesnet_architecture(dataset, source_pred_len), _timesnet_training(dataset, source_pred_len)
         evidence = (
             "scripts/long_term_forecast: audited TimesNet dataset script",
             "run.py:32-33 default freq='h'; formal ETT/ECL/Weather scripts omit --freq; data_provider/data_loader.py:89-91",
@@ -353,14 +362,14 @@ def resolve_general_profile(name: str, dataset: str, pred_len: int) -> GeneralBa
             "run.py:57,90-96",
         )
     elif canonical == "DLinear":
-        architecture, training = _items(individual=False, moving_avg=25), _dlinear_training(dataset, pred_len)
+        architecture, training = _items(individual=False, moving_avg=25), _dlinear_training(dataset, source_pred_len)
         evidence = (f"scripts/EXP-LongForecasting/Linear/{'electricity' if dataset == 'ECL' else dataset.lower()}.sh",
                     "models/DLinear.py:38-87", "exp/exp_main.py:46-51,112-205", "run_longExp.py:66-72")
     elif canonical == "TimeCMA":
-        architecture, training = _timecma_architecture(dataset, pred_len), _timecma_training(dataset, pred_len)
+        architecture, training = _timecma_architecture(dataset, source_pred_len), _timecma_training(dataset, source_pred_len)
         evidence = (f"scripts/{dataset}.sh: audited horizon block", "models/TimeCMA.py:6-102", "train.py:17-49,69-90,233-299")
     else:
-        architecture, training = _timellm_architecture(dataset, pred_len), _timellm_training(dataset, pred_len)
+        architecture, training = _timellm_architecture(dataset, source_pred_len), _timellm_training(dataset, source_pred_len)
         evidence = (f"scripts/TimeLLM_{'ECL' if dataset == 'ECL' else dataset}.sh: audited horizon block",
                     "models/TimeLLM.py:30-197,200-264", "run_main.py:55-99,145-164,236-264")
 
@@ -373,4 +382,12 @@ def resolve_general_profile(name: str, dataset: str, pred_len: int) -> GeneralBa
         architecture_items=architecture,
         source_evidence=evidence,
         precision="bf16" if canonical == "Time-LLM" else "float32",
+        protocol_override_items=(
+            ("seq_len", 36),
+            ("features", "M"),
+            ("split_scaler", "Task3 shared train-only scaler"),
+            ("checkpoint_selection", "validation_mse"),
+            ("source_horizon_profile", SHORT_HORIZON_SOURCE_PROFILE),
+            ("short_horizon_policy", "inherit_source_h96_settings_change_pred_len_only"),
+        ),
     )

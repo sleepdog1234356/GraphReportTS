@@ -13,7 +13,7 @@ EXPECTED_DATASETS = ("ETTm1", "ETTm2", "ETTh1", "ETTh2", "ECL", "Weather")
 EXPECTED_MODELS = (
     "GraphReportTS", "PatchTST", "iTransformer", "TimeCMA", "TimesNet", "DLinear", "Time-LLM"
 )
-EXPECTED_HORIZONS = (96, 192, 336, 720)
+EXPECTED_HORIZONS = (24, 36, 48, 60)
 FORMAL_SEEDS = (2021, 2022, 2023)
 SMOKE_SEED = 42
 FEATURES = "M"
@@ -229,7 +229,7 @@ def load_general_experiment_spec(path: Path) -> GeneralExperimentSpec:
         raise ValueError("horizons must be a list of integers")
     horizons = tuple(_require_integer(horizon, "horizons") for horizon in raw_horizons)
     if not horizons or any(horizon not in SUPPORTED_HORIZONS for horizon in horizons):
-        raise ValueError("horizons must be selected from 96, 192, 336, and 720")
+        raise ValueError("horizons must be selected from 24, 36, 48, and 60")
     smoke_seed = _require_integer(matrix.get("smoke_seed"), "smoke_seed")
     if smoke_seed != SMOKE_SEED:
         raise ValueError("smoke_seed must be 42")

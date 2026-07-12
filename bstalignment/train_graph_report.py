@@ -77,7 +77,7 @@ def build_general_result_spec(dataset: str, dataset_checksum: str) -> Dict[str, 
         "dataset": dataset,
         "dataset_checksum": dataset_checksum,
         "source_commit": _git_source_commit(),
-        "protocol": {"input_len": 36, "features": "M", "horizons": [96, 192, 336, 720]},
+        "protocol": {"input_len": 36, "features": "M", "horizons": [24, 36, 48, 60]},
     }
 
 
@@ -128,8 +128,6 @@ def parse_args():
     p.add_argument("--patch_size", type=int, default=8)
     p.add_argument("--patch_stride", type=int, default=4)
     p.add_argument("--topk_edges", type=int, default=4)
-    p.add_argument("--variable_chunk_size", type=int, default=32)
-    p.add_argument("--legacy_general_graph", action="store_true", help="Diagnostic only: use the unbounded legacy global graph for general datasets")
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--text_model", type=str, default="distilbert-base-uncased")
     p.add_argument("--no_hf_text", action="store_true")
@@ -176,8 +174,8 @@ def parse_args():
     if args.variant == "general":
         if args.input_len != 36:
             p.error("general forecasting requires --input_len 36")
-        if args.pred_len not in (96, 192, 336, 720):
-            p.error("general forecasting requires --pred_len one of 96, 192, 336, 720")
+        if args.pred_len not in (24, 36, 48, 60):
+            p.error("general forecasting requires --pred_len one of 24, 36, 48, 60")
     if args.batch_size is None:
         args.batch_size = 64 if args.variant == "battery" else 32
     return args
@@ -422,6 +420,7 @@ def main():
     model_cfg = GraphReportTSConfig(
         variant=args.variant,
         output_dim=output_dim,
+        max_steps=60 if args.variant == "general" else 1024,
         d_model=args.d_model,
         patch_size=args.patch_size,
         patch_stride=args.patch_stride,
@@ -446,8 +445,6 @@ def main():
         use_relative_steps=not args.absolute_step_decoder,
         temporal_layers=args.temporal_layers,
         temporal_heads=args.temporal_heads,
-        variable_chunk_size=args.variable_chunk_size,
-        legacy_general_graph=args.legacy_general_graph,
     )
     model = GraphReportTS(model_cfg).to(device)
     with torch.no_grad():
@@ -617,7 +614,7 @@ def main():
             {
                 "dataset_checksum": _general_dataset_checksum(args.dataset, general_data_path),
                 "source_commit": _git_source_commit(),
-                "protocol": {"input_len": 36, "features": "M", "horizons": [96, 192, 336, 720]},
+                "protocol": {"input_len": 36, "features": "M", "horizons": [24, 36, 48, 60]},
                 "source": {"url": "local:GraphReportTS", "commit": _git_source_commit()},
                 "runtime": {
                     "wall_time_seconds": time.monotonic() - started_at,

@@ -22,7 +22,7 @@ class GeneralResultContractTests(unittest.TestCase):
             "dataset": "ECL",
             "dataset_checksum": "a" * 64,
             "source_commit": "1234567",
-            "protocol": {"input_len": 36, "features": "M", "horizons": [96, 192, 336, 720]},
+            "protocol": {"input_len": 36, "features": "M", "horizons": [24, 36, 48, 60]},
         }
 
     @staticmethod
@@ -30,7 +30,7 @@ class GeneralResultContractTests(unittest.TestCase):
         return {
             "dataset_checksum": "a" * 64,
             "source_commit": "1234567",
-            "protocol": {"input_len": 36, "features": "M", "horizons": [96, 192, 336, 720]},
+            "protocol": {"input_len": 36, "features": "M", "horizons": [24, 36, 48, 60]},
             "source": {"url": "https://example.invalid/source", "commit": "1234567"},
             "runtime": {"wall_time_seconds": 1.25, "peak_gpu_memory_bytes": 0, "trainable_parameters": 12},
         }
