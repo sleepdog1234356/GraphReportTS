@@ -18,6 +18,24 @@ Their checked-out short commits are respectively `204c21e`, `c2426e6`,
 single generalized default, govern dataset/horizon architecture, learning rate,
 epoch, and scheduler exceptions.
 
+The corresponding full SHAs re-read on 2026-07-13 are:
+
+| Baseline | Full SHA |
+| --- | --- |
+| PatchTST | `204c21efe0b39603ad6e2ca640ef5896646ab1a9` |
+| iTransformer | `c2426e68ca13f74aaec08045c5c724d8ad328124` |
+| TimeCMA | `223e4ae9364bec3e3a2d8bb39ab6eed2cf510296` |
+| TimesNet | `4e938a1767106324dd753b2a44832bf870a0252e` |
+| DLinear | `0c113668a3b88c4c4ee586b8c5ec3e539c4de5a6` |
+| Time-LLM | `b13e881f86cd0475ce1b72c17110430663334955` |
+
+Formal local validation resolves the manifest revision and `HEAD` to full SHAs,
+requires exact equality, and rejects output from
+`git status --porcelain --untracked-files=no`. The read-only server DLinear clone
+currently reports two tracked deleted `Pyraformer/utils/__pycache__/*.pyc` files;
+it was used only for read-only source inspection and would correctly be rejected
+as a formal runtime checkout until its owner restores those tracked files.
+
 This direct audit supersedes two earlier generalizations in this document:
 PatchTST is not universally OneCycle/patience 20, and TimeCMA is not universally
 100 epochs. The exact exceptions below are represented by
@@ -70,3 +88,19 @@ TimesNet. The Time-LLM source identifies `huggyllama/llama-7b` but does not pin 
 model/tokenizer revision, so formal construction requires caller-supplied local
 paths and explicit revision provenance and forces local-only loading. Its source
 scripts use bf16 mixed precision; the profile records `bf16`.
+
+## Task 6 review-fix evidence
+
+iTransformer and TimesNet both use the shared THUML `time_features` implementation
+(`utils/timefeatures.py:34-148`). Their data loaders transpose those features to
+`[time, feature]` and return both encoder and decoder markers
+(`iTransformer/data_provider/data_loader.py:74-90,164-180,262-278` and
+`TimesNet/data_provider/data_loader.py:90-110,192-212,302-322`). The project
+baseline collator now reproduces the four hourly columns or five minute columns
+from Task 3 timestamps and carries them to the official forward arguments.
+
+Time-LLM local-path redirection is constructor-scoped. Exact original
+`from_pretrained` descriptors are restored in `finally`; runtime provenance
+records resolved paths, revisions, requested precision, and observed backbone
+dtype. TimeCMA early-stop failures accumulate continuously, matching
+`train.py:289-299`, while the half-epoch condition gates only the break action.

@@ -103,6 +103,17 @@ class TimeCMACacheProvenance:
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+@dataclass(frozen=True)
+class SourceCheckoutProvenance:
+    manifest_revision: str
+    full_sha: str | None
+    verified: bool
+    tracked_dirty: bool | None
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def _datetime_value(value: Any) -> datetime:
     if isinstance(value, datetime):
         return value
@@ -375,20 +386,34 @@ def _source_root(external_root: Path, source: Any) -> Path:
     return root
 
 
-def _verify_checkout(external_root: Path, source: Any) -> None:
-    repo = external_root / source.repo_dir
-    if not repo.exists():
-        raise FileNotFoundError(f"official source checkout not found: {repo}")
+def _git_output(repo: Path, *arguments: str) -> str:
     try:
-        actual = subprocess.check_output(
-            ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
+        return subprocess.check_output(
+            ["git", "-C", str(repo), *arguments],
             text=True,
             stderr=subprocess.STDOUT,
         ).strip()
     except (OSError, subprocess.CalledProcessError) as exc:
-        raise RuntimeError(f"cannot validate official git checkout at {repo}") from exc
-    if actual != source.commit:
-        raise RuntimeError(f"official source commit mismatch for {source.name}: expected {source.commit}, got {actual}")
+        raise RuntimeError(f"cannot validate pinned revision for official git checkout at {repo}") from exc
+
+
+def validate_source_checkout(external_root: Path, source: Any) -> SourceCheckoutProvenance:
+    """Resolve and compare full commit identities and reject tracked changes."""
+
+    repo = external_root / source.repo_dir
+    if not repo.exists():
+        raise FileNotFoundError(f"official source checkout not found: {repo}")
+    full_head = _git_output(repo, "rev-parse", "HEAD")
+    full_pinned = _git_output(repo, "rev-parse", "--verify", f"{source.commit}^{{commit}}")
+    if full_head != full_pinned:
+        raise RuntimeError(
+            f"official source commit mismatch for {source.name}: pinned {source.commit} "
+            f"resolves to {full_pinned}, HEAD is {full_head}"
+        )
+    tracked_status = _git_output(repo, "status", "--porcelain", "--untracked-files=no")
+    if tracked_status:
+        raise RuntimeError(f"official source checkout has tracked dirty changes: {repo}")
+    return SourceCheckoutProvenance(source.commit, full_head, True, False)
 
 
 def _source_config(profile: Any, num_features: int) -> SimpleNamespace:
@@ -413,6 +438,7 @@ def _source_config(profile: Any, num_features: int) -> SimpleNamespace:
         "prompt_domain": 1,
     }
     values.update(profile.architecture)
+    values["freq"] = "t" if profile.dataset in {"ETTm1", "ETTm2", "Weather"} else "h"
     if profile.name == "Time-LLM":
         try:
             from .general_baseline_profiles import time_llm_description
@@ -422,58 +448,92 @@ def _source_config(profile: Any, num_features: int) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
-def _patch_timellm_local_sources(module: Any, args: Any, verify_source: bool) -> None:
-    if not hasattr(module, "LlamaModel"):
-        return
+def _is_runtime_placeholder(value: Any) -> bool:
+    return value is None or str(value).strip().lower() in {
+        "", "unknown", "placeholder", "required-at-runtime", "none",
+    }
+
+
+@contextmanager
+def _scoped_timellm_local_sources(module: Any, args: Any, formal: bool) -> Iterator[dict[str, Any] | None]:
+    """Redirect official loaders only while constructing one Time-LLM model."""
+
     local_model = getattr(args, "local_llm_path", None)
     local_tokenizer = getattr(args, "local_tokenizer_path", local_model)
     model_revision = getattr(args, "llm_model_revision", None)
     tokenizer_revision = getattr(args, "tokenizer_revision", None)
-    if verify_source and not all((local_model, local_tokenizer, model_revision, tokenizer_revision)):
-        raise ValueError("formal Time-LLM requires local model/tokenizer paths and recorded revisions")
+    precision = getattr(args, "precision", None)
+    runtime_values = (local_model, local_tokenizer, model_revision, tokenizer_revision, precision)
+    if formal and any(_is_runtime_placeholder(value) for value in runtime_values):
+        raise ValueError("formal Time-LLM requires actual local paths, revisions, and precision")
     if not local_model:
+        yield None
         return
 
-    for attr in ("LlamaConfig", "LlamaModel", "GPT2Config", "GPT2Model", "BertConfig", "BertModel"):
-        cls = getattr(module, attr, None)
-        if cls is None:
-            continue
+    model_path = Path(local_model).expanduser().resolve()
+    tokenizer_path = Path(local_tokenizer).expanduser().resolve()
+    if formal and (not model_path.exists() or not tokenizer_path.exists()):
+        raise ValueError("formal Time-LLM local model and tokenizer paths must exist")
+    if precision not in {"bf16", "float16", "float32"}:
+        raise ValueError(f"unsupported Time-LLM runtime precision: {precision!r}")
+
+    runtime = {
+        "model_path": str(model_path),
+        "tokenizer_path": str(tokenizer_path),
+        "model_revision": str(model_revision),
+        "tokenizer_revision": str(tokenizer_revision),
+        "precision": precision,
+    }
+    patched: list[tuple[Any, bool, Any]] = []
+
+    def patch_class(cls: Any, path: Path, revision: str) -> None:
+        had_own_descriptor = "from_pretrained" in vars(cls)
+        descriptor = vars(cls).get("from_pretrained")
         original = cls.from_pretrained
 
-        def model_loader(_name: str, *loader_args: Any, _original=original, **kwargs: Any):
+        def local_loader(_name: str, *loader_args: Any, **kwargs: Any):
             kwargs["local_files_only"] = True
-            kwargs["revision"] = model_revision
-            return _original(str(local_model), *loader_args, **kwargs)
+            kwargs["revision"] = revision
+            return original(str(path), *loader_args, **kwargs)
 
-        cls.from_pretrained = staticmethod(model_loader)
-    for attr in ("LlamaTokenizer", "GPT2Tokenizer", "BertTokenizer"):
-        cls = getattr(module, attr, None)
-        if cls is None:
-            continue
-        original = cls.from_pretrained
+        patched.append((cls, had_own_descriptor, descriptor))
+        cls.from_pretrained = staticmethod(local_loader)
 
-        def tokenizer_loader(_name: str, *loader_args: Any, _original=original, **kwargs: Any):
-            kwargs["local_files_only"] = True
-            kwargs["revision"] = tokenizer_revision
-            return _original(str(local_tokenizer), *loader_args, **kwargs)
-
-        cls.from_pretrained = staticmethod(tokenizer_loader)
+    try:
+        for attr in ("LlamaConfig", "LlamaModel", "GPT2Config", "GPT2Model", "BertConfig", "BertModel"):
+            cls = getattr(module, attr, None)
+            if cls is not None:
+                patch_class(cls, model_path, str(model_revision))
+        for attr in ("LlamaTokenizer", "GPT2Tokenizer", "BertTokenizer"):
+            cls = getattr(module, attr, None)
+            if cls is not None:
+                patch_class(cls, tokenizer_path, str(tokenizer_revision))
+        yield runtime
+    finally:
+        for cls, had_own_descriptor, descriptor in reversed(patched):
+            if had_own_descriptor:
+                setattr(cls, "from_pretrained", descriptor)
+            else:
+                delattr(cls, "from_pretrained")
 
 
 def _general_adapter_type():
     import torch
 
     class GeneralBaselineAdapter(torch.nn.Module):
-        def __init__(self, model: torch.nn.Module, profile: Any, num_features: int):
+        def __init__(self, model: torch.nn.Module, profile: Any, num_features: int,
+                     runtime_provenance: Mapping[str, Any]):
             super().__init__()
             self.model = model
             self.profile = profile
             self.source_identity = profile.source
             self.prompt_policy = profile.source.prompt_policy
             self.num_features = num_features
+            self.runtime_provenance = dict(runtime_provenance)
 
         def forward(self, x: torch.Tensor, *, prompt_embeddings: torch.Tensor | None = None,
-                    time_mark: torch.Tensor | None = None) -> torch.Tensor:
+                    time_mark: torch.Tensor | None = None,
+                    decoder_time_mark: torch.Tensor | None = None) -> torch.Tensor:
             if x.ndim != 3 or x.shape[1] != self.profile.seq_len or x.shape[2] != self.num_features:
                 raise ValueError(
                     f"{self.profile.name} requires input [B,{self.profile.seq_len},{self.num_features}]"
@@ -481,7 +541,22 @@ def _general_adapter_type():
             if self.profile.name == "PatchTST":
                 output = self.model(x)
             elif self.profile.name in {"iTransformer", "TimesNet"}:
-                output = self.model(x, None, None, None)
+                expected_dim = 5 if self.profile.dataset in {"ETTm1", "ETTm2", "Weather"} else 4
+                if time_mark is None:
+                    raise ValueError(f"{self.profile.name} requires source-format encoder time markers")
+                if tuple(time_mark.shape) != (x.shape[0], self.profile.seq_len, expected_dim):
+                    raise ValueError(
+                        f"{self.profile.name} encoder time markers must have shape "
+                        f"[{x.shape[0]},{self.profile.seq_len},{expected_dim}]"
+                    )
+                if decoder_time_mark is not None and tuple(decoder_time_mark.shape) != (
+                    x.shape[0], self.profile.pred_len, expected_dim
+                ):
+                    raise ValueError(
+                        f"{self.profile.name} decoder time markers must have shape "
+                        f"[{x.shape[0]},{self.profile.pred_len},{expected_dim}]"
+                    )
+                output = self.model(x, time_mark, None, decoder_time_mark)
             elif self.profile.name == "DLinear":
                 output = self.model(x)
             elif self.profile.name == "TimeCMA":
@@ -491,7 +566,7 @@ def _general_adapter_type():
                     time_mark = x.new_zeros((x.shape[0], x.shape[1], 1))
                 output = self.model(x, time_mark, prompt_embeddings)
             else:
-                output = self.model(x, None, None, None)
+                output = self.model(x, time_mark, None, decoder_time_mark)
             if isinstance(output, tuple):
                 output = output[0]
             expected = (x.shape[0], self.profile.pred_len, self.num_features)
@@ -518,16 +593,18 @@ def build_general_baseline(name: str, dataset_meta: Any, args: Any):
     profile = resolve_general_profile(name, dataset, pred_len)
     external_root = Path(getattr(args, "external_root", "external"))
     verify_source = bool(getattr(args, "verify_source_commit", True))
-    if verify_source:
-        _verify_checkout(external_root, profile.source)
+    checkout = (
+        validate_source_checkout(external_root, profile.source)
+        if verify_source
+        else SourceCheckoutProvenance(profile.source.commit, None, False, None)
+    )
     root = _source_root(external_root, profile.source)
     if not root.exists():
         raise FileNotFoundError(f"official source module root not found: {root}")
     config = _source_config(profile, num_features)
+    time_llm_runtime = None
     with _isolated_external_import(root):
         module = importlib.import_module(profile.source.module)
-        if profile.name == "Time-LLM":
-            _patch_timellm_local_sources(module, args, verify_source)
         official_class = getattr(module, profile.source.class_name)
         if profile.name == "TimeCMA":
             architecture = profile.architecture
@@ -544,6 +621,9 @@ def build_general_baseline(name: str, dataset_meta: Any, args: Any):
                 d_ff=architecture["d_ff"],
                 head=architecture["n_heads"],
             )
+        elif profile.name == "Time-LLM":
+            with _scoped_timellm_local_sources(module, args, verify_source) as time_llm_runtime:
+                model = official_class(config)
         else:
             model = official_class(config)
     if profile.name == "Time-LLM":
@@ -552,8 +632,17 @@ def build_general_baseline(name: str, dataset_meta: Any, args: Any):
             raise ValueError("official Time-LLM model does not expose llm_model for freeze verification")
         for parameter in backbone.parameters():
             parameter.requires_grad = False
+        if time_llm_runtime is not None:
+            try:
+                time_llm_runtime["backbone_dtype"] = str(next(backbone.parameters()).dtype)
+            except StopIteration:
+                time_llm_runtime["backbone_dtype"] = "parameterless"
     adapter_class = _general_adapter_type()
-    return adapter_class(model, profile, num_features)
+    runtime_provenance = {
+        "source_checkout": checkout.as_dict(),
+        "time_llm": time_llm_runtime,
+    }
+    return adapter_class(model, profile, num_features, runtime_provenance)
 
 
 def parse_args():

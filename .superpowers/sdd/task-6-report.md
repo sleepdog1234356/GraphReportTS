@@ -152,3 +152,121 @@ The second skip is the existing opt-in CUDA ECL smoke test. `compileall` and
 - The source TimeCMA loop can use test MSE in checkpoint updates after epoch 10.
   That behavior is deliberately not retained: the formal shared contract uses
   validation MSE only, as required by the project protocol.
+
+## 2026-07-13 review-fix pass
+
+Design amendment: `e99a82b` (`Document Task 6 review fixes`). No training, CUDA,
+weights, real embedding generation, or network model access occurred during the
+fix pass.
+
+### Full source identities and checkout state
+
+The pinned server repositories were re-read with full `git rev-parse HEAD`:
+
+| Baseline | Full SHA |
+| --- | --- |
+| PatchTST | `204c21efe0b39603ad6e2ca640ef5896646ab1a9` |
+| iTransformer | `c2426e68ca13f74aaec08045c5c724d8ad328124` |
+| TimeCMA | `223e4ae9364bec3e3a2d8bb39ab6eed2cf510296` |
+| TimesNet | `4e938a1767106324dd753b2a44832bf870a0252e` |
+| DLinear | `0c113668a3b88c4c4ee586b8c5ec3e539c4de5a6` |
+| Time-LLM | `b13e881f86cd0475ce1b72c17110430663334955` |
+
+The server DLinear tree reports two tracked deleted Pyraformer bytecode files.
+It remained read-only and was used only for inspection. The corrected formal
+validator rejects any such tracked-dirty checkout, resolves the pinned manifest
+revision to a full SHA, and compares that identity exactly to full `HEAD`.
+
+### Review RED evidence
+
+The complete review tests were written before production changes:
+
+```text
+C:\Python313\python.exe -m unittest tests.test_general_baselines -v
+Ran 34 tests in 4.219s
+FAILED (failures=6, errors=49, skipped=1)
+```
+
+The 49 subtest errors were the 48 iTransformer/TimesNet dataset-horizon marker
+contracts plus the missing Time-LLM runtime-result argument. Focused failures
+also proved permanent fake Transformers descriptor mutation, absent full checkout
+validation, pre-gate stale reset, absent clipping/optimizer helper, and absent
+Task 3 marker conversion/collation.
+
+An additional source-frequency RED caught profile architecture overwriting the
+dataset cadence after marker forwarding was implemented:
+
+```text
+C:\Python313\python.exe -m unittest \
+  tests.test_general_baselines.GeneralBaselineAdapterTests.test_fake_official_classes_receive_source_configs_and_return_m2m_outputs -v
+Ran 1 test
+FAILED (failures=24)
+```
+
+Those 24 subtest failures were every minute-frequency iTransformer/TimesNet
+combination still receiving config `freq='h'` instead of `freq='t'`.
+
+Self-review then strengthened the scoped-loader fake to inherit
+`from_pretrained`, matching real Hugging Face class structure. The focused RED
+failed with `ValueError: LlamaModel has no direct from_pretrained descriptor`.
+The context now records whether each class originally owned the descriptor and
+uses `delattr` on exit for inherited methods, restoring exact lookup semantics.
+The same focused test then passed, followed by the complete focused suite.
+
+### Review GREEN evidence
+
+```text
+C:\Python313\python.exe -m unittest tests.test_general_baselines -v
+Ran 34 tests in 5.484s
+OK (skipped=1)
+```
+
+The optional local-real-repository integration remains skipped because no local
+official clones are installed.
+
+```text
+C:\Python313\python.exe -m unittest discover -s tests -v
+Ran 157 tests in 36.289s
+OK (skipped=2)
+```
+
+The second skip remains the existing opt-in CUDA ECL smoke test.
+
+After the inherited-descriptor self-review fix, final re-verification was:
+
+```text
+C:\Python313\python.exe -m unittest tests.test_general_baselines -q
+Ran 34 tests in 5.539s
+OK (skipped=1)
+
+C:\Python313\python.exe -m unittest discover -s tests -q
+Ran 157 tests in 35.175s
+OK (skipped=2)
+```
+
+### Findings closed
+
+1. Task 3 timestamps now become exact THUML `timeF` markers: four hourly
+   dimensions for ETTh1/ETTh2/ECL and five minute dimensions for
+   ETTm1/ETTm2/Weather. Baseline collation preserves encoder and target marks;
+   the shared batch-forward path passes both to iTransformer and TimesNet, and
+   adapters reject missing/malformed encoder marks.
+2. Time-LLM loader redirection is scoped to one constructor. Each exact original
+   class descriptor is restored in `finally`; sequential fake builds prove
+   distinct paths/revisions and no global mutation or cross-contamination.
+3. TimeCMA stale failures now accumulate before the delayed gate. The gate
+   suppresses only `should_stop`; improvements still reset stale state.
+4. Checkout validation compares full resolved identities, rejects tracked dirt,
+   ignores only untracked files as specified, and attaches full SHA provenance.
+5. Time-LLM adapter provenance now records resolved model/tokenizer paths,
+   revisions, requested execution precision, and observed backbone dtype. The
+   formal result schema rejects placeholders and requires/emits this provenance.
+6. Import safety is now stated precisely: `train_general_baselines` eagerly
+   imports NumPy and PyTorch for executable optimizer/scheduler helpers, but a
+   subprocess test proves no Transformers, official `models`/`model`/`layers`,
+   weights, or initialized CUDA context appears at import.
+
+The optimizer mechanics are executable: the helper applies profile gradient
+clipping, performs the optimizer step, and then performs source batch scheduling;
+the one-based epoch scheduler helper remains covered. Existing battery behavior
+remains unchanged and the full battery/general suite is green.

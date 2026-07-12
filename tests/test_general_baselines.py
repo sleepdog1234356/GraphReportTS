@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta
 import json
 from pathlib import Path
@@ -44,6 +45,11 @@ except (ImportError, ModuleNotFoundError):
     build_timecma_prompt = None
 
 try:
+    from bstalignment.baseline_adapters import validate_source_checkout
+except (ImportError, ModuleNotFoundError):
+    validate_source_checkout = None
+
+try:
     from bstalignment.train_general_baselines import (
         build_general_optimizer,
         build_general_scheduler,
@@ -65,6 +71,21 @@ except (ImportError, ModuleNotFoundError):
     step_general_batch_scheduler = None
     step_general_epoch_scheduler = None
     validation_checkpoint_decision = None
+
+try:
+    from bstalignment.train_general_baselines import (
+        clip_general_gradients,
+        collate_general_baseline_batch,
+        forward_general_baseline_batch,
+        source_time_markers,
+        step_general_optimizer,
+    )
+except (ImportError, ModuleNotFoundError):
+    clip_general_gradients = None
+    collate_general_baseline_batch = None
+    forward_general_baseline_batch = None
+    source_time_markers = None
+    step_general_optimizer = None
 
 
 SOURCES = {
@@ -198,8 +219,26 @@ def _fake_source_tree(root: Path) -> None:
                 return x.new_zeros((x.shape[0], self.configs.pred_len, x.shape[2])) + self.weight * 0
     """
     _write_package_file(root / "patchtst" / "PatchTST_supervised", "models/PatchTST.py", common_model.replace("MARKER", repr("patchtst")))
-    _write_package_file(root / "itransformer", "model/iTransformer.py", common_model.replace("MARKER", repr("itransformer")))
-    _write_package_file(root / "timesnet", "models/TimesNet.py", common_model.replace("MARKER", repr("timesnet")))
+    marked_model = """
+        import torch
+        from torch import nn
+        class Model(nn.Module):
+            marker = MARKER
+            def __init__(self, configs):
+                super().__init__()
+                self.configs = configs
+                self.weight = nn.Parameter(torch.ones(()))
+                self.last_encoder_mark = None
+                self.last_decoder_mark = None
+            def forward(self, x, x_mark, x_dec, y_mark, *args, **kwargs):
+                if x_mark is None:
+                    raise AssertionError("official encoder time markers are required")
+                self.last_encoder_mark = x_mark.detach().clone()
+                self.last_decoder_mark = None if y_mark is None else y_mark.detach().clone()
+                return x.new_zeros((x.shape[0], self.configs.pred_len, x.shape[2])) + self.weight * 0
+    """
+    _write_package_file(root / "itransformer", "model/iTransformer.py", marked_model.replace("MARKER", repr("itransformer")))
+    _write_package_file(root / "timesnet", "models/TimesNet.py", marked_model.replace("MARKER", repr("timesnet")))
     _write_package_file(root / "dlinear", "models/DLinear.py", common_model.replace("MARKER", repr("dlinear")))
     _write_package_file(
         root / "timecma",
@@ -218,18 +257,63 @@ def _fake_source_tree(root: Path) -> None:
                 return input_data.new_zeros((input_data.shape[0], self.kwargs["pred_len"], input_data.shape[2])) + self.weight * 0
         """,
     )
+    sys.modules.pop("fake_transformers_for_task6", None)
+    _write_package_file(
+        root / "time_llm",
+        "fake_transformers_for_task6.py",
+        """
+        from types import SimpleNamespace
+        import torch
+        from torch import nn
+
+        calls = []
+
+        class LlamaConfig:
+            @classmethod
+            def from_pretrained(cls, path, *args, **kwargs):
+                calls.append(("config", str(path), dict(kwargs)))
+                return SimpleNamespace()
+
+        class FakeBackbone(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.ones(2, 2))
+
+        class ModelLoaderBase:
+            @classmethod
+            def from_pretrained(cls, path, *args, **kwargs):
+                calls.append(("model", str(path), dict(kwargs)))
+                return FakeBackbone()
+
+        class LlamaModel(ModelLoaderBase):
+            pass
+
+        class TokenizerLoaderBase:
+            @classmethod
+            def from_pretrained(cls, path, *args, **kwargs):
+                calls.append(("tokenizer", str(path), dict(kwargs)))
+                return SimpleNamespace()
+
+        class LlamaTokenizer(TokenizerLoaderBase):
+            pass
+        """,
+    )
     _write_package_file(
         root / "time_llm",
         "models/TimeLLM.py",
         """
         import torch
         from torch import nn
+        from fake_transformers_for_task6 import LlamaConfig, LlamaModel, LlamaTokenizer
+
         class Model(nn.Module):
             marker = "time_llm"
             def __init__(self, configs):
                 super().__init__()
                 self.configs = configs
-                self.llm_model = nn.Linear(2, 2)
+                self.llm_config = LlamaConfig.from_pretrained("huggyllama/llama-7b")
+                self.llm_model = LlamaModel.from_pretrained("huggyllama/llama-7b")
+                self.tokenizer = LlamaTokenizer.from_pretrained("huggyllama/llama-7b")
                 self.head = nn.Parameter(torch.ones(()))
             def forward(self, x, x_mark, x_dec, y_mark, mask=None):
                 return x.new_zeros((x.shape[0], self.configs.pred_len, x.shape[2])) + self.head * 0
@@ -262,6 +346,13 @@ class GeneralBaselineAdapterTests(unittest.TestCase):
                             x = torch.randn(1, 36, num_features)
                             if model == "TimeCMA":
                                 output = adapter(x, prompt_embeddings=torch.zeros(1, 768, num_features))
+                            elif model in {"iTransformer", "TimesNet"}:
+                                mark_dim = 5 if dataset in {"ETTm1", "ETTm2", "Weather"} else 4
+                                output = adapter(
+                                    x,
+                                    time_mark=torch.zeros(1, 36, mark_dim),
+                                    decoder_time_mark=torch.zeros(1, horizon, mark_dim),
+                                )
                             else:
                                 output = adapter(x)
                             self.assertEqual(tuple(output.shape), (1, horizon, num_features))
@@ -271,6 +362,9 @@ class GeneralBaselineAdapterTests(unittest.TestCase):
                                 self.assertEqual(adapter.model.configs.pred_len, horizon)
                                 self.assertEqual(adapter.model.configs.enc_in, num_features)
                                 self.assertEqual(adapter.model.configs.c_out, num_features)
+                                if model in {"iTransformer", "TimesNet"}:
+                                    expected_freq = "t" if dataset in {"ETTm1", "ETTm2", "Weather"} else "h"
+                                    self.assertEqual(adapter.model.configs.freq, expected_freq)
                             self.assertEqual(adapter.source_identity.commit, SOURCES[model][1])
                             self.assertEqual(adapter.prompt_policy, SOURCES[model][4])
 
@@ -295,6 +389,107 @@ class GeneralBaselineAdapterTests(unittest.TestCase):
         self.assertTrue(all(not parameter.requires_grad for parameter in adapter.model.llm_model.parameters()))
         self.assertTrue(adapter.model.head.requires_grad)
 
+    def test_time_llm_local_loader_patches_are_scoped_and_runtime_specific(self):
+        self.require_builder()
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            _fake_source_tree(root)
+            model_a = root / "weights" / "model-a"
+            tokenizer_a = root / "weights" / "tokenizer-a"
+            model_b = root / "weights" / "model-b"
+            tokenizer_b = root / "weights" / "tokenizer-b"
+            for path in (model_a, tokenizer_a, model_b, tokenizer_b):
+                path.mkdir(parents=True)
+
+            sys.path.insert(0, str(root / "time_llm"))
+            try:
+                import fake_transformers_for_task6 as fake_hf
+            finally:
+                sys.path.pop(0)
+            original_descriptors = {
+                name: (
+                    "from_pretrained" in vars(getattr(fake_hf, name)),
+                    vars(getattr(fake_hf, name)).get("from_pretrained"),
+                )
+                for name in ("LlamaConfig", "LlamaModel", "LlamaTokenizer")
+            }
+
+            def build(model_path, tokenizer_path, model_revision, tokenizer_revision):
+                return build_general_baseline(
+                    "Time-LLM",
+                    {"name": "Weather", "num_features": 2},
+                    SimpleNamespace(
+                        external_root=root,
+                        pred_len=96,
+                        verify_source_commit=False,
+                        local_llm_path=model_path,
+                        local_tokenizer_path=tokenizer_path,
+                        llm_model_revision=model_revision,
+                        tokenizer_revision=tokenizer_revision,
+                        precision="bf16",
+                    ),
+                )
+
+            first = build(model_a, tokenizer_a, "model-rev-a", "token-rev-a")
+            for name, (had_own_descriptor, descriptor) in original_descriptors.items():
+                self.assertEqual("from_pretrained" in vars(getattr(fake_hf, name)), had_own_descriptor)
+                self.assertIs(vars(getattr(fake_hf, name)).get("from_pretrained"), descriptor)
+            first_calls = list(fake_hf.calls)
+            fake_hf.calls.clear()
+            second = build(model_b, tokenizer_b, "model-rev-b", "token-rev-b")
+            for name, (had_own_descriptor, descriptor) in original_descriptors.items():
+                self.assertEqual("from_pretrained" in vars(getattr(fake_hf, name)), had_own_descriptor)
+                self.assertIs(vars(getattr(fake_hf, name)).get("from_pretrained"), descriptor)
+            second_calls = list(fake_hf.calls)
+
+        self.assertEqual([call[1] for call in first_calls], [str(model_a.resolve()), str(model_a.resolve()), str(tokenizer_a.resolve())])
+        self.assertEqual([call[2]["revision"] for call in first_calls], ["model-rev-a", "model-rev-a", "token-rev-a"])
+        self.assertEqual([call[1] for call in second_calls], [str(model_b.resolve()), str(model_b.resolve()), str(tokenizer_b.resolve())])
+        self.assertEqual([call[2]["revision"] for call in second_calls], ["model-rev-b", "model-rev-b", "token-rev-b"])
+        for adapter, expected_model, expected_tokenizer, model_revision, tokenizer_revision in (
+            (first, model_a, tokenizer_a, "model-rev-a", "token-rev-a"),
+            (second, model_b, tokenizer_b, "model-rev-b", "token-rev-b"),
+        ):
+            provenance = adapter.runtime_provenance["time_llm"]
+            self.assertEqual(provenance["model_path"], str(expected_model.resolve()))
+            self.assertEqual(provenance["tokenizer_path"], str(expected_tokenizer.resolve()))
+            self.assertEqual(provenance["model_revision"], model_revision)
+            self.assertEqual(provenance["tokenizer_revision"], tokenizer_revision)
+            self.assertEqual(provenance["precision"], "bf16")
+            self.assertEqual(provenance["backbone_dtype"], "torch.float32")
+        sys.modules.pop("fake_transformers_for_task6", None)
+
+    def test_source_validation_records_full_sha_and_rejects_tracked_dirty_checkout(self):
+        self.assertIsNotNone(validate_source_checkout, "full source checkout validator must exist")
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "dlinear"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "task6@example.com"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Task 6"], cwd=repo, check=True)
+            tracked = repo / "tracked.py"
+            tracked.write_text("clean = True\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.py"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "fixture"], cwd=repo, check=True)
+            full_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+            source = replace(resolve_general_profile("DLinear", "ETTm1", 96).source, commit=full_sha[:7])
+
+            provenance = validate_source_checkout(root, source)
+            self.assertEqual(provenance.full_sha, full_sha)
+            self.assertEqual(provenance.manifest_revision, full_sha[:7])
+            self.assertTrue(provenance.verified)
+
+            (repo / "untracked.txt").write_text("allowed\n", encoding="utf-8")
+            self.assertEqual(validate_source_checkout(root, source).full_sha, full_sha)
+
+            tracked.write_text("clean = False\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "tracked.*dirty|dirty.*tracked"):
+                validate_source_checkout(root, source)
+            subprocess.run(["git", "restore", "tracked.py"], cwd=repo, check=True)
+            with self.assertRaisesRegex(RuntimeError, "pinned|revision|commit"):
+                validate_source_checkout(root, replace(source, commit="deadbee"))
+
     def test_formal_source_commit_validation_fails_closed(self):
         self.require_builder()
         with TemporaryDirectory() as directory:
@@ -313,8 +508,9 @@ class GeneralBaselineAdapterTests(unittest.TestCase):
         for model in SOURCES:
             with self.subTest(model=model):
                 profile = resolve_general_profile(model, "ETTm1", 96)
-                repo = root / profile.source.repo_dir
-                self.assertEqual(subprocess.check_output(["git", "-C", str(repo), "rev-parse", "--short", "HEAD"], text=True).strip(), profile.source.commit)
+                provenance = validate_source_checkout(root, profile.source)
+                self.assertTrue(provenance.full_sha.startswith(profile.source.commit))
+                self.assertFalse(provenance.tracked_dirty)
 
 
 class FakeFrozenEncoder(torch.nn.Module):
@@ -491,6 +687,53 @@ class GeneralTrainingContractTests(unittest.TestCase):
         patch_scheduler = build_general_scheduler(patch_optimizer, patch, steps_per_epoch=2)
         self.assertIsInstance(patch_scheduler, torch.optim.lr_scheduler.OneCycleLR)
 
+    def test_source_time_markers_match_official_hourly_and_minute_cadence_dimensions(self):
+        self.assertIsNotNone(source_time_markers, "source-format time marker helper must exist")
+        hourly = [datetime(2020, 1, 1) + timedelta(hours=index) for index in range(36)]
+        minute = [datetime(2020, 1, 1) + timedelta(minutes=15 * index) for index in range(36)]
+        hourly_mark = source_time_markers("ETTh1", hourly)
+        minute_mark = source_time_markers("ETTm1", minute)
+        weather_mark = source_time_markers("Weather", minute)
+        self.assertEqual(tuple(hourly_mark.shape), (36, 4))
+        self.assertEqual(tuple(minute_mark.shape), (36, 5))
+        self.assertEqual(tuple(weather_mark.shape), (36, 5))
+        torch.testing.assert_close(
+            hourly_mark[0],
+            torch.tensor([-0.5, 2 / 6 - 0.5, -0.5, -0.5], dtype=torch.float32),
+        )
+        torch.testing.assert_close(
+            minute_mark[0],
+            torch.tensor([-0.5, -0.5, 2 / 6 - 0.5, -0.5, -0.5], dtype=torch.float32),
+        )
+
+    def test_task3_timestamp_collation_reaches_official_marker_forward_arguments(self):
+        self.assertIsNotNone(collate_general_baseline_batch, "baseline timestamp collator must exist")
+        self.assertIsNotNone(forward_general_baseline_batch, "baseline batch forward helper must exist")
+        history_timestamps = tuple(datetime(2020, 1, 1) + timedelta(minutes=15 * index) for index in range(36))
+        target_timestamps = tuple(datetime(2020, 1, 1, 9) + timedelta(minutes=15 * index) for index in range(96))
+        sample = {
+            "series_id": "ETTm1",
+            "history_scaled": torch.randn(36, 2),
+            "target_scaled": torch.randn(96, 2),
+            "timestamp_markers": {"history": history_timestamps, "target": target_timestamps},
+            "start_index": 100,
+            "columns": ("a", "b"),
+        }
+        batch = collate_general_baseline_batch([sample])
+        self.assertEqual(tuple(batch["x_mark"].shape), (1, 36, 5))
+        self.assertEqual(tuple(batch["y_mark"].shape), (1, 96, 5))
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            _fake_source_tree(root)
+            args = SimpleNamespace(external_root=root, pred_len=96, verify_source_commit=False)
+            for name in ("iTransformer", "TimesNet"):
+                with self.subTest(name=name):
+                    adapter = build_general_baseline(name, {"name": "ETTm1", "num_features": 2}, args)
+                    output = forward_general_baseline_batch(adapter, batch)
+                    self.assertEqual(tuple(output.shape), (1, 96, 2))
+                    torch.testing.assert_close(adapter.model.last_encoder_mark, batch["x_mark"])
+                    torch.testing.assert_close(adapter.model.last_decoder_mark, batch["y_mark"])
+
     def test_dataset_builder_reuses_task3_train_scaler_for_validation_and_test(self):
         self.require_training_contracts()
         calls = []
@@ -543,17 +786,56 @@ class GeneralTrainingContractTests(unittest.TestCase):
         step_general_batch_scheduler(counter, resolve_general_profile("DLinear", "ETTm1", 96))
         self.assertEqual(counter.calls, 1)
 
-    def test_checkpoint_decisions_use_validation_only_and_delayed_stopping(self):
+    def test_checkpoint_decisions_accumulate_stale_before_delayed_stop_gate(self):
         self.require_training_contracts()
         profile = resolve_general_profile("TimeCMA", "Weather", 96)
-        decision = validation_checkpoint_decision(best_mse=0.5, stale=49, val_mse=0.6, epoch=9, profile=profile)
-        self.assertFalse(decision.should_stop)
-        self.assertEqual(decision.stale, 0)
-        decision = validation_checkpoint_decision(best_mse=0.5, stale=49, val_mse=0.6, epoch=10, profile=profile)
+        best_mse, stale = 0.5, 0
+        for epoch in range(1, 50):
+            decision = validation_checkpoint_decision(
+                best_mse=best_mse, stale=stale, val_mse=0.6, epoch=epoch, profile=profile
+            )
+            best_mse, stale = decision.best_mse, decision.stale
+            self.assertEqual(stale, epoch)
+            self.assertFalse(decision.should_stop)
+        decision = validation_checkpoint_decision(
+            best_mse=best_mse, stale=stale, val_mse=0.6, epoch=50, profile=profile
+        )
+        self.assertEqual(decision.stale, 50)
         self.assertTrue(decision.should_stop)
-        improved = validation_checkpoint_decision(best_mse=0.5, stale=49, val_mse=0.4, epoch=10, profile=profile)
+        improved = validation_checkpoint_decision(best_mse=0.5, stale=49, val_mse=0.4, epoch=50, profile=profile)
         self.assertTrue(improved.should_save)
         self.assertEqual(improved.best_mse, 0.4)
+        self.assertEqual(improved.stale, 0)
+
+    def test_optimizer_step_applies_gradient_clip_then_optimizer_then_batch_scheduler(self):
+        self.assertIsNotNone(clip_general_gradients, "general gradient clipping helper must exist")
+        self.assertIsNotNone(step_general_optimizer, "general optimizer step helper must exist")
+        base = resolve_general_profile("PatchTST", "ETTm1", 96)
+        profile = replace(base, training=replace(base.training, gradient_clip=0.5))
+        model = torch.nn.Linear(2, 1, bias=False)
+        model(torch.tensor([[100.0, -100.0]])).sum().backward()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        events = []
+        original_clip = torch.nn.utils.clip_grad_norm_
+        original_step = optimizer.step
+
+        def record_clip(parameters, max_norm):
+            events.append(("clip", max_norm))
+            return original_clip(parameters, max_norm)
+
+        def record_step(*args, **kwargs):
+            events.append(("optimizer", None))
+            return original_step(*args, **kwargs)
+
+        class Scheduler:
+            def step(self):
+                events.append(("scheduler", None))
+
+        optimizer.step = record_step
+        with patch("torch.nn.utils.clip_grad_norm_", side_effect=record_clip):
+            total_norm = step_general_optimizer(model, optimizer, profile, Scheduler())
+        self.assertGreater(float(total_norm), 0.5)
+        self.assertEqual(events, [("clip", 0.5), ("optimizer", None), ("scheduler", None)])
 
     def test_metrics_and_result_schema_cover_all_channels_and_provenance(self):
         self.require_training_contracts()
@@ -570,6 +852,15 @@ class GeneralTrainingContractTests(unittest.TestCase):
             best_epoch=7,
             best_val_mse=0.25,
             prompt_provenance=None,
+            runtime_provenance={
+                "source_checkout": {
+                    "manifest_revision": "0c11366",
+                    "full_sha": "b" * 40,
+                    "verified": True,
+                    "tracked_dirty": False,
+                },
+                "time_llm": None,
+            },
         )
         self.assertEqual(record["model"], "DLinear")
         self.assertEqual(record["dataset"], "ETTm1")
@@ -579,6 +870,83 @@ class GeneralTrainingContractTests(unittest.TestCase):
         self.assertEqual(record["training"]["optimizer"], "adam")
         self.assertEqual(record["protocol_overrides"]["seq_len"], 36)
         self.assertEqual(record["selection"], {"metric": "validation_mse", "best_epoch": 7, "best_val_mse": 0.25})
+
+    def test_time_llm_result_requires_actual_runtime_paths_revisions_and_precision(self):
+        self.require_training_contracts()
+        profile = resolve_general_profile("Time-LLM", "ETTm1", 96)
+        base_kwargs = dict(
+            profile=profile,
+            seed=2021,
+            metrics={"mse": 0.1, "mae": 0.2},
+            scaler_checksum="scale-a",
+            best_epoch=7,
+            best_val_mse=0.25,
+            prompt_provenance=None,
+        )
+        placeholder = {
+            "source_checkout": {"manifest_revision": "b13e881", "full_sha": "a" * 40, "verified": True},
+            "time_llm": {
+                "model_path": "required-at-runtime",
+                "tokenizer_path": "required-at-runtime",
+                "model_revision": "required-at-runtime",
+                "tokenizer_revision": "required-at-runtime",
+                "precision": "bf16",
+                "backbone_dtype": "torch.float32",
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "runtime provenance|placeholder|model_path"):
+            general_result_record(**base_kwargs, runtime_provenance=placeholder)
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            model_path = (root / "model").resolve()
+            tokenizer_path = (root / "tokenizer").resolve()
+            model_path.mkdir()
+            tokenizer_path.mkdir()
+            runtime = {
+                "source_checkout": {"manifest_revision": "b13e881", "full_sha": "a" * 40, "verified": True},
+                "time_llm": {
+                    "model_path": str(model_path),
+                    "tokenizer_path": str(tokenizer_path),
+                    "model_revision": "model-rev-1",
+                    "tokenizer_revision": "token-rev-1",
+                    "precision": "bf16",
+                    "backbone_dtype": "torch.float32",
+                },
+            }
+            record = general_result_record(**base_kwargs, runtime_provenance=runtime)
+        self.assertEqual(record["runtime_provenance"], runtime)
+
+    def test_trainer_imports_core_numerics_but_not_external_models_transformers_or_cuda(self):
+        code = textwrap.dedent(
+            """
+            import json, sys
+            import bstalignment.train_general_baselines
+            import torch
+            forbidden = [
+                name for name in sys.modules
+                if name == 'transformers' or name.startswith('transformers.')
+                or name == 'models' or name.startswith('models.')
+                or name == 'model' or name.startswith('model.')
+                or name == 'layers' or name.startswith('layers.')
+                or name == 'data_provider' or name.startswith('data_provider.')
+                or name == 'utils' or name.startswith('utils.')
+            ]
+            print(json.dumps({
+                'numpy': 'numpy' in sys.modules,
+                'torch': 'torch' in sys.modules,
+                'forbidden': forbidden,
+                'cuda_initialized': torch.cuda.is_initialized(),
+            }))
+            """
+        )
+        output = subprocess.check_output(
+            [sys.executable, "-c", code], text=True, cwd=Path(__file__).resolve().parents[1]
+        )
+        state = json.loads(output)
+        self.assertTrue(state["numpy"])
+        self.assertTrue(state["torch"])
+        self.assertEqual(state["forbidden"], [])
+        self.assertFalse(state["cuda_initialized"])
 
 
 if __name__ == "__main__":

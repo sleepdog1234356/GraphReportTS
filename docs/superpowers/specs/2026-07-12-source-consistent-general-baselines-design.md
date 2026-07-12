@@ -26,8 +26,11 @@ adds lazy, import-isolated official model construction through
 `build_general_baseline(name, dataset_meta, args)`. Every wrapper accepts
 `[B, 36, C]` and returns every channel as `[B, H, C]`.
 
-`bstalignment/train_general_baselines.py` provides CPU-import-safe orchestration
-over the Task 3 dataset, split, and train-only scaler. It applies the resolved
+`bstalignment/train_general_baselines.py` provides external-model-import-safe
+orchestration over the Task 3 dataset, split, and train-only scaler. It eagerly
+imports NumPy and PyTorch because its optimizer/scheduler contracts are
+executable, but imports no external source tree, Transformers package, weights,
+or CUDA context. It applies the resolved
 optimizer/scheduler/early-stop mechanics, selects checkpoints by validation MSE,
 and emits one result/provenance schema. This task does not run training.
 
@@ -36,9 +39,10 @@ and emits one result/provenance schema. This task does not run training.
 External repositories remain unvendored. Imports happen only during adapter
 construction from a caller-supplied external root. A temporary import scope
 isolates conflicting top-level packages such as `models`, `model`, and `layers`,
-then restores the process module state. Formal construction validates the local
-checkout commit. Ordinary module import must not require an external repository,
-Transformers, model weights, CUDA, or network access.
+then restores the process module state. Formal construction resolves both the
+pinned revision and `HEAD` to full SHAs, requires equality, and rejects tracked
+dirty changes. Ordinary module import must not require an external repository,
+Transformers, model weights, CUDA initialization, or network access.
 
 The official source paths are not assumed by this design document: the direct
 pinned-source audit determines and records the final paths before tests encode
@@ -53,6 +57,11 @@ are invalid with a 36-step history. Any required patch or stride adjustment is
 explicit profile metadata. `label_len=18` is present only for an official API
 that consumes decoder context; an unused four-argument signature alone does not
 justify decoder-history leakage.
+
+Task 3 timestamps are converted to the source `timeF` format before baseline
+forwarding: ETTh1/ETTh2/ECL use four hourly columns and ETTm1/ETTm2/Weather use
+five minute-frequency columns. iTransformer and TimesNet require encoder marks;
+the shared batch path also passes target marks through the decoder-marker API.
 
 ## TimeCMA prompt cache
 
@@ -71,7 +80,9 @@ tests and does not generate real embeddings in this task.
 Time-LLM retains its official per-variable minimum, maximum, median, trend, and
 top-five FFT-autocorrelation-lag prompt and the dataset-specific official prompt
 bank description. The official selected backbone is frozen, and provenance
-records model/tokenizer identifiers and revisions plus precision. No
+records absolute model/tokenizer paths, revisions, requested execution
+precision, and observed backbone dtype. Loader redirection is scoped to one
+constructor and restores exact original Transformers descriptors. No
 GraphReportTS prompt function is imported or reused.
 
 ## Training profiles and evaluation
@@ -81,7 +92,8 @@ contract for a model/dataset/horizon. It separately records source settings and
 formal-protocol overrides so the shared 36-step input, data loader, scaler,
 seeds, paths, and validation-only checkpoint rule cannot be mistaken for source
 defaults. The shared evaluator reports standardized-space MSE and MAE over all
-channels.
+channels. TimeCMA stale failures accumulate before its delayed stop gate; only
+the stop action is suppressed before the gate.
 
 ## Testing
 
