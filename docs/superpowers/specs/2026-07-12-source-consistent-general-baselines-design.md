@@ -58,10 +58,13 @@ explicit profile metadata. `label_len=18` is present only for an official API
 that consumes decoder context; an unused four-argument signature alone does not
 justify decoder-history leakage.
 
-Task 3 timestamps are converted to the source `timeF` format before baseline
-forwarding: ETTh1/ETTh2/ECL use four hourly columns and ETTm1/ETTm2/Weather use
-five minute-frequency columns. iTransformer and TimesNet require encoder marks;
-the shared batch path also passes target marks through the decoder-marker API.
+Task 3 timestamps are converted to the pinned source `timeF` format before
+baseline forwarding. iTransformer and TimesNet formal scripts do not override
+their CLI default `freq='h'`, so all six datasets use the four hourly columns,
+including ETTm1/ETTm2/Weather. This is source-native behavior, not a project
+protocol override; factual cadence remains in dataset schemas and TimeCMA/
+Time-LLM prompts. Both models require encoder marks, and the shared batch path
+also passes target marks through the decoder-marker API.
 
 ## TimeCMA prompt cache
 

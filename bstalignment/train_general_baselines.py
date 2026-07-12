@@ -15,28 +15,20 @@ import numpy as np
 import torch
 
 
-_MINUTE_DATASETS = {"ETTm1", "ETTm2", "Weather"}
-
-
 def source_time_markers(dataset: str, timestamps: Any) -> torch.Tensor:
-    """Build the official THUML ``timeF`` marker columns from Task 3 timestamps."""
+    """Build the pinned iTransformer/TimesNet hourly ``timeF`` columns."""
 
     import pandas as pd
 
     if dataset not in {"ETTm1", "ETTm2", "ETTh1", "ETTh2", "ECL", "Weather"}:
         raise ValueError(f"unknown formal general dataset: {dataset}")
     index = pd.DatetimeIndex(pd.to_datetime(tuple(timestamps), errors="raise"))
-    features = []
-    if dataset in _MINUTE_DATASETS:
-        features.append(index.minute.to_numpy(dtype=np.float32) / 59.0 - 0.5)
-    features.extend(
-        [
-            index.hour.to_numpy(dtype=np.float32) / 23.0 - 0.5,
-            index.dayofweek.to_numpy(dtype=np.float32) / 6.0 - 0.5,
-            (index.day.to_numpy(dtype=np.float32) - 1.0) / 30.0 - 0.5,
-            (index.dayofyear.to_numpy(dtype=np.float32) - 1.0) / 365.0 - 0.5,
-        ]
-    )
+    features = [
+        index.hour.to_numpy(dtype=np.float32) / 23.0 - 0.5,
+        index.dayofweek.to_numpy(dtype=np.float32) / 6.0 - 0.5,
+        (index.day.to_numpy(dtype=np.float32) - 1.0) / 30.0 - 0.5,
+        (index.dayofyear.to_numpy(dtype=np.float32) - 1.0) / 365.0 - 0.5,
+    ]
     return torch.from_numpy(np.stack(features, axis=1).astype(np.float32, copy=False))
 
 

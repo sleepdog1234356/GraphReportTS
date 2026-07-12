@@ -338,10 +338,20 @@ def resolve_general_profile(name: str, dataset: str, pred_len: int) -> GeneralBa
                     "PatchTST_supervised/run_longExp.py:78-85")
     elif canonical == "iTransformer":
         architecture, training = _itransformer_architecture(dataset, pred_len), _itransformer_training(dataset)
-        evidence = ("scripts/multivariate_forecasting: audited dataset script", "experiments/exp_long_term_forecasting.py:32-37,94-177", "run.py:62-68")
+        evidence = (
+            "scripts/multivariate_forecasting: audited dataset script",
+            "run.py:29-30 default freq='h'; formal ETT/ECL/Weather scripts omit --freq; data_provider/data_loader.py:73-75",
+            "experiments/exp_long_term_forecasting.py:32-37,94-177",
+            "run.py:62-68",
+        )
     elif canonical == "TimesNet":
         architecture, training = _timesnet_architecture(dataset, pred_len), _timesnet_training(dataset, pred_len)
-        evidence = ("scripts/long_term_forecast: audited TimesNet dataset script", "exp/exp_long_term_forecasting.py:34-39,88-161", "run.py:57,90-96")
+        evidence = (
+            "scripts/long_term_forecast: audited TimesNet dataset script",
+            "run.py:32-33 default freq='h'; formal ETT/ECL/Weather scripts omit --freq; data_provider/data_loader.py:89-91",
+            "exp/exp_long_term_forecasting.py:34-39,88-161",
+            "run.py:57,90-96",
+        )
     elif canonical == "DLinear":
         architecture, training = _items(individual=False, moving_avg=25), _dlinear_training(dataset, pred_len)
         evidence = (f"scripts/EXP-LongForecasting/Linear/{'electricity' if dataset == 'ECL' else dataset.lower()}.sh",

@@ -51,6 +51,14 @@ output path. No adapter substitutes GraphReportTS prompts for an official baseli
 selected by validation MSE; the shared evaluator reports standardized-space
 MSE and MAE.
 
+One surprising pinned behavior is source-native, not a shared-protocol
+override: iTransformer and TimesNet retain their script default `freq='h'` for
+all six datasets. This includes ETTm1, ETTm2, and Weather even though their
+factual cadence is measured in minutes. The formal profiles therefore retain
+`freq='h'`, and their executable marker path supplies four hourly `timeF`
+columns for every dataset. Dataset-schema cadence and the factual cadence text
+used by TimeCMA and Time-LLM prompts are unchanged.
+
 | Baseline | Official source frozen in manifest | Source implementation and loader | Source-native optimization | Prompt |
 | --- | --- | --- | --- | --- |
 | PatchTST | `yuqinie98/PatchTST` @ `204c21e` | `PatchTST_supervised/models/PatchTST.py:15-92` (`Model`) | Adam + MSE. ETTm1/2: batch OneCycle, pct_start 0.4, 100 epochs, patience 20. ECL: batch OneCycle, pct_start 0.2, 100 epochs, patience 10. ETTh1/2: source-default type3 epoch decay, 100 epochs, patience 100. Weather: type3, 100 epochs, patience 20. | None |
@@ -69,9 +77,9 @@ update or a changed comparison contract cannot silently alter a formal table.
 ## Exact script evidence
 
 - PatchTST dataset architecture and scheduler flags: `PatchTST_supervised/scripts/PatchTST/etth1.sh:8-42`, `etth2.sh:8-42`, `ettm1.sh:8-45`, `ettm2.sh:8-45`, `electricity.sh:8-45`, and `weather.sh:8-43`. Defaults are `run_longExp.py:78-85`; Adam/MSE, OneCycle construction, batch stepping, and non-TST epoch adjustment are `exp/exp_main.py:47-52,112-124,193-212`.
-- iTransformer architecture: `scripts/multivariate_forecasting/ETT/iTransformer_ETTh1.sh:13-78`, corresponding ETTh2/ETTm1/ETTm2 scripts at the same blocks, `ECL/iTransformer.sh:13-88`, and `Weather/iTransformer.sh:13-81`. Defaults are `run.py:43-68`; Adam/MSE and epoch adjustment are `experiments/exp_long_term_forecasting.py:32-37,94-177`.
+- iTransformer architecture: `scripts/multivariate_forecasting/ETT/iTransformer_ETTh1.sh:13-78`, corresponding ETTh2/ETTm1/ETTm2 scripts at the same blocks, `ECL/iTransformer.sh:13-88`, and `Weather/iTransformer.sh:13-81`. None of those scripts supplies `--freq`, so `run.py:29-30` retains `freq='h'`; `data_provider/data_loader.py:73-75` passes it to `time_features`, whose hourly mapping is four columns at `utils/timefeatures.py:106-113,124-128,147-148`. Training defaults are `run.py:43-68`; Adam/MSE and epoch adjustment are `experiments/exp_long_term_forecasting.py:32-37,94-177`.
 - TimeCMA dataset/horizon settings: `scripts/ETTm1.sh:11-99`, `ETTm2.sh:11-96`, `ETTh1.sh:11-99`, `ETTh2.sh:11-96`, `ECL.sh:11-96`, and `Weather.sh:11-100`. Optimizer, cosine, and clipping are `train.py:51-90`; validation/test checkpoint behavior and delayed stop are `train.py:233-299`. The adapter intentionally replaces the source's test-dependent save branch with validation-MSE-only selection.
-- TimesNet architecture/epoch overrides: `scripts/long_term_forecast/ETT_script/TimesNet_ETTh1.sh:14-102`, corresponding ETTh2/ETTm1/ETTm2 scripts, `ECL_script/TimesNet.sh:14-97`, and `Weather_script/TimesNet.sh:14-102`. Defaults are `run.py:57,90-96`; Adam/MSE and type1 stepping are `exp/exp_long_term_forecasting.py:34-39,88-161` and `utils/tools.py:12-29`.
+- TimesNet architecture/epoch overrides: `scripts/long_term_forecast/ETT_script/TimesNet_ETTh1.sh:14-102`, corresponding ETTh2/ETTm1/ETTm2 scripts, `ECL_script/TimesNet.sh:14-97`, and `Weather_script/TimesNet.sh:14-102`. None of those scripts supplies `--freq`, so `run.py:32-33` retains `freq='h'`; `data_provider/data_loader.py:89-91` passes it to the same four-column hourly mapping at `utils/timefeatures.py:106-113,124-128,147-148`. Training defaults are `run.py:57,90-96`; Adam/MSE and type1 stepping are `exp/exp_long_term_forecasting.py:34-39,88-161` and `utils/tools.py:12-29`.
 - DLinear architecture and learning rates: `models/DLinear.py:38-87` and `scripts/EXP-LongForecasting/Linear/{etth1,etth2,ettm1,ettm2,electricity,weather}.sh:9-66`. Defaults are `run_longExp.py:66-72`; Adam/MSE and type1 stepping are `exp/exp_main.py:46-51,112-205`.
 - Time-LLM architecture/training: `scripts/TimeLLM_ETTm1.sh:2-124`, `TimeLLM_ETTm2.sh:2-121`, `TimeLLM_ETTh1.sh:2-116`, `TimeLLM_ETTh2.sh:2-120`, `TimeLLM_ECL.sh:2-107`, and `TimeLLM_Weather.sh:2-115`. Defaults and frozen-backbone construction are `run_main.py:55-99` and `models/TimeLLM.py:43-164`; optimizer/scheduler stepping is `run_main.py:145-164,236-264`. Exact descriptions are `dataset/prompt_bank/{ETT,ECL,Weather}.txt`.
 
@@ -96,11 +104,18 @@ iTransformer and TimesNet both use the shared THUML `time_features` implementati
 `[time, feature]` and return both encoder and decoder markers
 (`iTransformer/data_provider/data_loader.py:74-90,164-180,262-278` and
 `TimesNet/data_provider/data_loader.py:90-110,192-212,302-322`). The project
-baseline collator now reproduces the four hourly columns or five minute columns
-from Task 3 timestamps and carries them to the official forward arguments.
+baseline collator reproduces the pinned script behavior: four hourly columns
+for every formal dataset, including ETTm1, ETTm2, and Weather, and carries them
+to the official forward arguments. This does not alter factual cadence in Task 3
+schemas or TimeCMA/Time-LLM prompts.
 
 Time-LLM local-path redirection is constructor-scoped. Exact original
 `from_pretrained` descriptors are restored in `finally`; runtime provenance
 records resolved paths, revisions, requested precision, and observed backbone
 dtype. TimeCMA early-stop failures accumulate continuously, matching
 `train.py:289-299`, while the half-epoch condition gates only the break action.
+
+`train_general_baselines` intentionally imports NumPy and PyTorch eagerly
+because it is the executable trainer contract. Official source repositories,
+Transformers, model weights, and CUDA initialization remain lazy and are the
+scope of its import-safety test.

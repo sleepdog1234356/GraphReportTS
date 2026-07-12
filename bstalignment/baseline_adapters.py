@@ -438,7 +438,6 @@ def _source_config(profile: Any, num_features: int) -> SimpleNamespace:
         "prompt_domain": 1,
     }
     values.update(profile.architecture)
-    values["freq"] = "t" if profile.dataset in {"ETTm1", "ETTm2", "Weather"} else "h"
     if profile.name == "Time-LLM":
         try:
             from .general_baseline_profiles import time_llm_description
@@ -541,7 +540,7 @@ def _general_adapter_type():
             if self.profile.name == "PatchTST":
                 output = self.model(x)
             elif self.profile.name in {"iTransformer", "TimesNet"}:
-                expected_dim = 5 if self.profile.dataset in {"ETTm1", "ETTm2", "Weather"} else 4
+                expected_dim = 4
                 if time_mark is None:
                     raise ValueError(f"{self.profile.name} requires source-format encoder time markers")
                 if tuple(time_mark.shape) != (x.shape[0], self.profile.seq_len, expected_dim):

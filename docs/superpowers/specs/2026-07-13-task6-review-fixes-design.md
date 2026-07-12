@@ -8,14 +8,16 @@ identities, battery behavior, or the no-training/no-CUDA/no-weights scope.
 ## Timestamp flow
 
 Task 3 remains the source of split windows, scaling, and raw timestamps. A
-general-baseline collation helper converts those timestamps to the exact THUML
-`timeF` representation audited in both iTransformer and TimesNet
-`utils/timefeatures.py:34-148`: hourly datasets use hour/day-of-week/day-of-month/
-day-of-year (four columns), while ETTm1, ETTm2, and Weather add minute-of-hour
-(five columns). Encoder and target markers are retained in the batch and passed
-through one general-baseline forward helper. iTransformer and TimesNet reject a
-missing encoder marker instead of silently receiving `None`; available target
-markers are passed as the official decoder-marker argument.
+general-baseline collation helper converts those timestamps to the exact pinned
+iTransformer/TimesNet `timeF` behavior. Their formal scripts do not override the
+CLI default `freq='h'`, so all six datasets receive hour/day-of-week/day-of-month/
+day-of-year (four columns), including ETTm1, ETTm2, and Weather. This surprising
+choice is source-native rather than a project protocol override; factual cadence
+remains in schemas and text prompts. Encoder and target markers are retained in
+the batch and passed through one general-baseline forward helper. iTransformer
+and TimesNet reject a missing encoder marker instead of silently receiving
+`None`; available target markers are passed as the official decoder-marker
+argument.
 
 ## Scoped Time-LLM loading
 
@@ -51,11 +53,10 @@ Epoch scheduler behavior remains in the existing one-based helper.
 
 ## Import-safety boundary
 
-`train_general_baselines` eagerly imports NumPy and PyTorch because it is an
-executable training-contract module. Import safety means it imports no official
-external source package, Transformers module, model weights, or CUDA context.
-Tests assert that precise boundary instead of claiming the trainer has no heavy
-core numerical imports.
+`train_general_baselines` intentionally imports NumPy and PyTorch eagerly
+because it is an executable training-contract module. Its lazy boundary covers
+official external source packages, Transformers, model weights, and CUDA
+initialization; tests assert only that boundary.
 
 ## Tests and scope
 

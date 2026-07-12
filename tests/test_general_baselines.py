@@ -146,6 +146,26 @@ class GeneralBaselineProfileTests(unittest.TestCase):
         ecl = resolve_general_profile("iTransformer", "ECL", 720)
         self.assertEqual((ecl.architecture["e_layers"], ecl.training.lr, ecl.training.batch_size), (3, 5e-4, 16))
 
+    def test_itransformer_and_timesnet_preserve_pinned_hourly_timef_default_for_all_datasets(self):
+        self.require_profiles()
+        expected_evidence = {
+            "iTransformer": (
+                "run.py:29-30 default freq='h'; formal ETT/ECL/Weather scripts omit --freq; "
+                "data_provider/data_loader.py:73-75"
+            ),
+            "TimesNet": (
+                "run.py:32-33 default freq='h'; formal ETT/ECL/Weather scripts omit --freq; "
+                "data_provider/data_loader.py:89-91"
+            ),
+        }
+        for model in expected_evidence:
+            for dataset in FORMAL_DATASETS:
+                with self.subTest(model=model, dataset=dataset):
+                    profile = resolve_general_profile(model, dataset, 96)
+                    self.assertEqual(profile.architecture["freq"], "h")
+                    self.assertNotIn("freq", profile.protocol_overrides)
+                    self.assertIn(expected_evidence[model], profile.source_evidence)
+
     def test_timesnet_profiles_preserve_source_epoch_exceptions(self):
         self.require_profiles()
         self.assertEqual(resolve_general_profile("TimesNet", "ETTm1", 336).training.max_epochs, 3)
@@ -347,11 +367,10 @@ class GeneralBaselineAdapterTests(unittest.TestCase):
                             if model == "TimeCMA":
                                 output = adapter(x, prompt_embeddings=torch.zeros(1, 768, num_features))
                             elif model in {"iTransformer", "TimesNet"}:
-                                mark_dim = 5 if dataset in {"ETTm1", "ETTm2", "Weather"} else 4
                                 output = adapter(
                                     x,
-                                    time_mark=torch.zeros(1, 36, mark_dim),
-                                    decoder_time_mark=torch.zeros(1, horizon, mark_dim),
+                                    time_mark=torch.zeros(1, 36, 4),
+                                    decoder_time_mark=torch.zeros(1, horizon, 4),
                                 )
                             else:
                                 output = adapter(x)
@@ -363,8 +382,7 @@ class GeneralBaselineAdapterTests(unittest.TestCase):
                                 self.assertEqual(adapter.model.configs.enc_in, num_features)
                                 self.assertEqual(adapter.model.configs.c_out, num_features)
                                 if model in {"iTransformer", "TimesNet"}:
-                                    expected_freq = "t" if dataset in {"ETTm1", "ETTm2", "Weather"} else "h"
-                                    self.assertEqual(adapter.model.configs.freq, expected_freq)
+                                    self.assertEqual(adapter.model.configs.freq, "h")
                             self.assertEqual(adapter.source_identity.commit, SOURCES[model][1])
                             self.assertEqual(adapter.prompt_policy, SOURCES[model][4])
 
@@ -687,7 +705,7 @@ class GeneralTrainingContractTests(unittest.TestCase):
         patch_scheduler = build_general_scheduler(patch_optimizer, patch, steps_per_epoch=2)
         self.assertIsInstance(patch_scheduler, torch.optim.lr_scheduler.OneCycleLR)
 
-    def test_source_time_markers_match_official_hourly_and_minute_cadence_dimensions(self):
+    def test_source_time_markers_match_pinned_hourly_default_for_all_datasets(self):
         self.assertIsNotNone(source_time_markers, "source-format time marker helper must exist")
         hourly = [datetime(2020, 1, 1) + timedelta(hours=index) for index in range(36)]
         minute = [datetime(2020, 1, 1) + timedelta(minutes=15 * index) for index in range(36)]
@@ -695,16 +713,51 @@ class GeneralTrainingContractTests(unittest.TestCase):
         minute_mark = source_time_markers("ETTm1", minute)
         weather_mark = source_time_markers("Weather", minute)
         self.assertEqual(tuple(hourly_mark.shape), (36, 4))
-        self.assertEqual(tuple(minute_mark.shape), (36, 5))
-        self.assertEqual(tuple(weather_mark.shape), (36, 5))
+        self.assertEqual(tuple(minute_mark.shape), (36, 4))
+        self.assertEqual(tuple(weather_mark.shape), (36, 4))
         torch.testing.assert_close(
             hourly_mark[0],
             torch.tensor([-0.5, 2 / 6 - 0.5, -0.5, -0.5], dtype=torch.float32),
         )
         torch.testing.assert_close(
             minute_mark[0],
-            torch.tensor([-0.5, -0.5, 2 / 6 - 0.5, -0.5, -0.5], dtype=torch.float32),
+            torch.tensor([-0.5, 2 / 6 - 0.5, -0.5, -0.5], dtype=torch.float32),
         )
+
+    def test_minute_cadence_datasets_execute_with_pinned_four_column_markers(self):
+        self.assertIsNotNone(collate_general_baseline_batch, "baseline timestamp collator must exist")
+        self.assertIsNotNone(forward_general_baseline_batch, "baseline batch forward helper must exist")
+        cadence_minutes = {"ETTm1": 15, "ETTm2": 15, "Weather": 10}
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            _fake_source_tree(root)
+            args = SimpleNamespace(external_root=root, pred_len=96, verify_source_commit=False)
+            for dataset, cadence in cadence_minutes.items():
+                history = tuple(
+                    datetime(2020, 1, 1) + timedelta(minutes=cadence * index) for index in range(36)
+                )
+                target = tuple(
+                    datetime(2020, 1, 1) + timedelta(minutes=cadence * (36 + index)) for index in range(96)
+                )
+                sample = {
+                    "series_id": dataset,
+                    "history_scaled": torch.randn(36, 2),
+                    "target_scaled": torch.randn(96, 2),
+                    "timestamp_markers": {"history": history, "target": target},
+                    "start_index": 0,
+                    "columns": ("a", "b"),
+                }
+                batch = collate_general_baseline_batch([sample])
+                self.assertEqual(tuple(batch["x_mark"].shape), (1, 36, 4))
+                self.assertEqual(tuple(batch["y_mark"].shape), (1, 96, 4))
+                for model in ("iTransformer", "TimesNet"):
+                    with self.subTest(model=model, dataset=dataset):
+                        adapter = build_general_baseline(model, {"name": dataset, "num_features": 2}, args)
+                        output = forward_general_baseline_batch(adapter, batch)
+                        self.assertEqual(tuple(output.shape), (1, 96, 2))
+                        self.assertEqual(adapter.model.configs.freq, "h")
+                        torch.testing.assert_close(adapter.model.last_encoder_mark, batch["x_mark"])
+                        torch.testing.assert_close(adapter.model.last_decoder_mark, batch["y_mark"])
 
     def test_task3_timestamp_collation_reaches_official_marker_forward_arguments(self):
         self.assertIsNotNone(collate_general_baseline_batch, "baseline timestamp collator must exist")
@@ -720,8 +773,8 @@ class GeneralTrainingContractTests(unittest.TestCase):
             "columns": ("a", "b"),
         }
         batch = collate_general_baseline_batch([sample])
-        self.assertEqual(tuple(batch["x_mark"].shape), (1, 36, 5))
-        self.assertEqual(tuple(batch["y_mark"].shape), (1, 96, 5))
+        self.assertEqual(tuple(batch["x_mark"].shape), (1, 36, 4))
+        self.assertEqual(tuple(batch["y_mark"].shape), (1, 96, 4))
         with TemporaryDirectory() as directory:
             root = Path(directory)
             _fake_source_tree(root)
