@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -173,7 +173,7 @@ class VariableGraphEncoder(nn.Module):
         self,
         maps: torch.Tensor,
         variable_mask: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Dict[str, Any]:
         if maps.ndim != 5:
             raise ValueError(f"Expected variable maps [B,C,V,H,W], got {tuple(maps.shape)}")
         batch_size, variables, views, height, width = maps.shape
@@ -187,11 +187,17 @@ class VariableGraphEncoder(nn.Module):
         flat_maps = maps.reshape(batch_size * variables, views, height, width)
         valid_indices = torch.nonzero(variable_mask.reshape(-1), as_tuple=False).squeeze(-1)
         encoded_chunks = []
-        graph_attn = None
+        chunk_count = 0
+        max_chunk_variables = 0
+        nodes_per_variable = 0
         for indices in valid_indices.split(self.variable_chunk_size):
             encoded = self.map_encoder(flat_maps.index_select(0, indices))
             encoded_chunks.append(encoded["repr"])
-            graph_attn = encoded["graph_attn"]
+            chunk_count += 1
+            max_chunk_variables = max(max_chunk_variables, int(indices.numel()))
+            attention = encoded["graph_attn"]
+            if torch.is_tensor(attention):
+                nodes_per_variable = max(nodes_per_variable, int(attention.size(-1)))
         flat_tokens = maps.new_zeros(batch_size * variables, self.d_model)
         if encoded_chunks:
             flat_tokens = flat_tokens.index_copy(0, valid_indices, torch.cat(encoded_chunks, dim=0))
@@ -202,7 +208,13 @@ class VariableGraphEncoder(nn.Module):
         return {
             "tokens": tokens,
             "repr": self.norm(pooled),
-            "graph_attn": graph_attn,
+            "variable_mask": variable_mask,
+            "graph_attn": {
+                "mode": "chunked_summary",
+                "chunk_count": chunk_count,
+                "max_chunk_variables": max_chunk_variables,
+                "nodes_per_variable": nodes_per_variable,
+            },
             "pool_weight": weights / weights.sum(dim=1, keepdim=True).clamp_min(1.0),
         }
 
@@ -223,7 +235,14 @@ class CrossModalFusion(nn.Module):
         graph_repr: torch.Tensor,
         text_tokens: torch.Tensor,
         text_mask: Optional[torch.Tensor],
+        graph_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
+        if graph_mask is None:
+            graph_mask = torch.ones(graph_tokens.shape[:2], dtype=torch.bool, device=graph_tokens.device)
+        if tuple(graph_mask.shape) != tuple(graph_tokens.shape[:2]):
+            raise ValueError(f"Expected graph mask {tuple(graph_tokens.shape[:2])}, got {tuple(graph_mask.shape)}")
+        graph_mask = graph_mask.to(device=graph_tokens.device, dtype=torch.bool)
+        graph_weight = graph_mask.to(graph_tokens.dtype).unsqueeze(-1)
         q = self.q(graph_tokens)
         k = self.k(text_tokens)
         v = self.v(text_tokens)
@@ -231,9 +250,11 @@ class CrossModalFusion(nn.Module):
         if text_mask is not None:
             scores = scores.masked_fill(~text_mask.unsqueeze(1), -1e4)
         attn = torch.softmax(scores, dim=-1)
+        attn = attn * graph_weight
         retrieved = torch.matmul(attn, v)
-        fused_tokens = graph_tokens + self.out(retrieved)
-        context = fused_tokens.mean(dim=1) + graph_repr
+        fused_tokens = (graph_tokens + self.out(retrieved)) * graph_weight
+        pooled = fused_tokens.sum(dim=1) / graph_weight.sum(dim=1).clamp_min(1.0)
+        context = pooled + graph_repr
         return {"tokens": fused_tokens, "context": context, "cross_attn": attn}
 
 
@@ -427,6 +448,58 @@ class SeparateNowFutureDecoder(nn.Module):
         return torch.where((step == 0).unsqueeze(-1), now.expand_as(future), future)
 
 
+class VariableQueryDecoder(nn.Module):
+    """Decode each variable with one shared token-conditioned scalar future head."""
+
+    def __init__(self, d_model: int, max_steps: int = 1024, dropout: float = 0.1):
+        super().__init__()
+        self.step_embed = nn.Embedding(max_steps + 1, d_model)
+        self.step_query = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+        )
+        self.variable_key = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+        )
+        self.variable_bias = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 1),
+        )
+
+    def forward(
+        self,
+        context: torch.Tensor,
+        variable_tokens: torch.Tensor,
+        steps: torch.Tensor,
+        variable_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if steps.ndim == 1:
+            step = steps.unsqueeze(0).expand(context.size(0), -1)
+        else:
+            step = steps
+        step = step.to(context.device).long().clamp(min=0, max=self.step_embed.num_embeddings - 1)
+        query = self.step_query(context.unsqueeze(1) + self.step_embed(step))
+        key = self.variable_key(variable_tokens)
+        prediction = torch.matmul(query, key.transpose(-1, -2)) / math.sqrt(query.size(-1))
+        prediction = prediction + self.variable_bias(variable_tokens).transpose(1, 2)
+        if variable_mask is not None:
+            if tuple(variable_mask.shape) != tuple(variable_tokens.shape[:2]):
+                raise ValueError(
+                    f"Expected variable mask {tuple(variable_tokens.shape[:2])}, got {tuple(variable_mask.shape)}"
+                )
+            prediction = prediction.masked_fill(~variable_mask.to(device=prediction.device).unsqueeze(1), 0.0)
+        return prediction
+
+
 @dataclass
 class GraphReportTSConfig:
     variant: str = "battery"  # battery or general
@@ -514,8 +587,11 @@ class GraphReportTS(nn.Module):
             nn.Linear(cfg.d_model, cfg.d_model),
         )
         self.context_norm = nn.LayerNorm(cfg.d_model)
-        decoder_cls = UnifiedQueryDecoder if cfg.unified_decoder else SeparateNowFutureDecoder
-        self.decoder = decoder_cls(cfg.d_model, cfg.output_dim, cfg.max_steps, cfg.dropout)
+        if cfg.variant == "general" and not cfg.legacy_general_graph:
+            self.variable_decoder = VariableQueryDecoder(cfg.d_model, cfg.max_steps, cfg.dropout)
+        else:
+            decoder_cls = UnifiedQueryDecoder if cfg.unified_decoder else SeparateNowFutureDecoder
+            self.decoder = decoder_cls(cfg.d_model, cfg.output_dim, cfg.max_steps, cfg.dropout)
 
     def _encode_graph_history(
         self,
@@ -557,8 +633,12 @@ class GraphReportTS(nn.Module):
         steps: Optional[torch.Tensor] = None,
         history_features: Optional[torch.Tensor] = None,
         variable_mask: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Dict[str, Any]:
         graph_context, graph_cycle_tokens, graph = self._encode_graph_history(maps, variable_mask)
+        scalable_general = self.cfg.variant == "general" and not self.cfg.legacy_general_graph
+        if scalable_general:
+            variable_mask = graph["variable_mask"]
+        variable_tokens = graph_cycle_tokens
         if history_features is not None and self.cfg.use_numeric_history:
             numeric_context, numeric_tokens = self.numeric_history_encoder(history_features)
         else:
@@ -576,6 +656,12 @@ class GraphReportTS(nn.Module):
             text_tokens, text_repr, text_mask = self.text_encoder(prompts)
             if self.cfg.variant == "battery":
                 fused = self.semantic_fusion(context, query_tokens, text_tokens, text_mask)
+            elif scalable_general:
+                fused = self.fusion(variable_tokens, context, text_tokens, text_mask, variable_mask)
+                variable_tokens = fused["tokens"]
+                fused["gate"] = torch.ones(context.size(0), 1, dtype=context.dtype, device=context.device)
+                fused["align_graph"] = fused["context"]
+                fused["align_text"] = text_repr
             else:
                 fused = self.fusion(graph["tokens"], graph["repr"], text_tokens, text_mask)
                 fused["gate"] = torch.ones(context.size(0), 1, dtype=context.dtype, device=context.device)
@@ -594,7 +680,10 @@ class GraphReportTS(nn.Module):
                 max_h = int(horizon.max().item())
             start = 1 if (self.cfg.variant == "battery" and self.cfg.use_relative_steps) else 1
             steps = torch.arange(start, max_h + start, device=maps.device)
-        pred = self.decoder(context, steps)
+        if scalable_general:
+            pred = self.variable_decoder(context, variable_tokens, steps, variable_mask)
+        else:
+            pred = self.decoder(context, steps)
         return {
             "pred": pred,
             "context": context,

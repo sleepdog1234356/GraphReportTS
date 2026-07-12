@@ -94,20 +94,25 @@ def build_loader(args, ckpt):
     return DataLoader(ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_general_graph_batch), variant, dataset
 
 
+def forward_inference_batch(model, batch, variant: str):
+    steps = batch["target_steps"] if variant == "battery" and not model.cfg.use_relative_steps else None
+    return model(
+        batch["maps"],
+        batch["prompt"],
+        batch["horizon"],
+        steps=steps,
+        history_features=batch.get("history_features"),
+        variable_mask=batch.get("variable_mask"),
+    )
+
+
 @torch.no_grad()
 def collect_predictions(model, loader, device, variant: str) -> tuple[pd.DataFrame, dict]:
     rows = []
     mse_sum = mae_sum = count = 0.0
     for batch in loader:
         batch = to_device(batch, device)
-        steps = batch["target_steps"] if variant == "battery" and not model.cfg.use_relative_steps else None
-        out = model(
-            batch["maps"],
-            batch["prompt"],
-            batch["horizon"],
-            steps=steps,
-            history_features=batch.get("history_features"),
-        )
+        out = forward_inference_batch(model, batch, variant)
         metrics = regression_metrics(out["pred"], batch["y"], batch["mask"])
         elems = float(batch["mask"].sum().detach().cpu())
         mse_sum += metrics["mse"] * elems
@@ -208,14 +213,7 @@ def main():
         loader, variant, dataset = build_loader(args, ckpt)
         init_batch = next(iter(loader))
         init_batch = to_device(init_batch, device)
-        init_steps = init_batch["target_steps"] if variant == "battery" and not model.cfg.use_relative_steps else None
-        _ = model(
-            init_batch["maps"],
-            init_batch["prompt"],
-            init_batch["horizon"],
-            steps=init_steps,
-            history_features=init_batch.get("history_features"),
-        )
+        _ = forward_inference_batch(model, init_batch, variant)
     model.load_state_dict(ckpt["model"])
     model.eval()
     out_dir = ensure_dir(args.out_dir or Path(args.checkpoint).with_suffix("").parent / "figures")

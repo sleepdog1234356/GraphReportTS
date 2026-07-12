@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import inspect
 import math
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 import torch
 
 import bstalignment.graph_report_model as graph_model
+import bstalignment.infer_graph_report as graph_inference
 import bstalignment.raw_signal as raw_signal
 from bstalignment.data_general import collate_general_graph_batch
 from bstalignment.train_graph_report import parse_args
@@ -40,7 +43,11 @@ def _sample(variable_count: int, horizon: int = 96) -> dict[str, object]:
     }
 
 
-def _general_model(variable_count: int, chunk_size: int = 32) -> graph_model.GraphReportTS:
+def _general_model(
+    variable_count: int,
+    chunk_size: int = 32,
+    use_prompt: bool = False,
+) -> graph_model.GraphReportTS:
     config = graph_model.GraphReportTSConfig(
         variant="general",
         output_dim=variable_count,
@@ -51,8 +58,8 @@ def _general_model(variable_count: int, chunk_size: int = 32) -> graph_model.Gra
         graph_layers=1,
         topk_edges=2,
         dropout=0.0,
-        use_report_prompt=False,
-        use_cross_modal_fusion=False,
+        use_report_prompt=use_prompt,
+        use_cross_modal_fusion=use_prompt,
         use_hf_text_encoder=False,
         use_numeric_history=False,
         variable_chunk_size=chunk_size,
@@ -139,6 +146,28 @@ class VariableGraphEncoderTests(unittest.TestCase):
         self.assertEqual(len(observed_batches), math.ceil(321 / chunk_size))
         self.assertLessEqual(max(observed_batches), chunk_size)
 
+    def test_chunk_size_does_not_change_predictions_and_diagnostic_is_bounded_summary(self):
+        torch.manual_seed(11)
+        maps = torch.randn(1, 5, 3, 4, 8)
+        variable_mask = torch.ones(1, 5, dtype=torch.bool)
+        chunk_one = _general_model(5, chunk_size=1)
+        chunk_four = _general_model(5, chunk_size=4)
+        with torch.inference_mode():
+            chunk_one(maps, ["forecast"], torch.tensor([6]), variable_mask=variable_mask)
+            chunk_four(maps, ["forecast"], torch.tensor([6]), variable_mask=variable_mask)
+        chunk_four.load_state_dict(chunk_one.state_dict())
+
+        with torch.inference_mode():
+            one = chunk_one(maps, ["forecast"], torch.tensor([6]), variable_mask=variable_mask)
+            four = chunk_four(maps, ["forecast"], torch.tensor([6]), variable_mask=variable_mask)
+
+        torch.testing.assert_close(one["pred"], four["pred"], rtol=1e-5, atol=1e-6)
+        self.assertIsInstance(one["graph_attn"], dict)
+        self.assertEqual(one["graph_attn"]["mode"], "chunked_summary")
+        self.assertEqual(one["graph_attn"]["chunk_count"], 5)
+        self.assertEqual(four["graph_attn"]["chunk_count"], 2)
+        self.assertNotIn("attention", one["graph_attn"])
+
 
 class GeneralGraphReportShapeTests(unittest.TestCase):
     def test_formal_horizons_retain_every_variable(self):
@@ -215,6 +244,133 @@ class GeneralGraphReportShapeTests(unittest.TestCase):
         self.assertFalse(scalable.legacy_general_graph)
         self.assertEqual(scalable.variable_chunk_size, 32)
         self.assertTrue(legacy.legacy_general_graph)
+
+
+class GeneralVariableIdentityTests(unittest.TestCase):
+    def test_prompt_path_is_permutation_equivariant(self):
+        torch.manual_seed(17)
+        model = _general_model(4, chunk_size=2, use_prompt=True)
+        maps = torch.randn(1, 4, 3, 4, 8)
+        variable_mask = torch.tensor([[True, True, False, True]])
+        permutation = torch.tensor([3, 0, 2, 1])
+
+        with torch.inference_mode():
+            original = model(maps, ["forecast every variable"], 7, variable_mask=variable_mask)
+            permuted = model(
+                maps.index_select(1, permutation),
+                ["forecast every variable"],
+                7,
+                variable_mask=variable_mask.index_select(1, permutation),
+            )
+
+        inverse_permutation = torch.argsort(permutation)
+        torch.testing.assert_close(
+            permuted["pred"].index_select(-1, inverse_permutation),
+            original["pred"],
+            rtol=1e-5,
+            atol=1e-6,
+        )
+        torch.testing.assert_close(permuted["context"], original["context"], rtol=1e-5, atol=1e-6)
+
+    def test_identical_variable_inputs_have_identical_output_channels(self):
+        torch.manual_seed(19)
+        model = _general_model(3, use_prompt=True)
+        one_variable = torch.randn(1, 1, 3, 4, 8)
+        maps = one_variable.expand(-1, 3, -1, -1, -1).clone()
+
+        with torch.inference_mode():
+            pred = model(maps, ["forecast every variable"], 5, variable_mask=torch.ones(1, 3, dtype=torch.bool))[
+                "pred"
+            ]
+
+        torch.testing.assert_close(pred[..., 0], pred[..., 1])
+        torch.testing.assert_close(pred[..., 1], pred[..., 2])
+
+    def test_full_prompt_path_ignores_padded_variable_slots(self):
+        torch.manual_seed(23)
+        model = _general_model(5, chunk_size=2, use_prompt=True)
+        valid_maps = torch.randn(1, 3, 3, 4, 8)
+        padded_maps = torch.cat([valid_maps, torch.randn(1, 2, 3, 4, 8) * 100.0], dim=1)
+        valid_mask = torch.ones(1, 3, dtype=torch.bool)
+        padded_mask = torch.tensor([[True, True, True, False, False]])
+
+        with torch.inference_mode():
+            valid = model(valid_maps, ["forecast every variable"], 6, variable_mask=valid_mask)
+            padded = model(padded_maps, ["forecast every variable"], 6, variable_mask=padded_mask)
+
+        self.assertEqual(tuple(valid["pred"].shape), (1, 6, 3))
+        self.assertEqual(tuple(padded["pred"].shape), (1, 6, 5))
+        torch.testing.assert_close(padded["pred"][..., :3], valid["pred"], rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(padded["context"], valid["context"], rtol=1e-5, atol=1e-6)
+        torch.testing.assert_close(padded["cross_attn"][:, :3], valid["cross_attn"], rtol=1e-5, atol=1e-6)
+        self.assertEqual(torch.count_nonzero(padded["pred"][..., 3:]).item(), 0)
+
+    def test_backward_reaches_each_valid_variable_and_shared_future_head(self):
+        torch.manual_seed(29)
+        model = _general_model(4, chunk_size=2)
+        maps = torch.randn(1, 4, 3, 4, 8, requires_grad=True)
+        variable_mask = torch.tensor([[True, True, True, False]])
+
+        output = model(maps, ["forecast"], 4, variable_mask=variable_mask)
+        output["pred"].square().sum().backward()
+
+        self.assertTrue(hasattr(model, "variable_decoder"))
+        valid_gradient = maps.grad[:, :3].abs().flatten(2).sum(dim=-1)
+        self.assertTrue(torch.all(valid_gradient > 0))
+        self.assertEqual(torch.count_nonzero(maps.grad[:, 3:]).item(), 0)
+        for parameter in model.variable_decoder.parameters():
+            if parameter.requires_grad:
+                self.assertIsNotNone(parameter.grad)
+                self.assertTrue(torch.isfinite(parameter.grad).all())
+        self.assertGreater(
+            sum(float(parameter.grad.abs().sum()) for parameter in model.variable_decoder.parameters()),
+            0.0,
+        )
+
+
+class GeneralInferenceMaskTests(unittest.TestCase):
+    class RecordingModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.cfg = SimpleNamespace(use_relative_steps=True)
+            self.variable_mask = None
+
+        def forward(
+            self,
+            maps,
+            prompts,
+            horizon,
+            steps=None,
+            history_features=None,
+            variable_mask=None,
+        ):
+            self.variable_mask = variable_mask
+            return {"pred": maps.new_zeros(maps.size(0), int(horizon.max()), maps.size(1))}
+
+    def test_prediction_collection_forwards_general_variable_mask(self):
+        model = self.RecordingModel()
+        variable_mask = torch.tensor([[True, True, False]])
+        batch = {
+            "maps": torch.zeros(1, 3, 3, 4, 8),
+            "variable_mask": variable_mask,
+            "prompt": ["forecast"],
+            "horizon": torch.tensor([2]),
+            "y": torch.zeros(1, 2, 3),
+            "mask": torch.tensor([[[True, True, False], [True, True, False]]]),
+            "target_steps": torch.tensor([[36, 37]]),
+            "series_id": ["synthetic"],
+            "start_index": torch.tensor([0]),
+        }
+
+        graph_inference.collect_predictions(model, [batch], torch.device("cpu"), "general")
+
+        self.assertIs(model.variable_mask, variable_mask)
+
+    def test_inference_lazy_initialization_uses_the_shared_mask_forwarding_helper(self):
+        helper = getattr(graph_inference, "forward_inference_batch", None)
+        self.assertIsNotNone(helper)
+        source = inspect.getsource(graph_inference.main)
+        self.assertIn("forward_inference_batch(model, init_batch, variant)", source)
 
 
 class CudaECLSmokeTests(unittest.TestCase):
