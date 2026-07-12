@@ -60,7 +60,7 @@ def parse_args():
     p.add_argument("--dataset", type=str, default="mit")
     p.add_argument("--data_root", type=str, default="bstalignment/data")
     p.add_argument("--out_dir", type=str, default="runs/graph_report_ts")
-    p.add_argument("--input_len", type=int, default=96)
+    p.add_argument("--input_len", type=int)
     p.add_argument("--pred_len", type=int, default=20)
     p.add_argument("--history_len", type=int, default=32)
     p.add_argument("--resample_len", type=int, default=128)
@@ -112,6 +112,8 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = p.parse_args()
+    if args.input_len is None:
+        args.input_len = 36 if args.variant == "general" else 96
     if args.batch_size is None:
         args.batch_size = 64 if args.variant == "battery" else 32
     return args
