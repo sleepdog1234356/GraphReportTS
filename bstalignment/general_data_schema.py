@@ -135,6 +135,11 @@ def validate_frame(schema: DatasetSchema, frame: pd.DataFrame) -> ValidatedFrame
         raise ValueError(f"{schema.name} timestamps violate expected frequency {schema.frequency}")
 
     value_columns = tuple(str(column) for column in frame.columns[1:])
+    if len(value_columns) != schema.expected_feature_count:
+        raise ValueError(
+            f"{schema.name} requires {schema.expected_feature_count} numeric values in its header; "
+            f"received feature count {len(value_columns)}"
+        )
     leaked = sorted(column for column in value_columns if column.strip().lower() in LEAKAGE_COLUMN_NAMES)
     if leaked:
         raise ValueError(f"{schema.name} contains target leakage column: {leaked[0]}")

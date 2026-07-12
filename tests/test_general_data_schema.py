@@ -22,7 +22,9 @@ class GeneralDataSchemaTests(unittest.TestCase):
         return DatasetSpec(name=name, raw_path=str(path), raw_sha256=sha256_file(path))
 
     def hourly_frame(self, values: dict[str, list[object]] | None = None) -> pd.DataFrame:
-        values = values or {"first": [1.0, 2.0, 3.0], "second": [4.0, 5.0, 6.0]}
+        values = dict(values or {"first": [1.0, 2.0, 3.0], "second": [4.0, 5.0, 6.0]})
+        while len(values) < dataset_schema("ETTh1").expected_feature_count:
+            values[f"filler_{len(values)}"] = [0.0, 0.0, 0.0]
         return pd.DataFrame({"timestamp": pd.date_range("2024-01-01", periods=3, freq="h"), **values})
 
     def test_schema_defines_formal_frequency_and_feature_count(self):
@@ -30,6 +32,16 @@ class GeneralDataSchemaTests(unittest.TestCase):
         self.assertEqual(dataset_schema("ETTm1").frequency, pd.Timedelta(minutes=15))
         self.assertEqual(dataset_schema("ECL").expected_feature_count, 321)
         self.assertEqual(dataset_schema("Weather").expected_feature_count, 21)
+
+    def test_validation_rejects_wrong_numeric_feature_count(self):
+        frame = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2024-01-01", periods=3, freq="h"),
+                **{f"feature_{index}": [1.0, 2.0, 3.0] for index in range(6)},
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "feature count"):
+            validate_frame(dataset_schema("ETTh1"), frame)
 
     def test_validation_rejects_unparseable_timestamp(self):
         frame = self.hourly_frame()
@@ -68,6 +80,7 @@ class GeneralDataSchemaTests(unittest.TestCase):
                     ["2020-01-01 00:00", "2020-01-01 00:10", "2020-01-01 00:10", "2020-01-01 01:50"]
                 ),
                 "value": [1.0, 2.0, 3.0, 4.0],
+                **{f"filler_{index}": [0.0, 0.0, 0.0, 0.0] for index in range(20)},
             }
         )
         validated = validate_frame(dataset_schema("Weather"), frame)
@@ -80,8 +93,8 @@ class GeneralDataSchemaTests(unittest.TestCase):
             raw = self.write_csv(root, "raw.csv", self.hourly_frame({"z_last": [1.0, 2.0, 3.0], "a_first": [4.0, 5.0, 6.0]}))
             manifest = prepare_dataset(self.spec_for("ETTh1", raw), raw, root / "processed")
             processed = pd.read_csv(root / "processed" / "ETTh1" / "ETTh1.csv")
-            self.assertEqual(list(processed.columns), ["date", "z_last", "a_first"])
-            self.assertEqual(manifest.feature_count, 2)
+            self.assertEqual(list(processed.columns), ["date", "z_last", "a_first", "filler_2", "filler_3", "filler_4", "filler_5", "filler_6"])
+            self.assertEqual(manifest.feature_count, 7)
 
     def test_prepare_uses_causal_fill_then_train_median_for_leading_values(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -92,6 +105,7 @@ class GeneralDataSchemaTests(unittest.TestCase):
                     "date": pd.date_range("2020-01-01", periods=rows, freq="h"),
                     "leading": [float("nan")] + [2.0] * (rows - 1),
                     "causal": [1.0, float("nan")] + [3.0] * (rows - 2),
+                    **{f"filler_{index}": [0.0] * rows for index in range(5)},
                 }
             )
             raw = self.write_csv(root, "raw.csv", frame)
