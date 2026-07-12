@@ -6,6 +6,8 @@ Complete.
 
 - Design record: `efb4c41` (`Document general baseline adapter design`)
 - Implementation: `dfffe59` (`Add official general forecasting baselines`)
+- Final frequency design: `a4e073d` (`Document Task 6 frequency correction`)
+- Final frequency implementation: `6c65593` (`Fix pinned baseline time marker frequency`)
 - Branch: `codex/general-forecasting-v1`
 
 No training, CUDA work, model download, real embedding generation, or server
@@ -193,8 +195,8 @@ also proved permanent fake Transformers descriptor mutation, absent full checkou
 validation, pre-gate stale reset, absent clipping/optimizer helper, and absent
 Task 3 marker conversion/collation.
 
-An additional source-frequency RED caught profile architecture overwriting the
-dataset cadence after marker forwarding was implemented:
+A now-superseded source-frequency RED encoded a dataset-derived marker
+assumption after marker forwarding was implemented:
 
 ```text
 C:\Python313\python.exe -m unittest \
@@ -203,8 +205,9 @@ Ran 1 test
 FAILED (failures=24)
 ```
 
-Those 24 subtest failures were every minute-frequency iTransformer/TimesNet
-combination still receiving config `freq='h'` instead of `freq='t'`.
+Those 24 subtest failures expected every minute-cadence iTransformer/TimesNet
+combination to receive `freq='t'`. The final pinned-source audit below found
+that expectation was not source-native: the formal scripts retain `freq='h'`.
 
 Self-review then strengthened the scoped-loader fake to inherit
 `from_pretrained`, matching real Hugging Face class structure. The focused RED
@@ -246,11 +249,11 @@ OK (skipped=2)
 
 ### Findings closed
 
-1. Task 3 timestamps now become exact THUML `timeF` markers: four hourly
-   dimensions for ETTh1/ETTh2/ECL and five minute dimensions for
-   ETTm1/ETTm2/Weather. Baseline collation preserves encoder and target marks;
-   the shared batch-forward path passes both to iTransformer and TimesNet, and
-   adapters reject missing/malformed encoder marks.
+1. Task 3 timestamps become the exact pinned iTransformer/TimesNet script
+   behavior: four hourly `timeF` dimensions for all six datasets because the
+   scripts retain `freq='h'`. Baseline collation preserves encoder and target
+   marks; the shared batch-forward path passes both to the official models, and
+   adapters reject missing or non-four-column encoder marks.
 2. Time-LLM loader redirection is scoped to one constructor. Each exact original
    class descriptor is restored in `finally`; sequential fake builds prove
    distinct paths/revisions and no global mutation or cross-contamination.
@@ -270,3 +273,80 @@ The optimizer mechanics are executable: the helper applies profile gradient
 clipping, performs the optimizer step, and then performs source batch scheduling;
 the one-based epoch scheduler helper remains covered. Existing battery behavior
 remains unchanged and the full battery/general suite is green.
+
+## 2026-07-13 final pinned-frequency correction
+
+Design amendment: `a4e073d` (`Document Task 6 frequency correction`). Fix
+implementation: `6c65593` (`Fix pinned baseline time marker frequency`). No
+training, CUDA initialization, model-weight access, embedding generation, or
+server mutation occurred.
+
+### Direct pinned evidence
+
+The read-only server clones were inspected again at full HEADs
+`c2426e68ca13f74aaec08045c5c724d8ad328124` (iTransformer) and
+`4e938a1767106324dd753b2a44832bf870a0252e` (TimesNet):
+
+- iTransformer `run.py:29-30` defines `freq='h'`; its formal
+  ETT/ECL/Weather scripts contain no `--freq`; and
+  `data_provider/data_loader.py:73-75` passes the retained value to
+  `time_features`.
+- TimesNet `run.py:32-33` defines the same default; its formal
+  ETT/ECL/Weather scripts contain no `--freq`; and
+  `data_provider/data_loader.py:89-91` propagates it.
+- Both pinned `utils/timefeatures.py:106-113,124-128,147-148` map `h` to
+  HourOfDay, DayOfWeek, DayOfMonth, and DayOfYear: exactly four columns.
+
+This is recorded as source-native profile behavior, not a Task 3 protocol
+override. ETTm1/ETTm2/Weather retain their factual cadence in dataset validation
+and in TimeCMA/Time-LLM prompt text.
+
+### Final RED evidence
+
+After the test selector was corrected to its existing
+`GeneralTrainingContractTests` class, the two new contracts failed solely on
+the missing pinned behavior:
+
+```text
+C:\Python313\python.exe -m unittest \
+  tests.test_general_baselines.GeneralBaselineProfileTests.test_itransformer_and_timesnet_preserve_pinned_hourly_timef_default_for_all_datasets \
+  tests.test_general_baselines.GeneralTrainingContractTests.test_minute_cadence_datasets_execute_with_pinned_four_column_markers -v
+Ran 2 tests in 0.395s
+FAILED (failures=13)
+```
+
+Twelve profile subtests lacked the exact default/absent-override/loader source
+evidence. The executable path produced `(1, 36, 5)` instead of `(1, 36, 4)` for
+ETTm1 before reaching the fake official models.
+
+### Final GREEN evidence
+
+The minimal fix removed the unsupported dataset-derived `t` overwrite, retained
+profile `freq='h'`, generated four columns for every formal dataset, and made
+the adapter validate four columns:
+
+```text
+C:\Python313\python.exe -m unittest \
+  tests.test_general_baselines.GeneralBaselineProfileTests.test_itransformer_and_timesnet_preserve_pinned_hourly_timef_default_for_all_datasets \
+  tests.test_general_baselines.GeneralTrainingContractTests.test_minute_cadence_datasets_execute_with_pinned_four_column_markers -v
+Ran 2 tests in 0.409s
+OK
+
+C:\Python313\python.exe -m unittest tests.test_general_baselines -v
+Ran 36 tests in 5.623s
+OK (skipped=1)
+
+C:\Python313\python.exe -m unittest discover -s tests -v
+Ran 159 tests in 35.155s
+OK (skipped=2)
+```
+
+`C:\Python313\python.exe -m compileall -q bstalignment tests` and
+`git diff --check` also passed. The skips remain the absent local official
+repositories and the opt-in CUDA ECL smoke test.
+
+The import-safety statement is intentionally narrow: NumPy and PyTorch are
+eager dependencies of the executable trainer. Official external repositories,
+Transformers, model weights, and CUDA initialization remain lazy, and the
+subprocess contract tests exactly that boundary. No battery files or behavior
+changed.
