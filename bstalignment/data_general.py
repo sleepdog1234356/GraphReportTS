@@ -10,12 +10,16 @@ from torch.utils.data import Dataset
 
 try:
     from .experiment_config import GENERAL_DATASET_NOTES
+    from .general_data_schema import dataset_schema
+    from .general_prompting import build_general_prompt_result
     from .general_protocol import FORMAL_HISTORY, GeneralForecastProtocol, StandardScalerNP, fit_train_scaler
-    from .raw_signal import build_report_from_array, build_variable_maps
+    from .raw_signal import build_variable_maps
 except ImportError:
     from experiment_config import GENERAL_DATASET_NOTES
+    from general_data_schema import dataset_schema
+    from general_prompting import build_general_prompt_result
     from general_protocol import FORMAL_HISTORY, GeneralForecastProtocol, StandardScalerNP, fit_train_scaler
-    from raw_signal import build_report_from_array, build_variable_maps
+    from raw_signal import build_variable_maps
 
 
 TIMECMA_DATASETS = ["ETTm1", "ETTm2", "ETTh1", "ETTh2", "ECL", "Weather"]
@@ -74,6 +78,7 @@ class GeneralForecastGraphDataset(Dataset):
         self.delay_lag = int(delay_lag)
         self.include_derivatives = bool(include_derivatives)
         self.include_hankel = bool(include_hankel)
+        self.frequency = dataset_schema(dataset_name).frequency
         path = _find_csv(self.data_root, dataset_name)
         df = pd.read_csv(path)
         timestamp_column = next((column for column in ("date", "timestamp") if column in df.columns), None)
@@ -114,13 +119,14 @@ class GeneralForecastGraphDataset(Dataset):
             include_derivatives=self.include_derivatives,
             include_hankel=self.include_hankel,
         )
-        prompt = build_report_from_array(x, domain=self.dataset_name, horizon=self.pred_len, variables=self.columns)
+        prompt_result = build_general_prompt_result(x, self.columns, self.frequency, self.pred_len)
         return {
             "maps": torch.tensor(maps, dtype=torch.float32),
             "y": torch.tensor(y, dtype=torch.float32),
             "mask": torch.ones(self.pred_len, y.shape[-1], dtype=torch.bool),
             "horizon": torch.tensor(self.pred_len, dtype=torch.long),
-            "prompt": prompt,
+            "prompt": prompt_result.prompt,
+            "prompt_metadata": dict(prompt_result.metadata),
             "series_id": self.dataset_name,
             "start_index": start,
             "history_steps": torch.arange(start, history_end),
@@ -166,6 +172,7 @@ def collate_general_graph_batch(batch: List[Dict[str, object]]) -> Dict[str, obj
         "mask": target_mask,
         "horizon": torch.stack([b["horizon"] for b in batch], dim=0),
         "prompt": [b["prompt"] for b in batch],
+        "prompt_metadata": [b.get("prompt_metadata") for b in batch],
         "series_id": [b["series_id"] for b in batch],
         "start_index": torch.tensor([b["start_index"] for b in batch], dtype=torch.long),
         "target_steps": torch.stack([b["target_steps"] for b in batch], dim=0),

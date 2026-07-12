@@ -18,7 +18,7 @@ Observation: 36 past steps sampled every {frequency}; {num_variables} variables 
 Window summary: aggregate mean={...}, standard deviation={...}, mean absolute change={...}, trend balance={up_count} increasing/{down_count} decreasing/{flat_count} approximately flat.
 Variable summaries: {bounded deterministic summaries of variable name, last value, trend, volatility}.
 Instruction: predict all {num_variables} variables for the next {pred_len} steps.
-Use only the observed window and do not assume future measurements.
+Use only the observed window.
 ```
 
 All statistics use the provided history only. Float formatting is fixed. Aggregate metrics include every variable. For at most 12 columns, summaries retain canonical order; otherwise the builder selects six highest and six lowest absolute trends, using canonical index as the tie-breaker. The prompt never includes a dataset name, split, future value, battery-specific term, or dataset-specific forecast hint.
