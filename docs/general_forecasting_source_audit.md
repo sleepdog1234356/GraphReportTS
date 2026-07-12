@@ -12,9 +12,9 @@ YAML parser.
 
 All baseline adapters preserve the source implementation listed below, while
 the formal protocol overrides only `seq_len=36`, `pred_len` (96, 192, 336, or
-720), dataset/raw and canonical-data paths, `features=M`, encoder/decoder
-feature counts, formal seed, and the run output path.  No adapter substitutes
-GraphReportTS prompts for an official baseline prompt.  Checkpoints are
+720), dataset/raw and canonical-data paths, M2M `features=M`, encoder/decoder
+feature counts, smoke seed 42 or formal seeds 2021/2022/2023, and the run
+output path. No adapter substitutes GraphReportTS prompts for an official baseline prompt. Checkpoints are
 selected by validation MSE; the shared evaluator reports standardized-space
 MSE and MAE.
 

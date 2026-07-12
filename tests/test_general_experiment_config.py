@@ -7,6 +7,14 @@ from tempfile import TemporaryDirectory
 import unittest
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "configs" / "general_forecasting" / "experiment_matrix.yaml"
+AUDITED_SOURCES = {
+    "PatchTST": ("https://github.com/yuqinie98/PatchTST", "204c21e"),
+    "iTransformer": ("https://github.com/thuml/iTransformer", "c2426e6"),
+    "TimeCMA": ("https://github.com/ChenxiLiu-HNU/TimeCMA", "223e4ae"),
+    "TimesNet": ("https://github.com/thuml/Time-Series-Library", "4e938a1"),
+    "DLinear": ("https://github.com/cure-lab/LTSF-Linear", "0c11366"),
+    "Time-LLM": ("https://github.com/KimMeen/Time-LLM", "b13e881"),
+}
 
 
 class GeneralExperimentConfigTests(unittest.TestCase):
@@ -35,15 +43,17 @@ class GeneralExperimentConfigTests(unittest.TestCase):
                     for name in ("GraphReportTS", "PatchTST", "iTransformer", "TimeCMA", "TimesNet", "DLinear", "Time-LLM")
                 ],
                 "sources": {
-                    name: {"url": f"https://github.com/example/{name}", "commit": "abc1234"}
-                    for name in ("PatchTST", "iTransformer", "TimeCMA", "TimesNet", "DLinear", "Time-LLM")
+                    name: {"url": url, "commit": commit}
+                    for name, (url, commit) in AUDITED_SOURCES.items()
                 },
             }
             manifest = {
                 "input_len": 36,
+                "features": "M",
                 "datasets": [dataset["name"] for dataset in datasets["datasets"]],
                 "models": [model["name"] for model in models["models"]],
                 "horizons": [96, 192, 336, 720],
+                "smoke_seed": 42,
                 "formal_seeds": [2021, 2022, 2023],
                 "paths": {"datasets": "datasets.yaml", "models": "models.yaml", "output_root": "runs/general_forecasting"},
             }
@@ -65,7 +75,9 @@ class GeneralExperimentConfigTests(unittest.TestCase):
             {"GraphReportTS", "PatchTST", "iTransformer", "TimeCMA", "TimesNet", "DLinear", "Time-LLM"},
         )
         self.assertEqual(spec.input_len, 36)
+        self.assertEqual(getattr(spec, "features", None), "M")
         self.assertEqual(spec.horizons, (96, 192, 336, 720))
+        self.assertEqual(getattr(spec, "smoke_seed", None), 42)
         self.assertEqual(spec.formal_seeds, (2021, 2022, 2023))
         self.assertEqual(len(spec.run_ids), 504)
         self.assertEqual(len(spec.run_ids), len(set(spec.run_ids)))
@@ -97,18 +109,49 @@ class GeneralExperimentConfigTests(unittest.TestCase):
         spec = self.load_spec()
 
         self.assertEqual(
-            {source.name: source.commit for source in spec.source_commits},
-            {
-                "PatchTST": "204c21e",
-                "iTransformer": "c2426e6",
-                "TimeCMA": "223e4ae",
-                "TimesNet": "4e938a1",
-                "DLinear": "0c11366",
-                "Time-LLM": "b13e881",
-            },
+            {source.name: (source.url, source.commit) for source in spec.source_commits},
+            AUDITED_SOURCES,
         )
-        self.assertTrue(all(source.url.startswith("https://github.com/") for source in spec.source_commits))
-        self.assertTrue(all(source.commit for source in spec.source_commits))
+
+    def test_loader_requires_the_complete_formal_matrix(self):
+        mutations = {
+            "datasets": lambda manifest, _: manifest.update(datasets=manifest["datasets"][:-1]),
+            "models": lambda manifest, _: manifest.update(models=manifest["models"][:-1]),
+            "horizons": lambda manifest, _: manifest.update(horizons=manifest["horizons"][:-1]),
+        }
+        for field, mutation in mutations.items():
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, f"complete.*{field}"):
+                self.write_mutated_manifest(mutation)
+
+    def test_loader_rejects_changed_audited_source_identity(self):
+        def change_url(manifest, models):
+            models["sources"]["PatchTST"]["url"] = "https://github.com/example/PatchTST"
+
+        def change_commit(manifest, models):
+            models["sources"]["PatchTST"]["commit"] = "abcdef0"
+
+        for field, mutation in (("URL", change_url), ("commit", change_commit)):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, f"audited source {field}"):
+                self.write_mutated_manifest(mutation)
+
+    def test_loader_requires_smoke_seed_42(self):
+        with self.assertRaisesRegex(ValueError, "smoke_seed"):
+            self.write_mutated_manifest(lambda manifest, _: manifest.update(smoke_seed=41))
+
+    def test_loader_requires_multivariate_to_multivariate_features(self):
+        with self.assertRaisesRegex(ValueError, "features"):
+            self.write_mutated_manifest(lambda manifest, _: manifest.update(features="S"))
+
+    def test_loader_rejects_non_integer_numeric_fields(self):
+        mutations = {
+            "input_len": lambda manifest, _: manifest.update(input_len=36.0),
+            "horizons": lambda manifest, _: manifest.update(horizons=[96.0, 192, 336, 720]),
+            "smoke_seed": lambda manifest, _: manifest.update(smoke_seed=True),
+            "formal_seeds": lambda manifest, _: manifest.update(formal_seeds=[2021.0, 2022, 2023]),
+        }
+        for field, mutation in mutations.items():
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "integer"):
+                self.write_mutated_manifest(mutation)
 
     def test_loader_rejects_an_unknown_dataset(self):
         with self.assertRaisesRegex(ValueError, "unknown dataset"):

@@ -5,16 +5,32 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping
 
 
-SUPPORTED_DATASETS = frozenset({"ETTm1", "ETTm2", "ETTh1", "ETTh2", "ECL", "Weather"})
-SUPPORTED_MODELS = frozenset(
-    {"GraphReportTS", "PatchTST", "iTransformer", "TimeCMA", "TimesNet", "DLinear", "Time-LLM"}
+EXPECTED_DATASETS = ("ETTm1", "ETTm2", "ETTh1", "ETTh2", "ECL", "Weather")
+EXPECTED_MODELS = (
+    "GraphReportTS", "PatchTST", "iTransformer", "TimeCMA", "TimesNet", "DLinear", "Time-LLM"
 )
-BASELINE_MODELS = SUPPORTED_MODELS - {"GraphReportTS"}
-SUPPORTED_HORIZONS = frozenset({96, 192, 336, 720})
+EXPECTED_HORIZONS = (96, 192, 336, 720)
 FORMAL_SEEDS = (2021, 2022, 2023)
+SMOKE_SEED = 42
+FEATURES = "M"
+SUPPORTED_DATASETS = frozenset(EXPECTED_DATASETS)
+SUPPORTED_MODELS = frozenset(EXPECTED_MODELS)
+BASELINE_MODELS = SUPPORTED_MODELS - {"GraphReportTS"}
+SUPPORTED_HORIZONS = frozenset(EXPECTED_HORIZONS)
+AUDITED_SOURCES = MappingProxyType(
+    {
+        "PatchTST": ("https://github.com/yuqinie98/PatchTST", "204c21e"),
+        "iTransformer": ("https://github.com/thuml/iTransformer", "c2426e6"),
+        "TimeCMA": ("https://github.com/ChenxiLiu-HNU/TimeCMA", "223e4ae"),
+        "TimesNet": ("https://github.com/thuml/Time-Series-Library", "4e938a1"),
+        "DLinear": ("https://github.com/cure-lab/LTSF-Linear", "0c11366"),
+        "Time-LLM": ("https://github.com/KimMeen/Time-LLM", "b13e881"),
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -43,6 +59,7 @@ class HorizonSpec:
 
 @dataclass(frozen=True)
 class SeedSpec:
+    smoke: int
     values: tuple[int, ...]
 
 
@@ -58,6 +75,7 @@ class GeneralExperimentSpec:
     datasets: tuple[DatasetSpec, ...]
     models: tuple[ModelSpec, ...]
     input_len: int
+    features: str
     horizon_spec: HorizonSpec
     seed_spec: SeedSpec
     paths: ExperimentPaths
@@ -70,6 +88,10 @@ class GeneralExperimentSpec:
     @property
     def formal_seeds(self) -> tuple[int, ...]:
         return self.seed_spec.values
+
+    @property
+    def smoke_seed(self) -> int:
+        return self.seed_spec.smoke
 
     @property
     def run_ids(self) -> tuple[str, ...]:
@@ -97,6 +119,12 @@ def _required_string(record: Mapping[str, Any], field: str, description: str) ->
     return value
 
 
+def _require_integer(value: Any, field: str) -> int:
+    if type(value) is not int:
+        raise ValueError(f"{field} must be an integer")
+    return value
+
+
 def _load_datasets(config: Mapping[str, Any]) -> tuple[DatasetSpec, ...]:
     records = config.get("datasets")
     if not isinstance(records, list):
@@ -117,6 +145,8 @@ def _load_datasets(config: Mapping[str, Any]) -> tuple[DatasetSpec, ...]:
             raise ValueError(f"unknown dataset: {dataset.name}")
         if len(dataset.raw_sha256) != 64 or any(char not in "0123456789abcdef" for char in dataset.raw_sha256):
             raise ValueError(f"dataset {dataset.name} requires a lowercase SHA-256 checksum")
+    if tuple(dataset.name for dataset in datasets) != EXPECTED_DATASETS:
+        raise ValueError("dataset catalog must contain the complete formal datasets in canonical order")
     return datasets
 
 
@@ -134,6 +164,8 @@ def _load_models(config: Mapping[str, Any]) -> tuple[ModelSpec, ...]:
     unknown_models = {model.name for model in models} - SUPPORTED_MODELS
     if unknown_models:
         raise ValueError(f"unknown model: {sorted(unknown_models)[0]}")
+    if tuple(model.name for model in models) != EXPECTED_MODELS:
+        raise ValueError("model catalog must contain the complete formal models in canonical order")
     return models
 
 
@@ -159,8 +191,11 @@ def _load_sources(config: Mapping[str, Any]) -> tuple[SourceCommit, ...]:
     for source in sources:
         if source.name not in BASELINE_MODELS:
             raise ValueError(f"unknown source model: {source.name}")
-        if not source.url.startswith("https://github.com/"):
-            raise ValueError(f"source URL for {source.name} must be an official GitHub URL")
+        expected_url, expected_commit = AUDITED_SOURCES[source.name]
+        if source.url != expected_url:
+            raise ValueError(f"audited source URL mismatch for {source.name}")
+        if source.commit != expected_commit:
+            raise ValueError(f"audited source commit mismatch for {source.name}")
     return sources
 
 
@@ -186,15 +221,27 @@ def load_general_experiment_spec(path: Path) -> GeneralExperimentSpec:
     models = _load_models(models_config)
     sources = _load_sources(models_config)
 
-    input_len = matrix.get("input_len")
+    input_len = _require_integer(matrix.get("input_len"), "input_len")
     if input_len != 36:
         raise ValueError("input_len must be 36 for formal general forecasting")
-    horizons = tuple(matrix.get("horizons", ()))
+    raw_horizons = matrix.get("horizons")
+    if not isinstance(raw_horizons, list):
+        raise ValueError("horizons must be a list of integers")
+    horizons = tuple(_require_integer(horizon, "horizons") for horizon in raw_horizons)
     if not horizons or any(horizon not in SUPPORTED_HORIZONS for horizon in horizons):
         raise ValueError("horizons must be selected from 96, 192, 336, and 720")
-    formal_seeds = tuple(matrix.get("formal_seeds", ()))
+    smoke_seed = _require_integer(matrix.get("smoke_seed"), "smoke_seed")
+    if smoke_seed != SMOKE_SEED:
+        raise ValueError("smoke_seed must be 42")
+    raw_formal_seeds = matrix.get("formal_seeds")
+    if not isinstance(raw_formal_seeds, list):
+        raise ValueError("formal_seeds must be a list of integers")
+    formal_seeds = tuple(_require_integer(seed, "formal_seeds") for seed in raw_formal_seeds)
     if formal_seeds != FORMAL_SEEDS:
         raise ValueError("formal_seeds must be 2021, 2022, and 2023")
+    features = matrix.get("features")
+    if features != FEATURES:
+        raise ValueError("features must be M for multivariate-to-multivariate forecasting")
 
     selected_datasets = tuple(matrix.get("datasets", ()))
     selected_models = tuple(matrix.get("models", ()))
@@ -213,11 +260,18 @@ def load_general_experiment_spec(path: Path) -> GeneralExperimentSpec:
         datasets=selected_dataset_specs,
         models=selected_model_specs,
         input_len=input_len,
+        features=features,
         horizon_spec=HorizonSpec(horizons),
-        seed_spec=SeedSpec(formal_seeds),
+        seed_spec=SeedSpec(smoke_seed, formal_seeds),
         paths=paths,
         source_commits=sources,
     )
     if len(spec.run_ids) != len(set(spec.run_ids)):
         raise ValueError("duplicate run ID in experiment matrix")
+    if tuple(dataset.name for dataset in spec.datasets) != EXPECTED_DATASETS:
+        raise ValueError("formal matrix must contain the complete datasets in canonical order")
+    if tuple(model.name for model in spec.models) != EXPECTED_MODELS:
+        raise ValueError("formal matrix must contain the complete models in canonical order")
+    if spec.horizons != EXPECTED_HORIZONS:
+        raise ValueError("formal matrix must contain the complete horizons in canonical order")
     return spec
