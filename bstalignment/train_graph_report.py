@@ -307,7 +307,7 @@ def _model_forward(model: GraphReportTS, batch: Dict[str, Any]) -> Dict[str, tor
         batch["prompt"],
         batch["horizon"],
         steps=steps,
-        history_features=batch.get("history_features"),
+        history_features=batch.get("history_scaled", batch.get("history_features")),
         variable_mask=batch.get("variable_mask"),
     )
 

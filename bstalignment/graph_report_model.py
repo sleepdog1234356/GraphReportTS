@@ -342,6 +342,43 @@ class NumericHistoryEncoder(nn.Module):
         return tokens[:, -1], tokens
 
 
+class VariableHistoryEncoder(nn.Module):
+    """Encode each general-forecasting variable with shared temporal weights."""
+
+    def __init__(self, history_len: int, d_model: int, dropout: float = 0.1):
+        super().__init__()
+        self.history_len = int(history_len)
+        self.encoder = nn.Sequential(
+            nn.LayerNorm(self.history_len),
+            nn.Linear(self.history_len, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+    def forward(
+        self,
+        history: torch.Tensor,
+        variable_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if history.ndim != 3 or history.size(1) != self.history_len:
+            raise ValueError(
+                f"Expected history [B,{self.history_len},C], got {tuple(history.shape)}"
+            )
+        tokens = self.encoder(history.transpose(1, 2).float())
+        if variable_mask is None:
+            variable_mask = torch.ones(tokens.shape[:2], dtype=torch.bool, device=tokens.device)
+        if tuple(variable_mask.shape) != tuple(tokens.shape[:2]):
+            raise ValueError(
+                f"Expected variable mask {tuple(tokens.shape[:2])}, got {tuple(variable_mask.shape)}"
+            )
+        mask = variable_mask.to(device=tokens.device, dtype=torch.bool)
+        masked_tokens = tokens * mask.unsqueeze(-1)
+        pooled = masked_tokens.sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp_min(1).to(tokens.dtype)
+        return pooled, masked_tokens
+
+
 class GatedSemanticFusion(nn.Module):
     """Token-aware text retrieval followed by learnable prompt gating."""
 
@@ -540,10 +577,7 @@ class GraphReportTS(nn.Module):
     def __init__(self, cfg: GraphReportTSConfig):
         super().__init__()
         self.cfg = cfg
-        graph_encoder_cls = (
-            VariableGraphEncoder if cfg.variant == "general" and not cfg.legacy_general_graph else GraphMapEncoder
-        )
-        graph_encoder_kwargs = dict(
+        self.graph_encoder = GraphMapEncoder(
             d_model=cfg.d_model,
             patch_size=cfg.patch_size,
             patch_stride=cfg.patch_stride,
@@ -553,9 +587,6 @@ class GraphReportTS(nn.Module):
             use_domain_edges=cfg.use_domain_edges,
             use_dynamic_graph=cfg.use_dynamic_graph,
         )
-        if graph_encoder_cls is VariableGraphEncoder:
-            graph_encoder_kwargs["variable_chunk_size"] = cfg.variable_chunk_size
-        self.graph_encoder = graph_encoder_cls(**graph_encoder_kwargs)
         if cfg.use_report_prompt and cfg.use_cross_modal_fusion and cfg.use_hf_text_encoder:
             self.text_encoder = HFTextEncoder(cfg.text_model, cfg.d_model, cfg.freeze_text, cfg.text_max_length)
         elif cfg.use_report_prompt and cfg.use_cross_modal_fusion:
@@ -579,6 +610,9 @@ class GraphReportTS(nn.Module):
             n_heads=cfg.temporal_heads,
             dropout=cfg.dropout,
         )
+        self.variable_history_encoder = (
+            VariableHistoryEncoder(36, cfg.d_model, cfg.dropout) if cfg.variant == "general" else None
+        )
         self.context_fuser = nn.Sequential(
             nn.LayerNorm(cfg.d_model * 2),
             nn.Linear(cfg.d_model * 2, cfg.d_model),
@@ -587,7 +621,7 @@ class GraphReportTS(nn.Module):
             nn.Linear(cfg.d_model, cfg.d_model),
         )
         self.context_norm = nn.LayerNorm(cfg.d_model)
-        if cfg.variant == "general" and not cfg.legacy_general_graph:
+        if cfg.variant == "general":
             self.variable_decoder = VariableQueryDecoder(cfg.d_model, cfg.max_steps, cfg.dropout)
         else:
             decoder_cls = UnifiedQueryDecoder if cfg.unified_decoder else SeparateNowFutureDecoder
@@ -598,12 +632,12 @@ class GraphReportTS(nn.Module):
         maps: torch.Tensor,
         variable_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
-        if self.cfg.variant == "general" and not self.cfg.legacy_general_graph:
-            graph = self.graph_encoder(maps, variable_mask)
-            return graph["repr"], graph["tokens"], graph
-        if self.cfg.variant == "general" and self.cfg.legacy_general_graph and maps.ndim == 5:
-            b, variables, views, h, w = maps.shape
-            maps = maps.reshape(b, variables * views, h, w)
+        if self.cfg.variant == "general":
+            if maps.ndim != 4:
+                raise ValueError(f"Expected aggregated general maps [B,C,H,W], got {tuple(maps.shape)}")
+            graph = self.graph_encoder(maps)
+            tokens = graph["repr"].unsqueeze(1)
+            return graph["repr"], tokens, graph
         if maps.ndim == 5:
             b, t, c, h, w = maps.shape
             if not self.cfg.use_multi_cycle_raw:
@@ -635,11 +669,16 @@ class GraphReportTS(nn.Module):
         variable_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         graph_context, graph_cycle_tokens, graph = self._encode_graph_history(maps, variable_mask)
-        scalable_general = self.cfg.variant == "general" and not self.cfg.legacy_general_graph
-        if scalable_general:
-            variable_mask = graph["variable_mask"]
+        scalable_general = self.cfg.variant == "general"
         variable_tokens = graph_cycle_tokens
-        if history_features is not None and self.cfg.use_numeric_history:
+        if scalable_general:
+            if history_features is None:
+                raise ValueError("general forecasting requires scaled history features")
+            if self.variable_history_encoder is None:
+                raise RuntimeError("general forecasting variable history encoder is unavailable")
+            numeric_context, variable_tokens = self.variable_history_encoder(history_features, variable_mask)
+            numeric_tokens = variable_tokens
+        elif history_features is not None and self.cfg.use_numeric_history:
             numeric_context, numeric_tokens = self.numeric_history_encoder(history_features)
         else:
             b = maps.size(0)

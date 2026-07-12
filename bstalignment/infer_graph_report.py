@@ -101,7 +101,7 @@ def forward_inference_batch(model, batch, variant: str):
         batch["prompt"],
         batch["horizon"],
         steps=steps,
-        history_features=batch.get("history_features"),
+        history_features=batch.get("history_scaled", batch.get("history_features")),
         variable_mask=batch.get("variable_mask"),
     )
 
