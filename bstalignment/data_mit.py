@@ -262,7 +262,8 @@ class MITBatterySOHDataset(Dataset):
     ):
         self.records = list(records)
         self.seq_len = seq_len
-        # Backward compatibility: if old code passes pred_horizon, treat it as forecast_horizon.
+        # 已废弃：pred_horizon 是历史参数名；新调用方必须使用 forecast_horizon。
+        # 保留该别名仅用于兼容旧脚本和旧检查点配置。
         self.forecast_horizon = int(pred_horizon if pred_horizon is not None else forecast_horizon)
         self.features = features or DEFAULT_FEATURES
         self.cells: Dict[str, Tuple[CellRecord, pd.DataFrame]] = {}

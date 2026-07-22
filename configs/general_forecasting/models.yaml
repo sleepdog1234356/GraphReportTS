@@ -1,0 +1,14 @@
+{
+  "models": [
+    {"name": "GraphReportTS"}, {"name": "PatchTST"}, {"name": "iTransformer"},
+    {"name": "TimeCMA"}, {"name": "TimesNet"}, {"name": "DLinear"}, {"name": "Time-LLM"}
+  ],
+  "sources": {
+    "PatchTST": {"url": "https://github.com/yuqinie98/PatchTST", "commit": "204c21e"},
+    "iTransformer": {"url": "https://github.com/thuml/iTransformer", "commit": "c2426e6"},
+    "TimeCMA": {"url": "https://github.com/ChenxiLiu-HNU/TimeCMA", "commit": "223e4ae"},
+    "TimesNet": {"url": "https://github.com/thuml/Time-Series-Library", "commit": "4e938a1"},
+    "DLinear": {"url": "https://github.com/cure-lab/LTSF-Linear", "commit": "0c11366"},
+    "Time-LLM": {"url": "https://github.com/KimMeen/Time-LLM", "commit": "b13e881"}
+  }
+}

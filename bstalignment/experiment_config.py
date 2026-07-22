@@ -9,9 +9,9 @@ from typing import Any, Dict, List, Optional
 class DataConfig:
     dataset_group: str = "battery"  # battery or general
     dataset_name: str = "mit"
-    data_root: str = "bstalignment/data"
-    raw_root: str = "bstalignment/data/raw"
-    processed_root: str = "bstalignment/data/processed"
+    data_root: str = "data/battery"
+    raw_root: str = "data/battery/raw"
+    processed_root: str = "data/battery/processed"
     output_root: str = "runs/graph_report_ts"
     split: str = "test"
     input_len: int = 96
@@ -110,8 +110,8 @@ class ExperimentConfig:
 
 BATTERY_DATASET_NOTES = {
     "mit": {
-        "raw_dir": "bstalignment/data/mit",
-        "processed_dir": "bstalignment/data/processed/battery/mit",
+        "raw_dir": "data/battery/mit",
+        "processed_dir": "data/battery/processed/mit",
         "required": [
             "cell_id",
             "cycle_id",
@@ -124,20 +124,9 @@ BATTERY_DATASET_NOTES = {
             "metadata: charge_policy, chemistry if available",
         ],
     },
-    "calce": {
-        "raw_dir": "bstalignment/data/raw/battery/calce",
-        "processed_dir": "bstalignment/data/processed/battery/calce",
-        "required": [
-            "cells 35, 36, 37, 38",
-            "per-cycle current/voltage/temperature/time sequences",
-            "charge/discharge phase markers or inferred phase split",
-            "capacity and SOH labels",
-            "precomputed IC dQ/dV and DV dV/dQ after smoothing",
-        ],
-    },
     "xjtu": {
-        "raw_dir": "bstalignment/data/raw/battery/xjtu",
-        "processed_dir": "bstalignment/data/processed/battery/xjtu",
+        "raw_dir": "data/battery/raw/xjtu",
+        "processed_dir": "data/battery/processed/xjtu",
         "required": [
             "cell_id and cycle_id index",
             "per-cycle current/voltage/temperature/time sequences",
@@ -151,8 +140,8 @@ BATTERY_DATASET_NOTES = {
 
 GENERAL_DATASET_NOTES = {
     name: {
-        "raw_dir": f"bstalignment/data/raw/general/{name}",
-        "processed_dir": f"bstalignment/data/processed/general/{name}",
+        "raw_dir": f"data/general/raw/{name}",
+        "processed_dir": f"data/general/processed/{name}",
         "required": [
             "CSV with timestamp column",
             "numeric covariate columns",
@@ -160,7 +149,7 @@ GENERAL_DATASET_NOTES = {
             "train/val/test split compatible with TimeCMA if possible",
         ],
     }
-    for name in ["ETTm1", "ETTm2", "ETTh1", "ETTh2", "ECL", "FRED", "ILI", "Weather"]
+    for name in ["ETTm1", "ETTm2", "ETTh1", "ETTh2", "ECL", "Weather"]
 }
 
 

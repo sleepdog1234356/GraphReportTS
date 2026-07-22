@@ -20,6 +20,7 @@ env/
 bstalignment/data/mit/*.pkl
 bstalignment/data/mit/Data/*.mat
 bstalignment/data/raw/
+bstalignment/data/raw/general_download/
 bstalignment/data/processed/
 data/
 runs/

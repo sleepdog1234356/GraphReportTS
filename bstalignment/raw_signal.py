@@ -130,6 +130,62 @@ def build_multiview_maps(
     return np.stack(maps, axis=0).astype(np.float32), names
 
 
+def build_variable_maps(
+    x: np.ndarray,
+    resample_len: int = 128,
+    delay_dim: int = 8,
+    delay_lag: int = 1,
+    include_derivatives: bool = True,
+    include_hankel: bool = True,
+) -> np.ndarray:
+    """Build independent multi-view maps shaped [variables, views, height, width]."""
+    values = np.asarray(x, dtype=np.float32)
+    if values.ndim != 2:
+        raise ValueError(f"Expected history [time,variables], got {values.shape}")
+    variable_maps = []
+    for variable_index in range(values.shape[1]):
+        maps, _ = build_multiview_maps(
+            {f"x{variable_index}": values[:, variable_index]},
+            resample_len=resample_len,
+            delay_dim=delay_dim,
+            delay_lag=delay_lag,
+            include_derivatives=include_derivatives,
+            include_hankel=include_hankel,
+            include_ic_dv=False,
+        )
+        variable_maps.append(maps)
+    if not variable_maps:
+        raise ValueError("Variable maps require at least one input variable")
+    return np.stack(variable_maps, axis=0).astype(np.float32)
+
+
+VARIABLE_GRAPH_STATISTICS = ("mean", "std", "min", "max", "q25", "q75")
+
+
+def aggregate_variable_maps(variable_maps: np.ndarray) -> np.ndarray:
+    """Aggregate variable-wise maps to fixed graph channels.
+
+    The input variable axis is reduced independently for every map view and
+    pixel.  The resulting channel count is therefore independent of the raw
+    feature count while the unaggregated history remains available to the
+    variable-specific numeric encoder.
+    """
+    values = np.asarray(variable_maps, dtype=np.float32)
+    if values.ndim != 4 or values.shape[0] < 1:
+        raise ValueError(
+            "Expected variable maps [variables,views,height,width] with at least one variable"
+        )
+    statistics = (
+        values.mean(axis=0),
+        values.std(axis=0),
+        values.min(axis=0),
+        values.max(axis=0),
+        np.quantile(values, 0.25, axis=0),
+        np.quantile(values, 0.75, axis=0),
+    )
+    return np.concatenate(statistics, axis=0).astype(np.float32, copy=False)
+
+
 def maps_to_patch_nodes(
     maps: torch.Tensor,
     patch_size: int = 8,
