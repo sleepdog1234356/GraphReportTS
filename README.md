@@ -41,11 +41,7 @@ projects/
 configs/
   general_forecasting/         dataset manifests used by general-data preparation
   gtr/                         shared and battery-main configuration
-docs/                          Method description and architecture figure
-tests/                         focused main-model and shared-runtime tests
 ```
-
-Baseline, ablation, optimization-search, result-archive, maintenance, and server-audit code is intentionally excluded from this public main-model tree.
 
 ## Installation
 
