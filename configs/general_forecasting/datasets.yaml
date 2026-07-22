@@ -1,0 +1,10 @@
+{
+  "datasets": [
+    {"name": "ETTm1", "raw_path": "data/general/raw/ETT-small/ETTm1.csv", "raw_sha256": "6ce1759b1a18e3328421d5d75fadcb316c449fcd7cec32820c8dafda71986c9e"},
+    {"name": "ETTm2", "raw_path": "data/general/raw/ETT-small/ETTm2.csv", "raw_sha256": "db973ca252c6410a30d0469b13d696cf919648d0f3fd588c60f03fdbdbadd1fd"},
+    {"name": "ETTh1", "raw_path": "data/general/raw/ETT-small/ETTh1.csv", "raw_sha256": "f18de3ad269cef59bb07b5438d79bb3042d3be49bdeecf01c1cd6d29695ee066"},
+    {"name": "ETTh2", "raw_path": "data/general/raw/ETT-small/ETTh2.csv", "raw_sha256": "a3dc2c597b9218c7ce1cd55eb77b283fd459a1d09d753063f944967dd6b9218b"},
+    {"name": "ECL", "raw_path": "data/general/raw/electricity/electricity.csv", "raw_sha256": "7e45845d54c5219bad0ae6bc1b5316cf8ff9cead5d33fa998a5a51c2e4a497ad"},
+    {"name": "Weather", "raw_path": "data/general/raw/weather/weather.csv", "raw_sha256": "34ee981d07313e51da2a50bb600072c8ae4a69cb4b0651f4cb93a069d7a2ba63"}
+  ]
+}

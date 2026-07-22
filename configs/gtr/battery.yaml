@@ -1,0 +1,36 @@
+data:
+  dataset: mit
+  prompt_context_cycles: 32
+  numeric_context_cycles: 32
+  prediction_cycles: 20
+  min_valid_numeric_cycles: 24
+  deterministic_features: 50
+  learned_curve_features: 8
+  curve_points: 128
+  prompt_mode: sensor_only
+  soh_context_dropout: 0.5
+
+training:
+  epochs: 80
+  batch_size: 256
+  num_workers: 8
+  prefetch_factor: 2
+  amp: bf16
+  optimizer: adamw
+  core_lr: 0.001
+  semantic_lr: 0.0003
+  weight_decay: 0.0001
+  warmup_epochs: 5
+  align_start_epoch: 6
+  align_full_epoch: 15
+  align_weight: 0.001
+  gradient_clip: 1.0
+  patience: 20
+  checkpoint_metric: validation_mse
+
+runtime:
+  cache_root: data/battery/cache/features
+  output_root: artifacts/battery/battery_gtr/runs
+  text_model: hf_models/distilbert-base-uncased
+  device: cuda
+  resume: true

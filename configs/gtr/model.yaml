@@ -1,0 +1,25 @@
+model:
+  d_model: 128
+  graph_layers: 3
+  heads: 4
+  dropout: 0.1
+  ffn_expansion: 2
+  dense_variable_threshold: 64
+  max_neighbors: 16
+  max_routers: 16
+  max_nodes: 6000
+  text_model: hf_models/distilbert-base-uncased
+  text_max_length: 128
+  text_token_cache_size: 32768
+  text_backend: distilbert
+  freeze_text: true
+
+general:
+  input_len: 36
+  horizons: [24, 36, 48, 60]
+
+battery:
+  input_len: 32
+  pred_len: 20
+  deterministic_features: 50
+  learned_curve_features: 8
