@@ -1,6 +1,6 @@
 {
   "models": [
-    {"name": "GraphReportTS"}, {"name": "PatchTST"}, {"name": "iTransformer"},
+    {"name": "AnchoredGTR"}, {"name": "PatchTST"}, {"name": "iTransformer"},
     {"name": "TimeCMA"}, {"name": "TimesNet"}, {"name": "DLinear"}, {"name": "Time-LLM"}
   ],
   "sources": {

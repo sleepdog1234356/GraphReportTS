@@ -2,20 +2,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from bstalignment.battery.battery_gtr import (
+from anchoredgtr.battery.battery_gtr import (
     BATTERY_GTR_MODEL_NAME,
-    LEGACY_BATTERY_MODEL_NAME,
     BatteryGTR,
-    canonical_battery_model_name,
 )
-from bstalignment.battery.train_battery_gtr import build_battery_argv
-from bstalignment.v2.contracts import GraphReportTSv2Config
-from bstalignment.v2.heads import BatterySOHHead
-from bstalignment.v2.model import BatteryGraphReportTSv2
+from anchoredgtr.battery.train_battery_gtr import build_battery_argv
+from anchoredgtr.core.contracts import GTRConfig
+from anchoredgtr.core.heads import BatterySOHHead
+from anchoredgtr.core.model import BatteryGTRCore
 
 
-def battery_config() -> GraphReportTSv2Config:
-    return GraphReportTSv2Config(
+def battery_config() -> GTRConfig:
+    return GTRConfig(
         domain="battery",
         input_len=32,
         pred_len=20,
@@ -24,18 +22,12 @@ def battery_config() -> GraphReportTSv2Config:
     )
 
 
-def test_battery_gtr_identity_and_legacy_mapping() -> None:
+def test_battery_gtr_uses_final_identity() -> None:
     assert BATTERY_GTR_MODEL_NAME == "BatteryGTR"
-    assert LEGACY_BATTERY_MODEL_NAME == "GraphReportTS-v2"
-    assert canonical_battery_model_name("GraphReportTS-v2") == "BatteryGTR"
-    assert canonical_battery_model_name("GraphReportTS-v2-BatteryDRF") == (
-        "GraphReportTS-v2-BatteryDRF"
-    )
-    assert canonical_battery_model_name("BatteryGTR") == "BatteryGTR"
 
 
 def test_battery_gtr_is_checkpoint_compatible_and_anchor_free() -> None:
-    legacy = BatteryGraphReportTSv2(battery_config())
+    legacy = BatteryGTRCore(battery_config())
     model = BatteryGTR(battery_config())
     incompatible = model.load_state_dict(legacy.state_dict(), strict=True)
     assert incompatible.missing_keys == []
@@ -45,7 +37,7 @@ def test_battery_gtr_is_checkpoint_compatible_and_anchor_free() -> None:
 
 
 def test_battery_gtr_rejects_non_patch_graphs() -> None:
-    config = GraphReportTSv2Config(
+    config = GTRConfig(
         domain="battery",
         input_len=32,
         pred_len=20,
@@ -73,7 +65,7 @@ def test_battery_gtr_launcher_is_portable() -> None:
     root = Path(__file__).resolve().parents[1]
     launcher = root / "projects" / "battery" / "battery_gtr" / "run_matrix.sh"
     text = launcher.read_text(encoding="utf-8")
-    assert "bstalignment.battery.train_battery_gtr" in text
+    assert "anchoredgtr.battery.train_battery_gtr" in text
     assert "artifacts/battery/battery_gtr/runs" in text
     assert "BASH_SOURCE[0]" in text
-    assert "/root/autodl-tmp/GraphReportTS" not in text
+    assert "/root/autodl-tmp/AnchoredGTR" not in text

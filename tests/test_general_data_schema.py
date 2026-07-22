@@ -7,9 +7,9 @@ import unittest
 
 import pandas as pd
 
-from bstalignment.general_data_schema import dataset_schema, sha256_file, validate_frame
-from bstalignment.general_experiment_config import DatasetSpec
-from bstalignment.prepare_general_data import prepare_dataset
+from anchoredgtr.general_data_schema import dataset_schema, sha256_file, validate_frame
+from anchoredgtr.general_experiment_config import DatasetSpec
+from anchoredgtr.prepare_general_data import prepare_dataset
 
 
 class GeneralDataSchemaTests(unittest.TestCase):

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="${GRAPHREPORTTS_ROOT:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
+ROOT="${ANCHOREDGTR_ROOT:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 DATA_ROOT="${DATA_ROOT:-$ROOT/data/general}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$ROOT/artifacts/general/anchored_gtr/runs}"
@@ -14,7 +14,7 @@ HORIZONS="${HORIZONS:-24 36 48 60}"
 cd "$ROOT"
 mkdir -p "$OUTPUT_ROOT/logs" "$TEXT_CACHE_ROOT"
 if [[ ! -f "$PROVENANCE" ]]; then
-  "$PYTHON_BIN" -m bstalignment.v2.provenance \
+  "$PYTHON_BIN" -m anchoredgtr.core.provenance \
     --project_root "$ROOT" --external_root "$ROOT/external" --output "$PROVENANCE"
 fi
 
@@ -25,7 +25,7 @@ run_cell() {
     printf 'skip completed AnchoredGTR %s H%s\n' "$dataset" "$horizon"
     return 0
   fi
-  CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" -u -m bstalignment.general.train_anchored_gtr \
+  CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_BIN" -u -m anchoredgtr.general.train_anchored_gtr \
     --dataset "$dataset" --horizon "$horizon" \
     --data-root "$DATA_ROOT" --output-root "$OUTPUT_ROOT" \
     --provenance-manifest "$PROVENANCE" --text-model "$TEXT_MODEL" \

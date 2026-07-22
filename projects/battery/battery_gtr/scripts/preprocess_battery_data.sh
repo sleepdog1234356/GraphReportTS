@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="${1:-${GRAPHREPORTTS_ROOT:-$(cd "$SCRIPT_DIR/../../../.." && pwd)}}"
+ROOT="${1:-${ANCHOREDGTR_ROOT:-$(cd "$SCRIPT_DIR/../../../.." && pwd)}}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 WORKERS="${WORKERS:-16}"
 cd "$ROOT"
@@ -14,7 +14,7 @@ build_cache() {
     return 0
   fi
   args=(
-    -m bstalignment.v2.precompute_battery
+    -m anchoredgtr.core.precompute_battery
     --dataset "$dataset"
     --data-root "$source"
     --output "$output"
@@ -30,7 +30,7 @@ build_cache mit data/battery/mit data/battery/cache/features/mit
 build_cache xjtu data/battery/processed/xjtu data/battery/cache/features/xjtu
 
 "$PYTHON_BIN" - <<'PY'
-from bstalignment.v2.battery_cache import BatteryFeatureCache
+from anchoredgtr.core.battery_cache import BatteryFeatureCache
 
 for dataset in ("mit", "xjtu"):
     cache = BatteryFeatureCache.load(f"data/battery/cache/features/{dataset}")

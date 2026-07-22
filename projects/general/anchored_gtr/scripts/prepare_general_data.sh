@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="${1:-${GRAPHREPORTTS_ROOT:-$(cd "$SCRIPT_DIR/../../../.." && pwd)}}"
+ROOT="${1:-${ANCHOREDGTR_ROOT:-$(cd "$SCRIPT_DIR/../../../.." && pwd)}}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 cd "$ROOT"
 
@@ -57,6 +57,6 @@ for record in "${records[@]}"; do
   mv "$partial" "$destination"
 done
 
-"$PYTHON_BIN" -m bstalignment.prepare_general_data \
+"$PYTHON_BIN" -m anchoredgtr.prepare_general_data \
   --config configs/general_forecasting/experiment_matrix.yaml \
   --output-root data/general/processed

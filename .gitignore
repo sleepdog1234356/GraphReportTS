@@ -17,11 +17,11 @@ env/
 .vscode/
 
 # Data and generated artifacts
-bstalignment/data/mit/*.pkl
-bstalignment/data/mit/Data/*.mat
-bstalignment/data/raw/
-bstalignment/data/raw/general_download/
-bstalignment/data/processed/
+anchoredgtr/data/mit/*.pkl
+anchoredgtr/data/mit/Data/*.mat
+anchoredgtr/data/raw/
+anchoredgtr/data/raw/general_download/
+anchoredgtr/data/processed/
 data/
 runs/
 external/
@@ -46,6 +46,7 @@ mlruns/
 
 # Local agent/Codex handoff files
 .agents/
-docs/graphreportts_remote_training_handoff.md
+.codex_tmp/
+docs/gtr_remote_training_handoff.md
 docs/superpowers/
 scripts/run_all*_nohup.sh

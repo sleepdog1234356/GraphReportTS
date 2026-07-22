@@ -5,8 +5,6 @@ This repository contains the two paper-facing main models of the project:
 - **AnchoredGTR** is the general multivariate forecasting model. It uses a decomposition-aware sparse graph encoder, frozen DistilBERT prompt encoder, graph-text semantic alignment, and a Ridge-initialized frozen lightweight anchor. The released protocol uses history length 36 and horizons 24/36/48/60.
 - **BatteryGTR** is the battery SOH transfer model. It converts 32 consecutive V/I/T cycles into 50 deterministic sensor features plus eight IC/DV residual channels, builds the original multi-scale patch graph, and predicts 20 future SOH values with a direct `BatterySOHHead`. It has no linear/Ridge anchor and does not use historical SOH or absolute cycle index.
 
-The old general identity `GraphReportTS-v2-DRF` and exact old battery-main identity `GraphReportTS-v2` are retained only for historical result and checkpoint compatibility. New runs use `AnchoredGTR` and `BatteryGTR`.
-
 ## Architecture
 
 AnchoredGTR separates the easily fitted trend from the nonlinear graph-text correction:
@@ -33,16 +31,16 @@ The detailed AnchoredGTR equations and module definitions are in [`docs/anchored
 ## Repository layout
 
 ```text
-bstalignment/
+anchoredgtr/
   general/                     AnchoredGTR identity, strategy registry, trainer
-  battery/                     BatteryGTR identity, compatibility layer, trainer
-  v2/                          shared graph, text, data, loss, and training runtime
+  battery/                     BatteryGTR identity and trainer
+  core/                        shared graph, text, data, loss, and training runtime
 projects/
   general/anchored_gtr/        L36 multi-dataset launcher and data preparation
   battery/battery_gtr/         MIT/XJTU launcher and feature-cache preparation
 configs/
   general_forecasting/         dataset manifests used by general-data preparation
-  graph_report_v2/             shared and battery-main configuration
+  gtr/                         shared and battery-main configuration
 docs/                          Method description and architecture figure
 tests/                         focused main-model and shared-runtime tests
 ```
@@ -97,7 +95,7 @@ CALCE is outside the current project scope.
 Run one AnchoredGTR cell:
 
 ```bash
-python -m bstalignment.general.train_anchored_gtr \
+python -m anchoredgtr.general.train_anchored_gtr \
   --dataset ETTh2 \
   --horizon 24 \
   --provenance-manifest /path/to/provenance.json
@@ -112,7 +110,7 @@ bash projects/general/anchored_gtr/run_matrix.sh /path/to/provenance.json
 Run one BatteryGTR dataset:
 
 ```bash
-python -m bstalignment.battery.train_battery_gtr \
+python -m anchoredgtr.battery.train_battery_gtr \
   --dataset mit \
   --cache_dir data/battery/cache/features/mit \
   --output artifacts/battery/battery_gtr/runs
@@ -128,7 +126,7 @@ Both launchers derive the repository root from their own locations and allow dat
 
 ## Checkpoint compatibility
 
-`BatteryGTR` subclasses the original internal `BatteryGraphReportTSv2` implementation without adding parameterized modules. Therefore historical battery-main checkpoints keep the same `state_dict` key layout and load with `strict=True`. Historical result JSON files should keep their original model strings; only new runs emit `model=BatteryGTR`.
+`BatteryGTR` subclasses the original internal `BatteryGTRCore` implementation without adding parameterized modules. Therefore historical battery-main checkpoints keep the same `state_dict` key layout and load with `strict=True`. Historical result JSON files should keep their original model strings; only new runs emit `model=BatteryGTR`.
 
 ## Verification
 

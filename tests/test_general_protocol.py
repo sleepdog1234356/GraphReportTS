@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 try:
-    from bstalignment.general_protocol import GeneralForecastProtocol, fit_train_scaler, split_bounds
+    from anchoredgtr.general_protocol import GeneralForecastProtocol, fit_train_scaler, split_bounds
 except ModuleNotFoundError:
     GeneralForecastProtocol = None
     fit_train_scaler = None
@@ -75,7 +75,7 @@ class GeneralProtocolTests(unittest.TestCase):
 
     def test_dataset_shares_history_but_keeps_validation_target_at_boundary(self):
         try:
-            from bstalignment.data_general import GeneralForecastGraphDataset
+            from anchoredgtr.data_general import GeneralForecastGraphDataset
         except ImportError as error:
             self.fail(f"general graph dataset must use the canonical protocol: {error}")
         with TemporaryDirectory() as directory:
@@ -107,7 +107,7 @@ class GeneralProtocolTests(unittest.TestCase):
             protocol.window_index("train", pred_len=23)
 
     def test_timestamp_column_is_preserved_as_timestamp_metadata(self):
-        from bstalignment.data_general import GeneralForecastGraphDataset
+        from anchoredgtr.data_general import GeneralForecastGraphDataset
 
         with TemporaryDirectory() as directory:
             root = Path(directory)

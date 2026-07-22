@@ -5,27 +5,19 @@ from pathlib import Path
 import pytest
 import torch
 
-from bstalignment.general.anchored_gtr import (
+from anchoredgtr.general.anchored_gtr import (
     ANCHORED_GTR_MODEL_NAME,
     AnchoredGTR,
-    canonical_general_model_name,
 )
-from bstalignment.general.strategy_registry import DATASETS, HORIZONS, STRATEGY_REGISTRY, resolve_strategy
-from bstalignment.general.train_anchored_gtr import build_general_argv, parse_args
-from bstalignment.v2.contracts import GraphReportTSv2Config
-from bstalignment.v2.heads import FixedLogitGate
-from bstalignment.v2.train_battery import parse_args as parse_battery_args
-from bstalignment.v2.train_general import _dataset_identity_matches
+from anchoredgtr.general.strategy_registry import DATASETS, HORIZONS, STRATEGY_REGISTRY, resolve_strategy
+from anchoredgtr.general.train_anchored_gtr import build_general_argv, parse_args
+from anchoredgtr.core.contracts import GTRConfig
+from anchoredgtr.core.heads import FixedLogitGate
+from anchoredgtr.core.train_battery import parse_args as parse_battery_args
+from anchoredgtr.core.train_general import _dataset_identity_matches
 
 
-def test_name_mapping_only_changes_legacy_general_prefix() -> None:
-    assert canonical_general_model_name("GraphReportTS-v2-DRF") == "AnchoredGTR"
-    assert canonical_general_model_name("GraphReportTS-v2-DRF-FixedCorrection") == (
-        "AnchoredGTR-FixedCorrection"
-    )
-    assert canonical_general_model_name("GraphReportTS-v2-BatteryDRF") == (
-        "GraphReportTS-v2-BatteryDRF"
-    )
+def test_general_model_uses_final_identity() -> None:
     assert ANCHORED_GTR_MODEL_NAME == "AnchoredGTR"
 
 
@@ -41,7 +33,7 @@ def test_registry_covers_exact_l36_matrix() -> None:
 
 def test_anchored_gtr_requires_general_decomposition_encoder() -> None:
     model = AnchoredGTR(
-        GraphReportTSv2Config(
+        GTRConfig(
             domain="general",
             input_len=36,
             pred_len=24,
@@ -55,7 +47,7 @@ def test_anchored_gtr_requires_general_decomposition_encoder() -> None:
     assert torch.equal(gate, torch.ones_like(gate))
     with pytest.raises(ValueError, match="series_context_decomp"):
         AnchoredGTR(
-            GraphReportTSv2Config(
+            GTRConfig(
                 domain="general",
                 input_len=36,
                 pred_len=24,
@@ -94,7 +86,7 @@ def test_main_cli_builds_canonical_identity_and_relative_roots(tmp_path: Path) -
     assert command[command.index("--graph_embedding_variant") + 1] == "series_context_decomp"
     assert command[command.index("--correction_gate_mode") + 1] == "fixed_one"
     assert "--freeze_linear_anchor" not in command
-    assert "/root/autodl-tmp/GraphReportTS" not in " ".join(command)
+    assert "/root/autodl-tmp/AnchoredGTR" not in " ".join(command)
 
 
 def test_main_defaults_use_organized_data_and_non_overwriting_run_roots() -> None:
@@ -104,7 +96,7 @@ def test_main_defaults_use_organized_data_and_non_overwriting_run_roots() -> Non
 
     assert Path(general.data_root) == root / "data" / "general"
     assert Path(general.output_root) == root / "artifacts" / "general" / "anchored_gtr" / "runs"
-    assert Path(battery.output) == Path("artifacts/battery/graphreportts_v2/runs")
+    assert Path(battery.output) == Path("artifacts/battery/battery_gtr/runs")
 
 
 def test_project_launchers_resolve_root_from_their_location() -> None:
@@ -115,7 +107,7 @@ def test_project_launchers_resolve_root_from_their_location() -> None:
     ):
         text = (root / relative).read_text(encoding="utf-8")
         assert "BASH_SOURCE[0]" in text
-        assert "/root/autodl-tmp/GraphReportTS" not in text
+        assert "/root/autodl-tmp/AnchoredGTR" not in text
 
 
 def test_dataset_identity_allows_only_a_relocated_equal_csv() -> None:

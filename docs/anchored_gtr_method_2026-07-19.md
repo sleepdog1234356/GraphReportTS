@@ -764,9 +764,9 @@ $$
 19: 以 Smooth L1 + 加权 NT-Xent 更新全部非冻结参数
 ```
 
-## 11. 与原版 GraphReportTS-v2 的差异
+## 11. 与基础稀疏图—文本结构的差异
 
-| 组件                     | 原版 GraphReportTS-v2          | AnchoredGTR           |
+| 组件                     | 基础稀疏图—文本结构 | AnchoredGTR           |
 | ---------------------- | ---------------------------- | ------------------------------ |
 | 图输入节点                  | 原始多尺度 patch                  | 局部标准化 patch + 25 点趋势/残差完整上下文   |
 | 图 embedding 选项         | `patch`                      | `series_context_decomp`        |
